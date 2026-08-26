@@ -1,7 +1,9 @@
 package com.rallycopilot.core
 
 import com.rallycopilot.core.advisor.NoteComposer
+import com.rallycopilot.core.model.Conditions
 import com.rallycopilot.core.model.Corner
+import com.rallycopilot.core.model.CornerObservation
 import com.rallycopilot.core.model.Direction
 import com.rallycopilot.core.model.DriverProfile
 import com.rallycopilot.core.model.Hazard
@@ -304,6 +306,50 @@ class CornerSpamTests {
         )
         val mph = h.corners.single().vTargetMps * 2.23694
         assertTrue("physical target was clamped to the limit: $mph mph", mph > 50.0)
+    }
+}
+
+class LearningCutoffTests {
+    /**
+     * The app keeps every observation forever and re-derives the profile from the
+     * whole history at each drive end. That is what made "reset profile" a no-op:
+     * the next drive rebuilt the old numbers from the same rows. Learning must
+     * therefore be able to ignore everything before a cutoff.
+     */
+    private fun obs(tMs: Long, aLat: Double) = CornerObservation(
+        runId = 1, cornerId = tMs, tMs = tMs,
+        band = SeverityBand.FOUR, minRadiusM = 90.0,
+        vEntryMps = 25.0, vMinMps = 22.0, vExitMps = 25.0,
+        aLatObserved = aLat, mapConfidence = 0.9, pathConfidence = 0.9,
+        wasConstrained = false, conditions = Conditions.DRY,
+    )
+
+    @Test
+    fun `pre-cutoff observations no longer shape the profile`() {
+        // Ten inflated corners from before the geometry fix, then five honest ones.
+        val contaminated = (1L..10L).map { obs(it, 12.0) }
+        val clean = (100L..104L).map { obs(it, 6.0) }
+
+        val withOld = com.rallycopilot.core.profile.Learning
+            .derive(contaminated + clean).first[SeverityBand.FOUR]!!
+        val afterCutoff = com.rallycopilot.core.profile.Learning
+            .derive((contaminated + clean).filter { it.tMs >= 100L }).first[SeverityBand.FOUR]!!
+
+        assertTrue("old data should drag the value up: $withOld", withOld > 8.0)
+        assertEquals("post-cutoff should reflect real driving", 6.0, afterCutoff, 0.01)
+    }
+
+    @Test
+    fun `a reset with no new corners leaves the seed standing`() {
+        // Nothing after the cutoff means nothing to learn from — and crucially the
+        // old rows must not creep back in and re-derive the previous numbers.
+        val (derived, counts) = com.rallycopilot.core.profile.Learning
+            .derive(emptyList())
+        assertTrue(derived.isEmpty())
+        assertTrue(counts.isEmpty())
+        val profile = com.rallycopilot.core.profile.Learning
+            .applySession(DriverProfile.COLD_START, emptyList())
+        assertEquals(DriverProfile.SEED_A_LAT, profile.aLatFor(SeverityBand.FOUR), 1e-9)
     }
 }
 

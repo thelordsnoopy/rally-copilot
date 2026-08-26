@@ -77,6 +77,11 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             locationGranted.value = hasLocationPermission()
+        // One-time: everything learned before the corner-geometry fix is suspect, so
+        // start the model afresh. Keeps every recorded drive; only learning restarts.
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { AppDb.get(this@MainActivity).migrateLearningCutoff() }
+        }
         }
 
     fun hasLocationPermission(): Boolean =
@@ -514,21 +519,29 @@ fun ProfileScreen(activity: MainActivity) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         Text(band.name.lowercase(), fontSize = 16.sp)
-                        Text("%.2f g   ·   %d corners".format(g, n), fontSize = 16.sp)
+                        Text(
+                            "%.2f g   ·   %d %s".format(g, n, if (n == 1) "corner" else "corners"),
+                            fontSize = 16.sp,
+                        )
                     }
                 }
             }
             item {
                 Button(
                     onClick = {
-                        val fresh = if (cond == com.rallycopilot.core.model.Conditions.WET)
-                            DriverProfile(emptyMap(), emptyMap(), seedALat = 0.4 * 9.81)
-                        else DriverProfile.COLD_START
-                        db.saveProfile(fresh, cond)
-                        profile = fresh
+                        // Sets a learning cutoff as well as clearing the profile.
+                        // Without the cutoff the next drive re-derived the old numbers
+                        // from the full history and silently undid this.
+                        db.resetLearning(cond)
+                        profile = db.loadProfile(cond)
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF5A2530)),
-                ) { Text("Reset ${cond.name.lowercase()} profile to default") }
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF5A2530),
+                        // Without an explicit content colour this inherits the theme's
+                        // dark purple onPrimary — unreadable on dark red.
+                        contentColor = Color(0xFFFFD7D7),
+                    ),
+                ) { Text("Start ${cond.name.lowercase()} learning again from now") }
             }
         }
     }

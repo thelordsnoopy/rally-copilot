@@ -188,6 +188,41 @@ class AppDb private constructor(context: Context) :
 
     fun allObservations(): List<CornerObservation> = readObservations("", null)
 
+    // ---- learning cutoff ----
+    // Corner observations are never deleted: they are the only record of what you
+    // actually drove. But a profile is DERIVED from the whole history every time,
+    // so observations taken before a maths fix would poison every future drive
+    // forever, and "reset profile" was a no-op — the next drive re-derived the old
+    // numbers straight back. A cutoff timestamp fixes both: history is kept, and
+    // learning simply ignores anything recorded before it.
+
+    fun learnCutoffMs(): Long = kvGet("learn_from_ms")?.toLongOrNull() ?: 0L
+
+    /** Start learning afresh from now. Keeps every stored observation. */
+    fun resetLearning(conditions: Conditions) {
+        kvPut("learn_from_ms", System.currentTimeMillis().toString())
+        saveProfile(coldStart(conditions), conditions)
+    }
+
+    /** The observations a profile may be derived from: right conditions, after the cutoff. */
+    fun observationsForLearning(conditions: Conditions): List<CornerObservation> {
+        val cutoff = learnCutoffMs()
+        return readObservations("WHERE conditions=? AND t_ms>=?",
+            arrayOf(conditions.name, cutoff.toString()))
+    }
+
+    /**
+     * One-time reset on upgrade. Everything recorded before v0.8.2 used corner
+     * radii from fragmented OSM geometry, which inflates observed lateral g
+     * (aLat = v²/radius), so those rows would drag the model permanently.
+     */
+    fun migrateLearningCutoff() {
+        if (kvGet("learn_cutoff_v1") == "done") return
+        kvPut("learn_from_ms", System.currentTimeMillis().toString())
+        kvPut("learn_cutoff_v1", "done")
+        for (c in Conditions.entries) saveProfile(coldStart(c), c)
+    }
+
     fun observationsFor(runId: Long): List<CornerObservation> =
         readObservations("WHERE run_id=?", arrayOf(runId.toString()))
 

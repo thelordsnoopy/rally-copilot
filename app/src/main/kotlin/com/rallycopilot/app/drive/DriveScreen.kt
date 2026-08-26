@@ -621,7 +621,7 @@ fun FeedbackSheet(activity: MainActivity, onDone: () -> Unit) {
                     ) Thread.sleep(200)
                     db.overrideRunStyle(runId, alsoOverride)
                 }
-                val history = db.allObservations().filter { it.conditions == cond }
+                val history = db.observationsForLearning(cond)
                 db.saveProfile(Learning.applySession(db.loadProfile(cond), history), cond)
             }
         }.start()

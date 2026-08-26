@@ -450,7 +450,7 @@ class DriveService : Service() {
                     db.saveObservations(useObs)
                     if (useObs.isNotEmpty()) {
                         // Learn only from history matching this run's conditions.
-                        val history = db.allObservations().filter { it.conditions == conditions }
+                        val history = db.observationsForLearning(conditions)
                         val updated = Learning.applySession(db.loadProfile(conditions), history)
                         db.saveProfile(updated, conditions)
                     }
