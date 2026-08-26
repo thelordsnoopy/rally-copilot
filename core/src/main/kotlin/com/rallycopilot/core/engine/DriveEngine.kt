@@ -80,6 +80,15 @@ class DriveEngine(
     @Volatile
     var alwaysSpeak: Boolean = false
 
+    /**
+     * Verbosity: the gentlest band still worth calling aloud, by ordinal
+     * (HAIRPIN=0 … SIX=6). Everything is still drawn on the HUD; this only decides
+     * what is SPOKEN. A "six" is barely a bend, so calling every one of them on a
+     * wiggly lane is most of what makes the co-driver feel like chatter.
+     */
+    @Volatile
+    var maxSpokenBandOrdinal: Int = com.rallycopilot.core.model.SeverityBand.SIX.ordinal
+
     /** Everything the HUD needs, updated every tick. */
     data class HudState(
         val matched: MatchedPosition? = null,
@@ -423,7 +432,8 @@ class DriveEngine(
         // Corners we could speak, nearest first. Low-confidence corners are skipped but
         // NOT marked spoken — a transient ambiguity must not silence them forever.
         val speakable = h.corners.filter { c ->
-            val ok = c.corner.id !in spokenCorners && aheadOf(c) > 0
+            val ok = c.corner.id !in spokenCorners && aheadOf(c) > 0 &&
+                c.band.ordinal <= maxSpokenBandOrdinal
             if (ok && c.pathConfidence < params.speakConfidence) {
                 if (suppressionLogged.add(c.corner.id)) {
                     runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))

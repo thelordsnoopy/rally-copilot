@@ -53,6 +53,10 @@ class HorizonBuilder(
         val distanceAheadM: Double,
         val pathConfidence: Double,
         val forward: Boolean,
+        /** Posted limit on the corner's own edge, if OSM has one. */
+        val maxspeedKph: Int? = null,
+        /** Road class, so a sane default limit can stand in where OSM has none. */
+        val highwayClass: String? = null,
     )
 
     data class RawHorizon(
@@ -131,7 +135,11 @@ class HorizonBuilder(
                         entryRadiusM = c.exitRadiusM,
                         exitRadiusM = c.entryRadiusM,
                     )
-                    corners += RawCorner(directed, aheadAt, step.confidence, step.forward)
+                    corners += RawCorner(
+                        directed, aheadAt, step.confidence, step.forward,
+                        maxspeedKph = step.edge.maxspeedKph,
+                        highwayClass = step.edge.highwayClass,
+                    )
                 }
             }
             val learned = knowledge?.cautionsOn(step.edge.id)?.map { b ->

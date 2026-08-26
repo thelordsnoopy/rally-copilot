@@ -225,6 +225,88 @@ class SpokenCallTests {
     }
 }
 
+class CornerSpamTests {
+    /** OSM routinely splits one sweeping bend into two or three corner rows.
+     *  Calling each of them is the "right, right, right" the driver hears. */
+    private fun raw(vararg c: Triple<Double, Direction, Double>) =
+        com.rallycopilot.core.horizon.HorizonBuilder.RawHorizon(
+            steps = emptyList(),
+            totalLengthM = 1000.0,
+            confidenceAtEnd = 0.9,
+            corners = c.mapIndexed { i, (ahead, dir, minR) ->
+                com.rallycopilot.core.horizon.HorizonBuilder.RawCorner(
+                    Corner(i.toLong(), 1, 0.0, 10.0, 20.0, dir, minR, minR, minR, 20.0, 0.9),
+                    ahead, 0.9, true,
+                )
+            },
+            hazards = emptyList(),
+        )
+
+    private fun advisor() = com.rallycopilot.core.advisor.Advisor(DriverProfile.COLD_START)
+
+    @Test
+    fun `one bend split into three fragments becomes a single call`() {
+        // Three right-handers 25 m apart — one real corner in the road.
+        val h = advisor().annotate(
+            raw(
+                Triple(100.0, Direction.RIGHT, 60.0),
+                Triple(145.0, Direction.RIGHT, 40.0),
+                Triple(190.0, Direction.RIGHT, 55.0),
+            ),
+            currentSpeedMps = 20.0, nowMs = 0L,
+        )
+        assertEquals("should be one call, not three", 1, h.corners.size)
+        // And it must keep the TIGHTEST of the run — the bit that actually bites.
+        assertEquals(40.0, h.corners[0].corner.minRadiusM, 0.001)
+    }
+
+    @Test
+    fun `a genuine left-right stays two calls`() {
+        val h = advisor().annotate(
+            raw(
+                Triple(100.0, Direction.RIGHT, 50.0),
+                Triple(145.0, Direction.LEFT, 50.0),
+            ),
+            currentSpeedMps = 20.0, nowMs = 0L,
+        )
+        assertEquals(2, h.corners.size)
+    }
+
+    @Test
+    fun `well separated same-direction corners stay separate`() {
+        val h = advisor().annotate(
+            raw(
+                Triple(100.0, Direction.RIGHT, 50.0),
+                Triple(400.0, Direction.RIGHT, 50.0),
+            ),
+            currentSpeedMps = 20.0, nowMs = 0L,
+        )
+        assertEquals(2, h.corners.size)
+    }
+
+    @Test
+    fun `target speed ignores the speed limit by design`() {
+        // A fast open bend on a lane with a 30 limit still reports what the corner
+        // can physically take — the number is a physical limit, not a legal one.
+        val a = advisor()
+        val h = a.annotate(
+            com.rallycopilot.core.horizon.HorizonBuilder.RawHorizon(
+                steps = emptyList(), totalLengthM = 500.0, confidenceAtEnd = 0.9,
+                corners = listOf(
+                    com.rallycopilot.core.horizon.HorizonBuilder.RawCorner(
+                        Corner(1, 1, 0.0, 10.0, 20.0, Direction.RIGHT, 300.0, 300.0, 300.0, 20.0, 0.9),
+                        150.0, 0.9, true, maxspeedKph = 48, highwayClass = "residential",
+                    )
+                ),
+                hazards = emptyList(),
+            ),
+            currentSpeedMps = 20.0, nowMs = 0L,
+        )
+        val mph = h.corners.single().vTargetMps * 2.23694
+        assertTrue("physical target was clamped to the limit: $mph mph", mph > 50.0)
+    }
+}
+
 class SpeakModeTests {
     /** The setting only flips one flag, but it is the flag that decides whether a
      *  whole drive is narrated or silent, so pin both directions down. */

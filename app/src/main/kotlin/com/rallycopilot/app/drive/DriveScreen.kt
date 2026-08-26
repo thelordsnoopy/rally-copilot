@@ -337,8 +337,9 @@ private fun InstrumentBar(hud: DriveEngine.HudState?, modifier: Modifier) {
             Chip("GPS", if (hud?.gpsOk == true) Green else Red)
             Chip("OBD", if (hud?.obdConnected == true) Green else InkDim)
             // Quiet mode is a deliberate silence, so say so — the driver must never
-            // wonder whether the co-driver has died.
-            if (hud?.pressingOn == false) Chip("QUIET · cameras only", InkDim)
+            // wonder whether the co-driver has died. Keep labels SHORT: this row
+            // shares one line with a 58sp speed readout.
+            if (hud?.pressingOn == false) Chip("QUIET", InkDim)
             else if (hud?.spirited == true) Chip("SPIRITED", Amber)
             else Chip("CALLING", Green)
         }
@@ -361,12 +362,17 @@ private fun InstrumentBar(hud: DriveEngine.HudState?, modifier: Modifier) {
 @Composable
 private fun Chip(label: String, colour: Color) {
     Row(
+        // Never wrap: this row is width-constrained, and a chip label that wraps
+        // grows the instrument bar vertically and crushes the map above it.
         Modifier.background(Color(0x33202B36), RoundedCornerShape(6.dp))
             .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Canvas(Modifier.size(7.dp)) { drawCircle(colour) }
-        Text("  $label", color = InkDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+        Text(
+            "  $label", color = InkDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+            maxLines = 1, softWrap = false,
+        )
     }
 }
 
@@ -458,6 +464,9 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
             rotationX = 35f
             cameraDistance = 9f * density
             transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.5f, 0.75f)
+            // A 3D rotation projects content outside the layout bounds, which paints
+            // roads over the instrument bar below. Keep it inside its own box.
+            clip = true
         }
     ) {
         // Draw from the eased values, not the raw fix — see the smoothing above.

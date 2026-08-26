@@ -183,6 +183,7 @@ class DriveService : Service() {
         )
         // "always" = call everything whenever driving; default = quiet unless pressing on.
         engine.alwaysSpeak = db.kvGet("speak_mode") == "always"
+        engine.maxSpokenBandOrdinal = verbosityOrdinal(db.kvGet("verbosity"))
 
         // IMU: surface roughness, pothole spikes, mount self-alignment and camber —
         // all tagged to the matched road bucket. No calibration step anywhere: the
@@ -276,6 +277,11 @@ class DriveService : Service() {
     /** Live change of the quiet-mode setting; takes effect on the next tick. */
     fun setAlwaysSpeak(always: Boolean) {
         if (::engine.isInitialized) engine.alwaysSpeak = always
+    }
+
+    /** Live change of verbosity; takes effect on the next tick. */
+    fun setVerbosity(key: String?) {
+        if (::engine.isInitialized) engine.maxSpokenBandOrdinal = verbosityOrdinal(key)
     }
 
     /** Live voice level/balance changes from the settings screen. */
@@ -441,6 +447,14 @@ class DriveService : Service() {
     }
 
     companion object {
+        /** Settings verbosity key → gentlest severity band still spoken. */
+        fun verbosityOrdinal(key: String?): Int = when (key) {
+            "tight" -> com.rallycopilot.core.model.SeverityBand.FOUR.ordinal
+            "min" -> com.rallycopilot.core.model.SeverityBand.TWO.ordinal
+            // Default stays "call everything" — the user's standing choice.
+            else -> com.rallycopilot.core.model.SeverityBand.SIX.ordinal
+        }
+
         const val CHANNEL = "drive"
         const val NOTIF_ID = 1
         const val ACTION_STOP = "com.rallycopilot.STOP"

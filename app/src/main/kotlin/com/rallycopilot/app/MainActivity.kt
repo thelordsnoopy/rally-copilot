@@ -554,7 +554,11 @@ fun SettingsScreen(activity: MainActivity) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             for ((key, label) in listOf("all" to "Everything", "tight" to "4+ only", "min" to "Min")) {
                 Button(
-                    onClick = { verbosity = key; db.kvPut("verbosity", key) },
+                    onClick = {
+                        verbosity = key
+                        db.kvPut("verbosity", key)
+                        activity.driveService?.setVerbosity(key)
+                    },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (verbosity == key) Color(0xFF1DB954) else Color(0xFF141C24)
                     ),
