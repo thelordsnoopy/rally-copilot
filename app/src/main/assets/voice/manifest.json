@@ -75,7 +75,8 @@
    "s_95": 930,
    "s_100": 699,
    "speed_camera": 498,
-   "average_camera": 1090
+   "average_camera": 1090,
+   "warn_sun": 850
   },
   "urgent": {
    "left_one": 526,
@@ -151,7 +152,8 @@
    "s_85": 665,
    "s_90": 458,
    "s_95": 780,
-   "s_100": 590
+   "s_100": 590,
+   "warn_sun": 720
   }
  }
 }

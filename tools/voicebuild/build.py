@@ -48,6 +48,7 @@ for k, t in {
     "finish": "finish", "warn_temps": "temperatures rising, ease off",
     "warn_battery": "battery voltage low",
     "warn_ice": "caution, possible ice",
+    "warn_sun": "low sun ahead",
     "gps_lost": "G P S lost", "gps_ok": "G P S restored",
 }.items():
     VOCAB[k] = t

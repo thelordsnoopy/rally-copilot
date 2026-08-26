@@ -63,6 +63,10 @@ class VoicePack(private val context: Context) : AudioSink {
     private var keepAlive: AudioTrack? = null
     private var keepAliveThread: Thread? = null
 
+    /** The same route to the car's speakers the notes use — the chirp must
+     *  travel it too, or it would be measuring a different path. */
+    val attributes: AudioAttributes get() = audioAttrs
+
     private val audioAttrs = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)

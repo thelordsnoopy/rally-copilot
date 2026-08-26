@@ -96,6 +96,7 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.ACCESS_FINE_LOCATION,
                 Manifest.permission.POST_NOTIFICATIONS,
                 Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.RECORD_AUDIO,
             )
         )
     }
@@ -237,6 +238,7 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.POST_NOTIFICATIONS,
             Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.RECORD_AUDIO,
         ).any {
             checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
         }
@@ -735,6 +737,24 @@ fun SettingsScreen(activity: MainActivity) {
                 inactiveTrackColor = Color(0xFF232D38),
             ),
         )
+        val audioCal by androidx.compose.runtime.produceState(initialValue = "start a drive to measure") {
+            while (true) {
+                value = activity.driveService?.audioCalibration ?: "start a drive to measure"
+                kotlinx.coroutines.delay(1000)
+            }
+        }
+        Text(
+            "Audio delay: $audioCal",
+            color = if (audioCal.contains("measured")) Color(0xFF2EE06B) else Color(0xFF8899AA),
+            fontSize = 12.sp,
+        )
+        Text(
+            "A short chirp plays when a drive starts and the phone listens for it, so " +
+                "corner calls are timed against your car's real Bluetooth delay instead " +
+                "of an assumption. Nothing is recorded or sent anywhere.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
         Text(
             "Over Bluetooth the car owns its speakers — Android can only pan the voice " +
                 "left or right, not pick one physical speaker. Hard left puts it in the " +

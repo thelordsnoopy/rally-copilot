@@ -45,6 +45,8 @@ class DriveEngine(
     private val healthWatch: HealthWatch? = null,
     private val knowledge: KnowledgeStore? = null,
     private val slowdown: SlowdownMonitor? = null,
+    /** Low-sun glare warning. Pure geometry; cloud cover is optional. */
+    private val sunWatch: com.rallycopilot.core.sun.SunWatch? = null,
 ) {
     data class Params(
         val maxAccuracyM: Double = 25.0,
@@ -94,6 +96,15 @@ class DriveEngine(
 
     @Volatile
     var speedSource: SpeedSource = SpeedSource.AUTO
+
+    /**
+     * Output delay to the car's speakers, milliseconds. Defaults to the documented
+     * SBC-to-head-unit range, but the app measures the real figure with a chirp at
+     * drive start — corner timing is scheduled backwards from this, so a guess here
+     * is a guess in every single call.
+     */
+    @Volatile
+    var audioLatencyMs: Long = 220
 
     /** Everything the HUD needs, updated every tick. */
     data class HudState(
@@ -265,6 +276,20 @@ class DriveEngine(
 
         // Health watch: coolant, battery, ambient/ice. One calm warning per crossing,
         // never interrupting a pacenote.
+        // Low sun straight down the road: you cannot see the corner, and no amount
+        // of corner geometry helps with that.
+        sunWatch?.let { sw ->
+            val f = fix
+            val bearing = lastMatch?.bearingDeg ?: f?.bearingDeg
+            if (f != null && bearing != null && !bearing.isNaN() && speed > 4.0 &&
+                sw.check(now, f.lat, f.lon, bearing) && !audio.isSpeaking()
+            ) {
+                audio.play(Utterance(listOf("warn_sun"), urgent = false,
+                    deadlineDistanceM = 0.0, forCornerId = null))
+                runLog.logEvent(RunEvent(now, RunEventType.HEALTH_WARNING, "sun"))
+            }
+        }
+
         healthWatch?.check(vehicle.coolantC(), vehicle.batteryV(), vehicle.ambientC())?.let { key ->
             if (!audio.isSpeaking()) {
                 audio.play(Utterance(listOf(key), urgent = false, deadlineDistanceM = 0.0, forCornerId = null))
@@ -525,7 +550,7 @@ class DriveEngine(
     /** Metres consumed while the utterance plays, incl. BT latency — end-anchored timing. */
     private fun speechLeadM(speed: Double, c: HorizonCorner): Double {
         val clipMs = NoteComposer.cornerKeys(c, includeGear = false).sumOf { audio.clipDurationMs(it) }
-        return speed * (clipMs + params.a2dpLatencyMs) / 1000.0
+        return speed * (clipMs + audioLatencyMs) / 1000.0
     }
 
     /**

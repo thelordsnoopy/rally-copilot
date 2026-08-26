@@ -13,6 +13,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Used once per drive to hear the calibration chirp and time the audio delay.
+         Nothing is recorded to storage and nothing leaves the phone. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:label="Rally Copilot"

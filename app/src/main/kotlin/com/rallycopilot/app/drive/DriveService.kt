@@ -89,9 +89,11 @@ class DriveService : Service() {
     private var knowledge: KnowledgeDb? = null
     private var imu: ImuMonitor? = null
     private var slowdownMonitor: com.rallycopilot.core.knowledge.SlowdownMonitor? = null
+    private var sun: com.rallycopilot.core.sun.SunWatch? = null
     @Volatile private var distanceM = 0.0
     private var lastFix: Fix? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile private var weatherAsked = false
 
     override fun onBind(intent: Intent?): IBinder = binder
 
@@ -136,6 +138,7 @@ class DriveService : Service() {
         // run's distance or a stale lastFix (one giant haversine jump).
         distanceM = 0.0
         lastFix = null
+        weatherAsked = false
 
         wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rallycopilot:drive")
@@ -154,6 +157,8 @@ class DriveService : Service() {
         val know = KnowledgeDb(db)
         knowledge = know
         val slowMon = com.rallycopilot.core.knowledge.SlowdownMonitor()
+        val sunWatch = com.rallycopilot.core.sun.SunWatch()
+        this.sun = sunWatch
         slowdownMonitor = slowMon
         runId = db.startRun(conditions, isCalibration)
         // Separate learned profiles per conditions: wet drives use and train the wet model.
@@ -181,6 +186,7 @@ class DriveService : Service() {
             healthWatch = com.rallycopilot.core.obd.HealthWatch(),
             knowledge = know,
             slowdown = slowMon,
+            sunWatch = sunWatch,
         )
         // "always" = call everything whenever driving; default = quiet unless pressing on.
         engine.alwaysSpeak = db.kvGet("speak_mode") == "always"
@@ -236,6 +242,11 @@ class DriveService : Service() {
                 }
             },
         ).also { it.start() }
+
+        // Audio latency: use the remembered measurement immediately, then re-measure
+        // in the background (head unit, codec and phone can all change between drives).
+        db.kvGet("audio_latency_ms")?.toLongOrNull()?.let { engine.audioLatencyMs = it }
+        scope.launch(Dispatchers.IO) { calibrateAudio() }
 
         voice.setVolume(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f)
         voice.setBalance(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f)
@@ -336,6 +347,58 @@ class DriveService : Service() {
         return found
     }
 
+    /**
+     * Cloud cover, so a warning is not given for a sun that is behind a thick sky.
+     * Entirely optional: the geometry works offline, and an unknown sky is treated
+     * as clear because a missed warning costs more than one you can ignore.
+     * Open-Meteo needs no key and no account.
+     */
+    private fun fetchCloudCover(lat: Double, lon: Double) {
+        val url = "https://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f" +
+            "&current=cloud_cover&forecast_days=1"
+        runCatching {
+            val conn = java.net.URL(url.format(lat, lon)).openConnection()
+                as java.net.HttpURLConnection
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            val body = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            val pct = org.json.JSONObject(body).getJSONObject("current").getDouble("cloud_cover")
+            sun?.cloudCover = (pct / 100.0).coerceIn(0.0, 1.0)
+            weatherNote = "cloud cover ${pct.toInt()}%"
+        }.onFailure {
+            weatherNote = "no weather (offline) - assuming clear"
+        }
+    }
+
+    @Volatile var weatherNote: String = "not checked"
+        private set
+
+    /** Last audio-calibration outcome, for the settings screen. */
+    @Volatile var audioCalibration: String = "not measured yet"
+        private set
+
+    /**
+     * Play the chirp, listen for it, and use the measured delay for note timing.
+     * Runs once at drive start, before you have set off.
+     */
+    private fun calibrateAudio() {
+        if (!com.rallycopilot.app.audio.LatencyCalibrator.hasMic(this)) {
+            audioCalibration = "microphone permission not granted - using ${engine.audioLatencyMs} ms"
+            return
+        }
+        audioCalibration = "measuring..."
+        val r = com.rallycopilot.app.audio.LatencyCalibrator.measure(this, voice.attributes)
+        val ms = r.latencyMs
+        if (ms != null) {
+            engine.audioLatencyMs = ms
+            db.kvPut("audio_latency_ms", ms.toString())
+            audioCalibration = "audio delay ${ms} ms (measured)"
+        } else {
+            audioCalibration = "${r.message} - using ${engine.audioLatencyMs} ms"
+        }
+    }
+
     /** Live voice level/balance changes from the settings screen. */
     fun setVoiceVolume(v: Float) { if (::voice.isInitialized) voice.setVolume(v) }
     fun setVoiceBalance(b: Float) { if (::voice.isInitialized) voice.setBalance(b) }
@@ -412,6 +475,11 @@ class DriveService : Service() {
                         )
                     }
                     lastFix = fix
+                    // One weather lookup per drive, once a real position exists.
+                    if (!weatherAsked) {
+                        weatherAsked = true
+                        scope.launch(Dispatchers.IO) { fetchCloudCover(fix.lat, fix.lon) }
+                    }
                     scope.launch(engineDispatcher) { if (driveActive) engine.onFix(fix) }
                 }
             }
