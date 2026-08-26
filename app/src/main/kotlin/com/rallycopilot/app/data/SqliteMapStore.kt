@@ -128,6 +128,8 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
                     direction = if (c.getString(5) == "LEFT") Direction.LEFT else Direction.RIGHT,
                     minRadiusM = c.getDouble(6), entryRadiusM = c.getDouble(7), exitRadiusM = c.getDouble(8),
                     arcLengthM = c.getDouble(9), confidence = c.getDouble(10),
+                    // Column added in schema 2; older copies simply read as flat.
+                    approachGrade = if (c.columnCount > 11 && !c.isNull(11)) c.getDouble(11) else 0.0,
                 )
             }
         }

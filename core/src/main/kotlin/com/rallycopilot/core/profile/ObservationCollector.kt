@@ -27,6 +27,14 @@ class ObservationCollector(
 
     private val active = ArrayList<Tracking>()
     private val done = ArrayList<CornerObservation>()
+    /** The corner that just closed, for live coaching. Read once, then gone. */
+    private var lastClosed: Pair<CornerObservation, HorizonCorner>? = null
+
+    fun takeLastClosed(): Pair<CornerObservation, HorizonCorner>? {
+        val v = lastClosed
+        lastClosed = null
+        return v
+    }
 
     val observations: List<CornerObservation> get() = done
 
@@ -82,7 +90,9 @@ class ObservationCollector(
                 else -> { // fully past: close out
                     t.vExit = speedMps
                     if (speedMps < 1.0) t.sawStopAfter = true
-                    done += finish(t, tMs)
+                    val closed = finish(t, tMs)
+                    done += closed
+                    lastClosed = closed to t.hc
                     it.remove()
                 }
             }

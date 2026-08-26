@@ -45,10 +45,13 @@ for k, t in {
     "crossing": "crossing", "ford": "ford", "cattle_grid": "cattle grid",
     "narrow_bridge": "narrow bridge", "gate": "gate", "level_crossing": "level crossing",
     "speed_camera": "camera", "average_camera": "average speed check",
+    "crest": "crest",
+    "coach_good": "good through there",
+    "coach_more": "you had more there",
+    "coach_hot": "bit hot into that one",
     "finish": "finish", "warn_temps": "temperatures rising, ease off",
     "warn_battery": "battery voltage low",
     "warn_ice": "caution, possible ice",
-    "warn_sun": "low sun ahead",
     "gps_lost": "G P S lost", "gps_ok": "G P S restored",
 }.items():
     VOCAB[k] = t

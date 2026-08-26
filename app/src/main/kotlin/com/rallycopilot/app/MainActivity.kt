@@ -693,6 +693,39 @@ fun SettingsScreen(activity: MainActivity) {
             color = Color(0xFF667788), fontSize = 11.sp,
         )
 
+        // ---- coaching ----
+        var coaching by remember { mutableStateOf(db.kvGet("coaching") != "off") }
+        Button(
+            onClick = {
+                coaching = !coaching
+                db.kvPut("coaching", if (coaching) "on" else "off")
+            },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (coaching) Color(0xFF2EE06B) else Color(0xFF141C24),
+            ),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+        ) {
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    if (coaching) "Coaching: on" else "Coaching: off",
+                    fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                    color = if (coaching) Color.Black else Color(0xFFEAF0F6),
+                )
+                Text(
+                    "a word about the corner you just took, only on a straight",
+                    fontSize = 10.sp, maxLines = 1,
+                    color = if (coaching) Color(0xCC06080B) else Color(0xFF7C8B9A),
+                )
+            }
+        }
+        Text(
+            "Never competes with the road ahead: if a call comes due the comment is " +
+                "dropped, not queued. Takes effect on the next drive.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
         // ---- voice level and where it comes out ----
         var vol by remember { mutableStateOf(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f) }
         var bal by remember { mutableStateOf(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f) }

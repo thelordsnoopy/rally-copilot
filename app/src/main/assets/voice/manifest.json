@@ -76,7 +76,10 @@
    "s_100": 699,
    "speed_camera": 498,
    "average_camera": 1090,
-   "warn_sun": 850
+   "crest": 493,
+   "coach_good": 772,
+   "coach_more": 844,
+   "coach_hot": 1150
   },
   "urgent": {
    "left_one": 526,
@@ -153,7 +156,10 @@
    "s_90": 458,
    "s_95": 780,
    "s_100": 590,
-   "warn_sun": 720
+   "crest": 420,
+   "coach_good": 644,
+   "coach_more": 709,
+   "coach_hot": 967
   }
  }
 }

@@ -63,6 +63,9 @@ data class Corner(
     val exitRadiusM: Double,
     val arcLengthM: Double,
     val confidence: Double,
+    /** Average slope of the 80 m approaching this corner. Positive = uphill.
+     *  Gravity helps you stop going up and fights you going down. */
+    val approachGrade: Double = 0.0,
 )
 
 /** Fixed hazards from OSM node tags, called like cautions. */
@@ -80,11 +83,17 @@ enum class HazardKind(val spoken: String) {
     SPEED_CAMERA("speed camera"),
     /** Average-speed (SPECS-style) enforcement zone. */
     AVERAGE_CAMERA("average speed check"),
+    /** A brow the road disappears over — the one hazard corner geometry cannot express. */
+    CREST("crest"),
     ;
 
     /** Announced even in quiet mode — the whole point of quiet mode is that these
      *  still get through when nothing else does. */
     val isAlwaysAnnounced: Boolean get() = this == SPEED_CAMERA || this == AVERAGE_CAMERA
+
+    /** Called by name alone. "Caution crest" is not how a co-driver says it. */
+    val isPlainCall: Boolean
+        get() = this == SPEED_CAMERA || this == AVERAGE_CAMERA || this == CREST
 }
 
 data class Hazard(val edgeId: Long, val offsetM: Double, val kind: HazardKind)

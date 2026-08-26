@@ -134,6 +134,10 @@ class HorizonBuilder(
                         },
                         entryRadiusM = c.exitRadiusM,
                         exitRadiusM = c.entryRadiusM,
+                        // A climb up to a corner from one side is a descent down to
+                        // it from the other. Same trap as the direction mirror: the
+                        // grade is stored in the edge's forward frame.
+                        approachGrade = -c.approachGrade,
                     )
                     corners += RawCorner(
                         directed, aheadAt, step.confidence, step.forward,

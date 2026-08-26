@@ -71,7 +71,7 @@ object NoteComposer {
         h.hazard.kind == com.rallycopilot.core.model.HazardKind.LEARNED -> listOf("caution")
         // A camera is not a hazard to be cautious of, it is a fact to act on —
         // "caution camera" would be both wrong and slower to say.
-        h.hazard.kind.isAlwaysAnnounced -> listOf(h.hazard.kind.name.lowercase())
+        h.hazard.kind.isPlainCall -> listOf(h.hazard.kind.name.lowercase())
         else -> listOf("caution", h.hazard.kind.name.lowercase())
     }
 

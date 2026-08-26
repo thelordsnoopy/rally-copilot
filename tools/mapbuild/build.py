@@ -11,13 +11,18 @@ Pipeline per edge (spec DESIGN.md section 2.2):
 Usage:
   python build.py <input.osm.pbf> <output.sqlite> [minlon minlat maxlon maxlat]
 """
+import io
 import math
+import os
 import sqlite3
 import struct
 import sys
+import time
+import urllib.request
 from collections import defaultdict
 
 import osmium
+from PIL import Image
 
 DRIVABLE = {
     "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified",
@@ -67,6 +72,20 @@ def camera_kind(tags):
     return None
 
 CAMERA_CLUSTER_M = 150.0    # cameras closer than this are one enforcement site
+
+# ---- terrain ----------------------------------------------------------------
+# Braking distance depends on which way the hill runs: gravity helps you stop
+# going up and fights you going down, and downhill-into-a-tightening-corner is
+# exactly where road drivers get caught out. Elevation is sampled along every
+# road at build time, so the app ships a grade per corner rather than a hundred
+# megabytes of terrain.
+TERRAIN_ZOOM = 12                  # ~25 m per pixel at this latitude
+TERRAIN_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+GRADE_WINDOW_M = 80.0              # how far back to measure a corner's approach
+# 8%: a genuine brow that hides the road, not every undulation. At 5% the Stroud
+# valleys alone produced 245 crests in a few square miles, which is chatter.
+CREST_MIN_GRADE_CHANGE = 0.08
+CREST_WINDOW_M = 60.0              # measured either side of the summit
 RESAMPLE_M = 5.0
 STRAIGHT_RADIUS_M = 500.0   # above this, treat as straight
 MIN_CORNER_POINTS = 2
@@ -241,6 +260,147 @@ def parse_width_m(v):
         return None
 
 
+class Elevation:
+    """
+    Metres above sea level, from cached open terrain tiles (no key, no account).
+
+    Terrarium encoding: elevation = R*256 + G + B/256 - 32768. Bilinear between
+    pixels, because a road running diagonally across a 25 m grid otherwise reads
+    as a staircase and every gentle slope looks like a series of steps.
+    """
+
+    def __init__(self, cache_dir, zoom=TERRAIN_ZOOM):
+        self.zoom = zoom
+        self.cache = cache_dir
+        self.tiles = {}
+        self.missing = set()
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def _tile(self, tx, ty):
+        key = (tx, ty)
+        if key in self.tiles:
+            return self.tiles[key]
+        if key in self.missing:
+            return None
+        path = os.path.join(self.cache, f"{self.zoom}_{tx}_{ty}.png")
+        data = None
+        if os.path.exists(path):
+            data = open(path, "rb").read()
+        else:
+            url = TERRAIN_URL.format(z=self.zoom, x=tx, y=ty)
+            for attempt in range(3):
+                try:
+                    data = urllib.request.urlopen(url, timeout=30).read()
+                    open(path, "wb").write(data)
+                    break
+                except Exception:
+                    time.sleep(1 + attempt)
+            if data is None:
+                self.missing.add(key)
+                return None
+        try:
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception:
+            self.missing.add(key)
+            return None
+        px = im.load()
+        grid = [[0.0] * 256 for _ in range(256)]
+        for y in range(256):
+            row = grid[y]
+            for x in range(256):
+                r, g, b = px[x, y]
+                row[x] = (r * 256 + g + b / 256.0) - 32768.0
+        if len(self.tiles) > 40:            # keep memory sane on a big region
+            self.tiles.pop(next(iter(self.tiles)))
+        self.tiles[key] = grid
+        return grid
+
+    def at(self, lat, lon):
+        n = 2 ** self.zoom
+        fx = (lon + 180.0) / 360.0 * n
+        r = math.radians(lat)
+        fy = (1.0 - math.log(math.tan(r) + 1.0 / math.cos(r)) / math.pi) / 2.0 * n
+        tx, ty = int(fx), int(fy)
+        # Pixel position within the tile, offset by half a pixel so bilinear
+        # weights are centred on pixel centres rather than corners.
+        px = (fx - tx) * 256.0 - 0.5
+        py = (fy - ty) * 256.0 - 0.5
+        x0, y0 = math.floor(px), math.floor(py)
+        dx, dy = px - x0, py - y0
+
+        def sample(ix, iy):
+            ttx, tty, sx, sy = tx, ty, ix, iy
+            if sx < 0: ttx, sx = ttx - 1, sx + 256
+            if sx > 255: ttx, sx = ttx + 1, sx - 256
+            if sy < 0: tty, sy = tty - 1, sy + 256
+            if sy > 255: tty, sy = tty + 1, sy - 256
+            g = self._tile(ttx, tty)
+            return None if g is None else g[sy][sx]
+
+        v00, v10 = sample(x0, y0), sample(x0 + 1, y0)
+        v01, v11 = sample(x0, y0 + 1), sample(x0 + 1, y0 + 1)
+        if None in (v00, v10, v01, v11):
+            return next((v for v in (v00, v10, v01, v11) if v is not None), None)
+        return (v00 * (1 - dx) * (1 - dy) + v10 * dx * (1 - dy) +
+                v01 * (1 - dx) * dy + v11 * dx * dy)
+
+
+def grade_at(profile, cum, offset_m, window_m=GRADE_WINDOW_M):
+    """
+    Average slope over the [window_m] leading up to [offset_m]. + = uphill.
+
+    Corners frequently sit right at the start of an edge (edges are split at
+    junctions, and a bend usually follows one), leaving no road behind them to
+    measure. Rather than report those as flat — which silently discards the hill
+    on nearly a fifth of all corners — fall back to a window centred on the
+    corner, which still describes the slope the driver is braking on.
+    """
+    if not profile or len(profile) < 2:
+        return 0.0
+
+    def slope(a_m, b_m):
+        i0 = min(range(len(cum)), key=lambda i: abs(cum[i] - a_m))
+        i1 = min(range(len(cum)), key=lambda i: abs(cum[i] - b_m))
+        if i1 <= i0 or cum[i1] - cum[i0] < 15.0:
+            return None
+        return (profile[i1] - profile[i0]) / (cum[i1] - cum[i0])
+
+    g = slope(max(0.0, offset_m - window_m), offset_m)
+    if g is None:
+        half = window_m / 2.0
+        g = slope(max(0.0, offset_m - half), min(cum[-1], offset_m + half))
+    if g is None:
+        return 0.0
+    return max(-0.30, min(0.30, g))
+
+
+def find_crests(profile, cum):
+    """
+    Summits where the road rises then falls sharply enough to hide what follows.
+
+    Returns (offset_m, grade_change). A blind crest is the one hazard a corner
+    map genuinely cannot express: the geometry beyond may be arrow-straight and
+    still be completely invisible until you are on it.
+    """
+    out = []
+    if len(profile) < 5:
+        return out
+    last_offset = -1e9
+    for i in range(len(profile)):
+        up = grade_at(profile, cum, cum[i], CREST_WINDOW_M)
+        # Slope of the road AFTER this point.
+        j = min(range(len(cum)), key=lambda k: abs(cum[k] - (cum[i] + CREST_WINDOW_M)))
+        if j <= i or cum[j] - cum[i] < 20.0:
+            continue
+        down = (profile[j] - profile[i]) / (cum[j] - cum[i])
+        change = up - down                      # rise then fall = positive
+        if up > 0.015 and down < -0.015 and change >= CREST_MIN_GRADE_CHANGE:
+            if cum[i] - last_offset > 200.0:    # one call per summit
+                out.append((cum[i], change))
+                last_offset = cum[i]
+    return out
+
+
 class Collector(osmium.SimpleHandler):
     def __init__(self, bbox):
         super().__init__()
@@ -388,6 +548,10 @@ def main():
     cam_best = {}   # node_id -> (distance_m, edge_id, offset_m)
     print(f"  {len(col.camera_nodes)} speed cameras to snap")
 
+    terrain_cache = os.path.join(os.path.expanduser("~"), ".rallydev", "downloads", "terrain")
+    elev = Elevation(terrain_cache)
+    print(f"terrain tiles cached in {terrain_cache}")
+
     # Process geometry per edge.
     print(f"processing {len(edges)} edges")
     out_edges, out_corners, out_hazards, cells = [], [], [], []
@@ -413,9 +577,26 @@ def main():
         out_edges.append((eid, e["from"], e["to"], length, e["tags"]["name"], e["tags"]["ref"],
                           e["tags"]["highway"], e["tags"]["maxspeed"], e["tags"]["oneway"],
                           pack_geometry(rs)))
+
+        # Elevation along this edge, and what it implies.
+        rs_cum2 = [0.0]
+        for i in range(1, len(rs)):
+            rs_cum2.append(rs_cum2[-1] + haversine(rs[i - 1], rs[i]))
+        profile = []
+        for la, lo in rs:
+            v = elev.at(la, lo)
+            profile.append(v if v is not None else (profile[-1] if profile else 0.0))
+        if profile and any(v != 0.0 for v in profile):
+            for off, change in find_crests(profile, rs_cum2):
+                out_hazards.append((eid, off, "CREST"))
+        else:
+            profile = []
+
         for c in corners:
+            grade = grade_at(profile, rs_cum2, c["start"]) if profile else 0.0
             out_corners.append((cid, eid, c["start"], c["apex"], c["end"], c["dir"],
-                                c["min_r"], c["entry_r"], c["exit_r"], c["arc"], c["confidence"]))
+                                c["min_r"], c["entry_r"], c["exit_r"], c["arc"],
+                                c["confidence"], grade))
             cid += 1
         # hazards on this edge — offsets measured along the SAME smoothed/resampled
         # geometry the app stores. Measuring along the raw node polyline drifts late
@@ -487,6 +668,8 @@ def main():
                 la, lo = loc[nid]
                 out_junctions.append((nid, la, lo, ",".join(map(str, eids))))
 
+    crests = sum(1 for h in out_hazards if h[2] == "CREST")
+    print(f"  {crests} blind crests; {len(elev.missing)} terrain tiles unavailable")
     print(f"writing {dst}: {len(out_edges)} edges, {len(out_corners)} corners, "
           f"{len(out_hazards)} hazards, {len(out_junctions)} junctions")
     db = sqlite3.connect(dst)
@@ -501,7 +684,7 @@ def main():
         CREATE TABLE junctions(node_id INTEGER PRIMARY KEY, lat REAL, lon REAL, edge_ids TEXT);
         CREATE TABLE corners(id INTEGER PRIMARY KEY, edge_id INTEGER, start_m REAL, apex_m REAL,
             end_m REAL, direction TEXT, min_r REAL, entry_r REAL, exit_r REAL, arc_m REAL,
-            confidence REAL);
+            confidence REAL, approach_grade REAL DEFAULT 0);
         CREATE TABLE hazards(edge_id INTEGER, offset_m REAL, kind TEXT);
         CREATE TABLE edge_cells(cell TEXT, edge_id INTEGER);
         CREATE INDEX idx_cells ON edge_cells(cell);
@@ -510,10 +693,10 @@ def main():
     """)
     db.executemany("INSERT INTO edges VALUES (?,?,?,?,?,?,?,?,?,?)", out_edges)
     db.executemany("INSERT INTO junctions VALUES (?,?,?,?)", out_junctions)
-    db.executemany("INSERT INTO corners VALUES (?,?,?,?,?,?,?,?,?,?,?)", out_corners)
+    db.executemany("INSERT INTO corners VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", out_corners)
     db.executemany("INSERT INTO hazards VALUES (?,?,?)", out_hazards)
     db.executemany("INSERT INTO edge_cells VALUES (?,?)", cells)
-    db.execute("INSERT INTO meta VALUES ('schema','1')")
+    db.execute("INSERT INTO meta VALUES ('schema','2')")
     db.execute("INSERT INTO meta VALUES ('source',?)", (src,))
     db.commit()
     db.execute("VACUUM")

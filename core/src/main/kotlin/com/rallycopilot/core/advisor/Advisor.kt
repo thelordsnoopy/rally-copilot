@@ -81,9 +81,21 @@ class Advisor(
         return v.coerceAtMost(params.userMaxMps)
     }
 
-    /** Metres needed to shed [vNow] down to [vTarget] at the comfortable braking rate. */
-    fun brakingDistanceM(vNow: Double, vTarget: Double): Double =
-        if (vNow > vTarget) (vNow * vNow - vTarget * vTarget) / (2 * params.aBrake) else 0.0
+    /**
+     * Metres needed to shed [vNow] down to [vTarget].
+     *
+     * [gradeFraction] is the slope of the approach, positive uphill. Gravity adds
+     * g·sin(θ) to your braking going up and takes it away coming down, so a 10%
+     * descent costs about a fifth of the retardation — which is precisely the
+     * situation (dropping into a tightening corner) where getting it wrong hurts.
+     */
+    fun brakingDistanceM(vNow: Double, vTarget: Double, gradeFraction: Double = 0.0): Double {
+        if (vNow <= vTarget) return 0.0
+        val slope = kotlin.math.atan(gradeFraction.coerceIn(-0.30, 0.30))
+        // Never let a steep descent drive the usable deceleration to nothing.
+        val a = (params.aBrake + 9.81 * kotlin.math.sin(slope)).coerceAtLeast(1.5)
+        return (vNow * vNow - vTarget * vTarget) / (2 * a)
+    }
 
     /** Seconds of thinking + settling the driver needs after the note finishes. */
     val noteLeadSeconds: Double get() = params.reactionSeconds + params.endLeadSeconds
@@ -138,7 +150,8 @@ class Advisor(
             // Braking point / trigger for the HUD, from build-time speed. The ENGINE
             // recomputes both from live speed every tick — these are display values.
             val v = currentSpeedMps
-            val brakingPointM = (aheadM - brakingDistanceM(v, vTarget)).coerceAtLeast(0.0)
+            val brakingPointM = (aheadM - brakingDistanceM(v, vTarget, corner.approachGrade))
+                .coerceAtLeast(0.0)
             val triggerDistanceM = (brakingPointM - v * noteLeadSeconds).coerceAtLeast(0.0)
 
             out += HorizonCorner(

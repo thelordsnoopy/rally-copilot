@@ -45,8 +45,8 @@ class DriveEngine(
     private val healthWatch: HealthWatch? = null,
     private val knowledge: KnowledgeStore? = null,
     private val slowdown: SlowdownMonitor? = null,
-    /** Low-sun glare warning. Pure geometry; cloud cover is optional. */
-    private val sunWatch: com.rallycopilot.core.sun.SunWatch? = null,
+    /** A word about the corner just taken — spoken only into a straight. */
+    private val coach: com.rallycopilot.core.advisor.Coach? = null,
 ) {
     data class Params(
         val maxAccuracyM: Double = 25.0,
@@ -276,20 +276,6 @@ class DriveEngine(
 
         // Health watch: coolant, battery, ambient/ice. One calm warning per crossing,
         // never interrupting a pacenote.
-        // Low sun straight down the road: you cannot see the corner, and no amount
-        // of corner geometry helps with that.
-        sunWatch?.let { sw ->
-            val f = fix
-            val bearing = lastMatch?.bearingDeg ?: f?.bearingDeg
-            if (f != null && bearing != null && !bearing.isNaN() && speed > 4.0 &&
-                sw.check(now, f.lat, f.lon, bearing) && !audio.isSpeaking()
-            ) {
-                audio.play(Utterance(listOf("warn_sun"), urgent = false,
-                    deadlineDistanceM = 0.0, forCornerId = null))
-                runLog.logEvent(RunEvent(now, RunEventType.HEALTH_WARNING, "sun"))
-            }
-        }
-
         healthWatch?.check(vehicle.coolantC(), vehicle.batteryV(), vehicle.ambientC())?.let { key ->
             if (!audio.isSpeaking()) {
                 audio.play(Utterance(listOf(key), urgent = false, deadlineDistanceM = 0.0, forCornerId = null))
@@ -342,6 +328,8 @@ class DriveEngine(
                 } else if (now - e.value > 30_000) hzIt.remove()
             }
         }
+
+        val quietNow = !alwaysSpeak && !(styleDetector?.isPressingOn ?: true)
 
         // ---- style detection: is this spirited driving? ----
         val insideCorner = h.corners.firstOrNull { c ->
@@ -406,6 +394,22 @@ class DriveEngine(
         // ---- decide what to speak ----
         maybeSpeak(h, speed, now, ::aheadOf)
 
+        // ---- a word about the corner just taken, if the road allows ----
+        // Strictly subordinate to the road ahead: the verdict is only voiced when
+        // nothing is due, and is thrown away rather than queued if a call arrives.
+        coach?.let { c ->
+            collector?.takeLastClosed()?.let { (obs, hc) -> c.onCornerClosed(obs, hc, now) }
+            if (!quietNow) {
+                val gapS = clearRoadSeconds(h, speed, ::aheadOf)
+                c.poll(now, gapS, audio.isSpeaking())?.let { key ->
+                    audio.play(Utterance(listOf(key), urgent = false,
+                        deadlineDistanceM = 0.0, forCornerId = null))
+                }
+            } else {
+                c.clear()
+            }
+        }
+
         val upcoming = h.corners.filter { aheadOf(it) > -5.0 }.sortedBy { aheadOf(it) }
         _hud.value = HudState(
             matched = lastMatch,
@@ -425,6 +429,32 @@ class DriveEngine(
             pressingOn = alwaysSpeak || (styleDetector?.isPressingOn ?: true),
             hazardPrompt = activePrompt,
         )
+    }
+
+    /**
+     * How long the road is clear for, in seconds: time until the next corner call
+     * would come due, or the next hazard needs announcing. This is the budget any
+     * non-essential speech has to fit inside.
+     */
+    private fun clearRoadSeconds(h: Horizon, speed: Double, aheadOf: (HorizonCorner) -> Double): Double {
+        if (speed < 3.0) return 0.0
+        var nearest = Double.MAX_VALUE
+        for (c in h.corners) {
+            if (c.corner.id in spokenCorners) continue
+            val ahead = aheadOf(c)
+            if (ahead <= 0) continue
+            // The moment this corner's call becomes due, not the corner itself.
+            val trigger = advisor.brakingDistanceM(speed, c.vTargetMps, c.corner.approachGrade) +
+                speed * advisor.noteLeadSeconds + speechLeadM(speed, c)
+            nearest = minOf(nearest, (ahead - trigger).coerceAtLeast(0.0))
+        }
+        for (hz in h.hazards) {
+            val ahead = hz.distanceAheadM - progressM
+            val key = "${hz.hazard.edgeId}:${hz.hazard.offsetM.toInt()}"
+            if (ahead <= 0 || key in spokenHazards) continue
+            nearest = minOf(nearest, (ahead - (speed * 6.0 + 50.0)).coerceAtLeast(0.0))
+        }
+        return if (nearest == Double.MAX_VALUE) 30.0 else nearest / speed
     }
 
     private fun maybeSpeak(h: Horizon, speed: Double, now: Long, aheadOf: (HorizonCorner) -> Double) {
@@ -486,7 +516,7 @@ class DriveEngine(
         // reaction lead plus the time the clips take to play. Build-time trigger
         // distances go stale the moment speed changes.
         fun triggerReached(c: HorizonCorner): Boolean {
-            val need = advisor.brakingDistanceM(speed, c.vTargetMps) +
+            val need = advisor.brakingDistanceM(speed, c.vTargetMps, c.corner.approachGrade) +
                 speed * advisor.noteLeadSeconds + speechLeadM(speed, c)
             return aheadOf(c) <= need
         }
@@ -517,7 +547,9 @@ class DriveEngine(
 
         val first = chain.first()
         // The whole utterance must be DONE by the first corner's braking point.
-        val deadline = (aheadOf(first) - advisor.brakingDistanceM(speed, first.vTargetMps)).coerceAtLeast(0.0)
+        val deadline = (aheadOf(first) -
+            advisor.brakingDistanceM(speed, first.vTargetMps, first.corner.approachGrade))
+            .coerceAtLeast(0.0)
 
         // Speak speed and gear only when they tell you something you would not
         // already assume. Calling the target speed of a corner you are already
