@@ -165,6 +165,12 @@ class MainActivity : ComponentActivity() {
         if (testingObd.value) {
             testObd.disconnect(); testingObd.value = false; return
         }
+        // The other half of the same rule: a live drive owns the dongle. Opening a
+        // test link now would take the socket away from the drive mid-corner.
+        if (DriveService.instance?.driveActive == true) {
+            testObd.reportUnavailable("a drive is running — it already owns the dongle")
+            return
+        }
         testingObd.value = true
         val mac = when {
             Build.VERSION.SDK_INT >= 31 &&
@@ -266,6 +272,14 @@ class MainActivity : ComponentActivity() {
     }
 
     fun startDrive(wet: Boolean, calibration: Boolean, demo: Boolean = false, condAuto: Boolean = false) {
+        // The Settings "Test connection" link MUST be closed before the drive opens
+        // its own. An ELM327 accepts exactly one RFCOMM connection: with the test
+        // link still holding the socket, the drive's connect loses the race and the
+        // dongle appears to drop the moment you press DRIVE. onStop() used to be
+        // the only thing closing it, and navigating Settings -> Drive never stops
+        // the activity, so testing the dongle and then driving was the one sequence
+        // guaranteed to break it.
+        if (testingObd.value) { testObd.disconnect(); testingObd.value = false }
         val i = Intent(this, DriveService::class.java)
             .putExtra(DriveService.EXTRA_WET, wet)
             .putExtra(DriveService.EXTRA_COND_AUTO, condAuto)
@@ -794,7 +808,74 @@ fun SettingsScreen(activity: MainActivity) {
             color = Color(0xFF667788), fontSize = 11.sp,
         )
 
+        // ---- what the co-driver does to your music ----
+        Spacer(Modifier.height(16.dp))
+        Text("YOUR MUSIC", color = Color(0xFF7C8B9A), fontSize = 11.sp,
+            letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        var focusMode by remember { mutableStateOf(db.kvGet("audio_focus") ?: "duck") }
+        Row(Modifier.fillMaxWidth().background(Color(0xFF11161D), RoundedCornerShape(12.dp)).padding(4.dp)) {
+            for ((key, label) in listOf("duck" to "DIP IT", "none" to "LEAVE IT ALONE")) {
+                val sel = focusMode == key
+                Button(
+                    onClick = { focusMode = key; db.kvPut("audio_focus", key) },
+                    modifier = Modifier.weight(1f).height(40.dp),
+                    shape = RoundedCornerShape(9.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (sel) Color(0xFF232D38) else Color.Transparent),
+                    elevation = null,
+                ) {
+                    Text(label, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                        color = if (sel) Color(0xFFEAF0F6) else Color(0xFF7C8B9A))
+                }
+            }
+        }
+        Text(
+            if (focusMode == "duck")
+                "Music dips for the second or so a call takes, then comes straight back. " +
+                    "The co-driver no longer holds the audio focus for the whole drive — " +
+                    "that is what was pausing your music from the moment you pressed DRIVE."
+            else "The co-driver never asks for audio focus. Notes play over the top of " +
+                "your music at whatever volume you have set, and nothing else is touched.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
+        var keepAlive by remember { mutableStateOf(db.kvGet("bt_keepalive") != "off") }
+        Spacer(Modifier.height(10.dp))
+        Button(
+            onClick = {
+                keepAlive = !keepAlive
+                db.kvPut("bt_keepalive", if (keepAlive) "on" else "off")
+            },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (keepAlive) Color(0xFF2EE06B) else Color(0xFF141C24)),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+        ) {
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    if (keepAlive) "Keep Bluetooth awake: on" else "Keep Bluetooth awake: off",
+                    fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                    color = if (keepAlive) Color.Black else Color(0xFFEAF0F6),
+                )
+                Text(
+                    "stops the head unit clipping the first word",
+                    fontSize = 10.sp, maxLines = 1,
+                    color = if (keepAlive) Color(0xCC06080B) else Color(0xFF7C8B9A),
+                )
+            }
+        }
+        Text(
+            "Sends continuous near-silence so the car never idles the link. If your music " +
+                "comes from the CAR — radio, USB, another phone — this can make the head unit " +
+                "switch to Bluetooth and stay there. Turn it off if that is happening; you may " +
+                "lose the first syllable of a call. Takes effect on the next drive.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
         // ---- voice level and where it comes out ----
+        Spacer(Modifier.height(16.dp))
         var vol by remember { mutableStateOf(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f) }
         var bal by remember { mutableStateOf(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f) }
 

@@ -26,7 +26,19 @@ class VoicePack(private val context: Context) : AudioSink {
     private val playbackThread = android.os.HandlerThread("voice").apply { start() }
     private val handler = Handler(playbackThread.looper)
     private var focusRequest: android.media.AudioFocusRequest? = null
+    @Volatile private var focusHeld = false
     @Volatile private var speakingUntil = 0L
+
+    /** What the co-driver is allowed to do to whatever else is playing. */
+    enum class FocusMode {
+        /** Ask the music to dip for the length of a call, then hand it straight back. */
+        DUCK,
+        /** Never ask for audio focus at all: notes mix over the top of the music. */
+        NONE,
+    }
+
+    @Volatile
+    var focusMode: FocusMode = FocusMode.DUCK
 
     /** Voice level, 0..1. */
     @Volatile var volume: Float = 1.0f
@@ -111,9 +123,13 @@ class VoicePack(private val context: Context) : AudioSink {
         val totalMs = utterance.clipKeys.sumOf { clipDurationMs(it) }
         speakingUntil = System.currentTimeMillis() + totalMs + 300
         handler.post {
+            acquireFocus()
             stopPlayerQuietly()
             queue = ArrayDeque(paths)
             playNext()
+            // Grace period covers the gap between chained clips and the head unit's
+            // own output delay, so the music is not yo-yoing mid-note.
+            scheduleFocusRelease(totalMs + 1200)
         }
     }
 
@@ -157,6 +173,15 @@ class VoicePack(private val context: Context) : AudioSink {
 
     // ---- A2DP keep-alive: continuous near-silence so the BT link never sleeps ----
 
+    /**
+     * Continuous near-silence so a car head unit never idles the A2DP link and
+     * swallows the first syllable of the next note.
+     *
+     * The cost: if the music is coming from the car itself — radio, USB, another
+     * phone — an always-active Bluetooth stream makes many head units switch source
+     * to Bluetooth and stay there. That is the second way this app can take over
+     * someone's music, and it has nothing to do with audio focus. Hence the toggle.
+     */
     fun startKeepAlive() {
         if (keepAlive != null) return
         val sampleRate = 16000
@@ -192,24 +217,54 @@ class VoicePack(private val context: Context) : AudioSink {
         keepAliveThread = null
     }
 
-    fun requestFocus() {
+    /**
+     * Audio focus is taken PER UTTERANCE and handed back as soon as the call is
+     * over — never held across a drive.
+     *
+     * Holding AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK from the moment DRIVE was tapped
+     * until the drive ended is what silenced Chad's music for an entire journey:
+     * "transient" is a promise to give it back shortly, and plenty of players
+     * (and car head units) respond to it by pausing outright rather than ducking.
+     * A co-driver wants the music dipped for the second and a half it is talking,
+     * and not one moment longer.
+     */
+    private fun acquireFocus() {
+        if (focusMode != FocusMode.DUCK || focusHeld) return
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val req = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+        val req = focusRequest ?: android.media.AudioFocusRequest
+            .Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
             .setAudioAttributes(audioAttrs)
-            .build()
-        focusRequest = req
+            .setWillPauseWhenDucked(false)
+            .build().also { focusRequest = it }
         am.requestAudioFocus(req)
+        focusHeld = true
     }
 
-    fun release() {
-        stopKeepAlive()
-        handler.post { stopPlayerQuietly() }
-        // Give the driver their music back — holding transient focus after the drive
-        // leaves other apps ducked (or paused) until this process dies.
+    private fun releaseFocus() {
+        if (!focusHeld) return
+        focusHeld = false
         focusRequest?.let {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.abandonAudioFocusRequest(it)
         }
+    }
+
+    /** Hand the music back once this utterance is done — unless another call has
+     *  started by then, in which case that one owns the focus and its own release. */
+    private val releaseFocusRunnable = Runnable { releaseFocus() }
+
+    private fun scheduleFocusRelease(afterMs: Long) {
+        handler.removeCallbacks(releaseFocusRunnable)
+        handler.postDelayed(releaseFocusRunnable, afterMs)
+    }
+
+    fun release() {
+        stopKeepAlive()
+        handler.removeCallbacks(releaseFocusRunnable)
+        handler.post { stopPlayerQuietly() }
+        // Give the driver their music back — holding transient focus after the drive
+        // leaves other apps ducked (or paused) until this process dies.
+        releaseFocus()
         focusRequest = null
     }
 

@@ -303,8 +303,10 @@ class DriveService : Service() {
         voice.setVolume(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f)
         voice.setBalance(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f)
         voice.muted = false // a "quiet" from last drive must not silence this one
-        voice.requestFocus()
-        voice.startKeepAlive()
+        // Focus is taken per utterance from here on, never held across the drive.
+        voice.focusMode = if (db.kvGet("audio_focus") == "none") VoicePack.FocusMode.NONE
+        else VoicePack.FocusMode.DUCK
+        if (db.kvGet("bt_keepalive") != "off") voice.startKeepAlive()
         if (isDemo) startDemo(map) else {
             startGps()
             // Bonded-device access needs BLUETOOTH_CONNECT; never let a denial kill the drive.
