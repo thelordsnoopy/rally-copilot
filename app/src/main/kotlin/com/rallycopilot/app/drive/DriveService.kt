@@ -93,6 +93,7 @@ class DriveService : Service() {
     private var imu: ImuMonitor? = null
     private var slowdownMonitor: com.rallycopilot.core.knowledge.SlowdownMonitor? = null
     private var radiusAuditor: com.rallycopilot.core.knowledge.RadiusAuditor? = null
+    private var blackBox: com.rallycopilot.app.debug.BlackBox? = null
     private var voiceCommands: com.rallycopilot.app.audio.VoiceCommands? = null
     @Volatile private var distanceM = 0.0
     private var lastFix: Fix? = null
@@ -188,6 +189,28 @@ class DriveService : Service() {
         val slowMon = com.rallycopilot.core.knowledge.SlowdownMonitor()
         slowdownMonitor = slowMon
         runId = db.startRun(conditions, isCalibration)
+        // The black box opens first: a crash during setup is exactly the kind of
+        // thing there is otherwise no record of.
+        val bb = if (db.kvGet("blackbox") != "off")
+            com.rallycopilot.app.debug.BlackBox(this, runId) else null
+        blackBox = bb
+        bb?.log("drive_start", mapOf(
+            "app" to com.rallycopilot.app.BuildConfig.VERSION_NAME,
+            "versionCode" to com.rallycopilot.app.BuildConfig.VERSION_CODE,
+            "device" to (android.os.Build.MODEL ?: "?"),
+            "android" to android.os.Build.VERSION.SDK_INT,
+            "conditions" to conditions.name, "why" to conditionsWhy,
+            "calibration" to isCalibration, "demo" to isDemo,
+            "car" to db.activeCarKey(),
+            "speakMode" to (db.kvGet("speak_mode") ?: "smart"),
+            "verbosity" to (db.kvGet("verbosity") ?: "all"),
+            "speedSource" to (db.kvGet("speed_source") ?: "auto"),
+            "audioFocus" to (db.kvGet("audio_focus") ?: "pause"),
+            "keepAlive" to (db.kvGet("bt_keepalive") != "off"),
+            "voiceCommands" to (db.kvGet("voice_commands") == "on"),
+            "coaching" to (db.kvGet("coaching") != "off"),
+            "audioLatencyMs" to (db.kvGet("audio_latency_ms") ?: "unmeasured"),
+        ))
         // Separate learned profiles per conditions: wet drives use and train the wet model.
         val profile = db.loadProfile(conditions)
         collector = ObservationCollector(runId, conditions)
@@ -222,6 +245,7 @@ class DriveService : Service() {
             slowdown = slowMon,
             coach = if (db.kvGet("coaching") != "off") com.rallycopilot.core.advisor.Coach() else null,
             radiusAuditor = auditor,
+            telemetry = bb ?: com.rallycopilot.core.engine.NullTelemetry,
         )
         // "always" = call everything whenever driving; default = quiet unless pressing on.
         engine.alwaysSpeak = db.kvGet("speak_mode") == "always"
@@ -285,6 +309,13 @@ class DriveService : Service() {
                 }
             },
         ).also { it.start() }
+
+        bb?.log("profile", mapOf(
+            "push" to profile.pushFactor,
+            "bands" to com.rallycopilot.core.model.SeverityBand.entries.joinToString(";") { b ->
+                "${b.name}:${"%.2f".format(profile.aLatFor(b) / 9.81)}g:n${profile.sampleCountByBand[b] ?: 0}"
+            },
+        ))
 
         // Audio latency: use the remembered measurement immediately, then re-measure
         // in the background (head unit, codec and phone can all change between drives).
@@ -437,9 +468,19 @@ class DriveService : Service() {
             engine.audioLatencyMs = ms
             db.kvPut("audio_latency_ms", ms.toString())
             audioCalibration = "audio delay ${ms} ms (measured)"
+            blackBox?.log("audio_cal", mapOf("ms" to ms, "noise" to r.noiseLevel))
         } else {
             audioCalibration = "${r.message} - using ${engine.audioLatencyMs} ms"
+            blackBox?.log("audio_cal", mapOf("ms" to null, "why" to r.message, "noise" to r.noiseLevel))
         }
+    }
+
+    /** Map view telemetry: what the HUD actually had to draw, and from where. */
+    fun logMapFetch(lat: Double, lon: Double, edgeId: Long, offsetM: Double, edges: Int, ms: Long) {
+        blackBox?.log("map_fetch", mapOf(
+            "lat" to lat, "lon" to lon, "edge" to edgeId, "off" to offsetM,
+            "edges" to edges, "ms" to ms,
+        ))
     }
 
     /** Hands-free commands. Every one is harmless to miss or to false-trigger. */
@@ -572,6 +613,34 @@ class DriveService : Service() {
         scope.launch(engineDispatcher) {
             // A corner in progress when the drive ends still counts as a pass.
             radiusAuditor?.closePass(); radiusAuditor = null
+            val bbEnd = blackBox
+            bbEnd?.log("drive_end", mapOf(
+                "distanceM" to distanceM,
+                "observations" to (obs?.size ?: 0),
+                "usable" to (obs?.let { com.rallycopilot.core.profile.Learning.usable(it).size } ?: 0),
+            ))
+            // Every corner the collector closed, with the exact reason it was or was
+            // not allowed to teach the profile. This is the record that answers
+            // "why did a drive with ten corners learn one?".
+            obs?.forEach { o ->
+                bbEnd?.log("obs", mapOf(
+                    "corner" to o.cornerId, "band" to o.band.name,
+                    "rM" to o.minRadiusM,
+                    "vEntry" to o.vEntryMps, "vMin" to o.vMinMps, "vExit" to o.vExitMps,
+                    "aLat" to o.aLatObserved, "g" to o.aLatObserved / 9.81,
+                    "mapConf" to o.mapConfidence, "pathConf" to o.pathConfidence,
+                    "constrained" to o.wasConstrained, "spirited" to o.spirited,
+                    "throttle" to o.throttleMean,
+                    "rejectedBecause" to when {
+                        o.wasConstrained -> "constrained"
+                        !o.spirited -> "not spirited"
+                        o.mapConfidence < 0.6 -> "map confidence %.2f < 0.60".format(o.mapConfidence)
+                        o.pathConfidence < 0.6 -> "path confidence %.2f < 0.60".format(o.pathConfidence)
+                        o.aLatObserved <= 0.5 -> "lateral g too low"
+                        else -> null
+                    },
+                ))
+            }
             if (rid >= 0 && distanceM < MIN_SAVED_DRIVE_M && obs.isNullOrEmpty()) {
                 // Went nowhere: a mis-tap, or the app opened to check a setting.
                 // Not a drive, so do not keep one.
@@ -591,6 +660,7 @@ class DriveService : Service() {
                     }
                 }
             }
+            blackBox?.close(); blackBox = null
             stopSelf()
         }
         // Scope stays alive: Android may reuse this instance for the next drive.

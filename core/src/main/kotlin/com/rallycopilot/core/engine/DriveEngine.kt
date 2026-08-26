@@ -49,16 +49,14 @@ class DriveEngine(
     private val coach: com.rallycopilot.core.advisor.Coach? = null,
     /** Compares IMU-measured corner radius against the map (see RadiusAuditor). */
     private val radiusAuditor: com.rallycopilot.core.knowledge.RadiusAuditor? = null,
+    /** Black box. Records what was nearly done as well as what was done. */
+    private val telemetry: Telemetry = NullTelemetry,
 ) {
     data class Params(
         val maxAccuracyM: Double = 25.0,
         val maxJumpMps: Double = 90.0,
         /** At or above this path confidence a corner is called plainly. */
         val speakConfidence: Double = 0.50,
-        /** Between here and [speakConfidence] the call is HEDGED — spoken with a
-         *  leading "care" instead of being suppressed. Below this the wrong-road
-         *  risk is real and silence stays the rule. */
-        val hedgeConfidence: Double = 0.30,
         val gpsLostAfterMs: Long = 3000,
         /** Rebuild horizon on edge change or heading change beyond this. */
         val rebuildHeadingDeg: Double = 25.0,
@@ -211,6 +209,7 @@ class DriveEngine(
         val prev = lastFix
         // ---- validate ----
         if (fix.accuracyM > params.maxAccuracyM) {
+            telemetry.log("fix_rejected", mapOf("why" to "accuracy", "acc" to fix.accuracyM))
             runLog.logFix(fix, null, null, null, wasPredicted = false)
             return
         }
@@ -220,7 +219,10 @@ class DriveEngine(
                 val d = com.rallycopilot.core.geo.Geo.haversineM(
                     LatLon(prev.lat, prev.lon), LatLon(fix.lat, fix.lon)
                 )
-                if (d / dt > params.maxJumpMps) return // implausible jump
+                if (d / dt > params.maxJumpMps) {
+                    telemetry.log("fix_rejected", mapOf("why" to "jump", "mps" to d / dt))
+                    return
+                }
             }
         }
         lastFix = fix
@@ -229,6 +231,7 @@ class DriveEngine(
         val m = matcher.match(fix)
         runLog.logFix(fix, m?.edgeId, m?.offsetM, m?.confidence, wasPredicted = false)
         if (m == null) {
+            telemetry.log("match_lost", mapOf("lat" to fix.lat, "lon" to fix.lon, "acc" to fix.accuracyM))
             if (lastMatch != null) runLog.logEvent(RunEvent(fix.tMs, RunEventType.MATCH_LOST))
             lastMatch = null
             horizon = null
@@ -251,6 +254,7 @@ class DriveEngine(
             val raw = horizonBuilder.build(m)
             if (raw == null) {
                 horizon = null
+                telemetry.log("horizon_none", mapOf("edge" to m.edgeId, "off" to m.offsetM))
                 runLog.logEvent(RunEvent(fix.tMs, RunEventType.MPP_AMBIGUOUS))
             } else {
                 val speed = fusedSpeed(fix.speedMps)
@@ -266,6 +270,19 @@ class DriveEngine(
                 // them, or a corner in progress reopens and ratchets vMin through
                 // unrelated road into a garbage observation.
                 collector?.onHorizonRebuilt(newHorizon.corners)
+                telemetry.log("horizon", mapOf(
+                    "edges" to newHorizon.pathEdgeIds.size,
+                    "lengthM" to newHorizon.totalLengthM,
+                    "confEnd" to newHorizon.confidenceAtEnd,
+                    "why" to if (edgeChanged) "edge" else "heading",
+                    "corners" to newHorizon.corners.joinToString(";") { c ->
+                        "${c.corner.id}:${c.corner.direction}:${c.band}:" +
+                            "${c.distanceAheadM.toInt()}m:r${c.corner.minRadiusM.toInt()}:" +
+                            "conf${(c.corner.confidence * 100).toInt()}:" +
+                            "path${(c.pathConfidence * 100).toInt()}:" +
+                            "v${(c.vTargetMps * 2.23694).toInt()}"
+                    },
+                ))
                 runLog.logEvent(RunEvent(fix.tMs, RunEventType.HORIZON_REBUILT))
             }
         } else {
@@ -421,6 +438,30 @@ class DriveEngine(
             }
         }
 
+        // ---- black box: a state line, ~1 Hz, plus the whole horizon each rebuild ----
+        if (now - lastTelemetryMs >= 1000) {
+            lastTelemetryMs = now
+            val m2 = lastMatch
+            telemetry.log("state", mapOf(
+                "lat" to fix?.lat, "lon" to fix?.lon, "acc" to fix?.accuracyM,
+                "edge" to m2?.edgeId, "off" to m2?.offsetM, "fwd" to m2?.forward,
+                "matchConf" to m2?.confidence,
+                "speed" to speed, "obdSpeed" to vehicle.obdSpeedMps(), "usingObd" to usingObdSpeed,
+                "gear" to gear, "rpm" to vehicle.rpm(), "throttle" to vehicle.throttle01(),
+                "aLatImu" to imuLateralMps2,
+                "progress" to progressM, "odo" to odometerM,
+                "horizonCorners" to h.corners.size, "horizonM" to h.totalLengthM,
+                "confEnd" to h.confidenceAtEnd,
+                "spirited" to spiritedNow, "spiritedFrac" to (styleDetector?.spiritedFraction ?: 0.0),
+                "pressingOn" to (styleDetector?.isPressingOn ?: true),
+                "quiet" to quietNow, "speaking" to audio.isSpeaking(),
+                "activeObs" to (collector?.activeCount ?: 0),
+                "nextCorner" to h.corners.firstOrNull { aheadOf(it) > 0 }?.let {
+                    "${it.corner.direction}${it.band}@${aheadOf(it).toInt()}m r=${it.corner.minRadiusM.toInt()}"
+                },
+            ))
+        }
+
         // ---- decide what to speak ----
         maybeSpeak(h, speed, now, ::aheadOf)
 
@@ -538,6 +579,10 @@ class DriveEngine(
                 c.band.ordinal <= maxSpokenBandOrdinal
             if (ok && c.pathConfidence < params.speakConfidence) {
                 if (suppressionLogged.add(c.corner.id)) {
+                    telemetry.log("note_suppressed", mapOf(
+                        "corner" to c.corner.id, "band" to c.band.name,
+                        "pathConf" to c.pathConfidence, "need" to params.speakConfidence,
+                        "aheadM" to aheadOf(c)))
                     runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
                 }
                 false
@@ -553,7 +598,24 @@ class DriveEngine(
                 speed * advisor.noteLeadSeconds + speechLeadM(speed, c)
             return aheadOf(c) <= need
         }
-        val due = speakable.firstOrNull { triggerReached(it) } ?: return
+        val due = speakable.firstOrNull { triggerReached(it) } ?: run {
+            // The near-miss line: what WOULD be called, and how far off the trigger
+            // it is. This is the record that says whether a missing call was a
+            // suppressed corner, an untriggered one, or a corner never in the horizon.
+            speakable.firstOrNull()?.let { c ->
+                val need = advisor.brakingDistanceM(speed, c.vTargetMps, c.corner.approachGrade) +
+                    speed * advisor.noteLeadSeconds + speechLeadM(speed, c)
+                if (now - lastPendingLogMs >= 2000) {
+                    lastPendingLogMs = now
+                    telemetry.log("note_pending", mapOf(
+                        "corner" to c.corner.id, "band" to c.band.name,
+                        "aheadM" to aheadOf(c), "needM" to need, "speed" to speed,
+                        "vTarget" to c.vTargetMps,
+                    ))
+                }
+            }
+            return
+        }
 
         // Speak from the NEAREST speakable corner: if a far severe corner comes due
         // while a nearer gentle one hasn't triggered yet, the driver still must hear
@@ -609,6 +671,17 @@ class DriveEngine(
             durationOf = { audio.clipDurationMs(it) },
         )
         chain.forEach { spokenCorners[it.corner.id] = now }
+        telemetry.log("note", mapOf(
+            "keys" to utterance.clipKeys.joinToString("+"),
+            "urgent" to utterance.urgent,
+            "chain" to chain.size,
+            "speed" to speed,
+            "deadlineM" to deadline,
+            "corners" to chain.joinToString(";") { c ->
+                "${c.corner.id}:${c.band}:${aheadOf(c).toInt()}m:v${(c.vTargetMps * 2.23694).toInt()}"
+            },
+            "detail" to "speed=${detail.speed},gear=${detail.gear}",
+        ))
         audio.play(utterance)
         lastCall = "corners=" + chain.joinToString(",") { it.corner.id.toString() } +
             " keys=" + utterance.clipKeys.joinToString("+") +
@@ -617,6 +690,8 @@ class DriveEngine(
     }
 
     private var lastCall: String? = null
+    private var lastTelemetryMs = 0L
+    private var lastPendingLogMs = 0L
 
     /**
      * The driver said "wrong". Stamp the last thing the co-driver said, plus where

@@ -465,7 +465,14 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
             if (e != null) {
                 val cum = Polyline.cumulative(e.geometry)
                 val c = Polyline.pointAt(e.geometry, cum, m.offsetM)
+                val t0 = System.currentTimeMillis()
                 val near = s.edgesNear(c, MAP_RADIUS_M)
+                // Black box: exactly what the map view had to draw, and where from.
+                // "The map cut off" is unanswerable without this.
+                activity.driveService?.logMapFetch(
+                    c.lat, c.lon, m.edgeId, m.offsetM, near.size,
+                    System.currentTimeMillis() - t0,
+                )
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                     centre = c; nearby = near
                 }

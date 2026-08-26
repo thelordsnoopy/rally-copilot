@@ -86,3 +86,22 @@ object NullVehicleData : VehicleData {
     override fun mapKpa(): Int? = null
     override fun fuelLevel01(): Double? = null
 }
+
+/**
+ * Black box: a dense, self-describing trace of everything the engine did, for
+ * diagnosing a drive after the fact instead of guessing from the driver's memory.
+ *
+ * Deliberately separate from [RunLog]. RunLog records the handful of events the app
+ * itself reasons about; this records whatever is needed to answer "why did it do
+ * that", including the near-misses — the corner that was nearly called, the
+ * observation that was nearly kept — which are exactly the things no other record
+ * keeps. Cheap and non-blocking: implementations buffer and write off-thread.
+ */
+interface Telemetry {
+    /** [fields] is a flat key=value map; the implementation decides the format. */
+    fun log(kind: String, fields: Map<String, Any?>)
+}
+
+object NullTelemetry : Telemetry {
+    override fun log(kind: String, fields: Map<String, Any?>) {}
+}

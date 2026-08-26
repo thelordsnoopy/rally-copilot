@@ -12,6 +12,12 @@ class ObservationCollector(
     private val runId: Long,
     private val conditions: Conditions,
 ) {
+    companion object {
+        /** Slack past the mapped arc before a detached corner is closed out — the
+         *  driven line runs slightly long, and closing early clips the exit speed. */
+        const val DETACHED_MARGIN_M = 15.0
+    }
+
     private data class Tracking(
         var hc: HorizonCorner,
         var vEntry: Double = Double.NaN,
@@ -21,6 +27,20 @@ class ObservationCollector(
         var throttleN: Int = 0,
         var sawStopAfter: Boolean = false,
         var wasSpirited: Boolean = false,
+        /**
+         * Metres driven since this corner was entered, integrated from live speed.
+         *
+         * This is what makes a corner survive to become an observation. The horizon
+         * is rebuilt whenever heading changes by more than 25°, which is guaranteed
+         * part-way through any real corner — and a rebuilt horizon only lists
+         * corners still AHEAD, so the corner being driven vanishes from it. The
+         * tracker used to be discarded at that moment, which is to say: every corner
+         * actually driven through was thrown away, and only the gentle ones that
+         * never triggered a rebuild ever reached the profile.
+         */
+        var travelledM: Double = 0.0,
+        /** The corner is no longer in the horizon; distance alone closes it now. */
+        var detached: Boolean = false,
     )
 
     private var spiritedNow: Boolean = false
@@ -38,6 +58,9 @@ class ObservationCollector(
 
     val observations: List<CornerObservation> get() = done
 
+    /** Corners currently being tracked through — black box only. */
+    val activeCount: Int get() = active.size
+
     /**
      * The horizon was rebuilt: every active tracker's distances are stale. Remap each
      * onto the corner's fresh HorizonCorner, or abort trackers whose corner is gone —
@@ -46,11 +69,16 @@ class ObservationCollector(
      */
     fun onHorizonRebuilt(newCorners: List<HorizonCorner>) {
         val byId = newCorners.associateBy { it.corner.id }
-        val it = active.iterator()
-        while (it.hasNext()) {
-            val t = it.next()
+        for (t in active) {
             val fresh = byId[t.hc.corner.id]
-            if (fresh == null) it.remove() else t.hc = fresh
+            if (fresh != null) {
+                t.hc = fresh
+                t.detached = false
+            } else {
+                // Gone from the horizon because we are INSIDE it. Keep tracking on
+                // distance travelled — never discard it, that was the whole bug.
+                t.detached = true
+            }
         }
     }
 
@@ -69,6 +97,11 @@ class ObservationCollector(
         distanceAheadOf: (HorizonCorner) -> Double,
     ) {
         this.spiritedNow = spiritedNow
+        // Metres covered since the last tick, for the distance-based fallback.
+        val dtS = if (lastTickMs == 0L) 0.0 else ((tMs - lastTickMs) / 1000.0).coerceIn(0.0, 2.0)
+        lastTickMs = tMs
+        val stepM = speedMps * dtS
+
         // Start tracking corners we are about to enter.
         for (hc in horizonCorners) {
             val ahead = distanceAheadOf(hc)
@@ -80,24 +113,29 @@ class ObservationCollector(
         val it = active.iterator()
         while (it.hasNext()) {
             val t = it.next()
-            val ahead = distanceAheadOf(t.hc)
-            val exitAhead = ahead + t.hc.corner.arcLengthM
-            when {
-                exitAhead > 0.0 -> { // still inside (or approaching apex)
-                    if (speedMps < t.vMin) t.vMin = speedMps
-                    if (throttle01 != null) { t.throttleSum += throttle01; t.throttleN++ }
-                }
-                else -> { // fully past: close out
-                    t.vExit = speedMps
-                    if (speedMps < 1.0) t.sawStopAfter = true
-                    val closed = finish(t, tMs)
-                    done += closed
-                    lastClosed = closed to t.hc
-                    it.remove()
-                }
+            t.travelledM += stepM
+            // Corner still on the horizon: trust its geometry. Detached (we are
+            // inside it, so it has dropped off): fall back to distance travelled.
+            val stillInside = if (t.detached) {
+                t.travelledM < t.hc.corner.arcLengthM + DETACHED_MARGIN_M
+            } else {
+                distanceAheadOf(t.hc) + t.hc.corner.arcLengthM > 0.0
+            }
+            if (stillInside) {
+                if (speedMps < t.vMin) t.vMin = speedMps
+                if (throttle01 != null) { t.throttleSum += throttle01; t.throttleN++ }
+            } else {
+                t.vExit = speedMps
+                if (speedMps < 1.0) t.sawStopAfter = true
+                val closed = finish(t, tMs)
+                done += closed
+                lastClosed = closed to t.hc
+                it.remove()
             }
         }
     }
+
+    private var lastTickMs = 0L
 
     private fun finish(t: Tracking, tMs: Long): CornerObservation {
         val r = t.hc.corner.minRadiusM

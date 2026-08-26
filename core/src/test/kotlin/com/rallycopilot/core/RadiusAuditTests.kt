@@ -168,3 +168,67 @@ class HedgedCallTests {
         assertFalse("but long must not", "long" in keys)
     }
 }
+
+/**
+ * The corner you are actually driving through must survive to become an observation.
+ *
+ * The horizon is rebuilt whenever heading changes by more than 25°, which happens
+ * part-way through every real corner, and a rebuilt horizon only lists corners still
+ * AHEAD. The collector used to discard any tracker whose corner had vanished — so
+ * every corner genuinely driven through was thrown away, and only gentle bends that
+ * never triggered a rebuild reached the profile. One spirited drive over ten-plus
+ * corners produced exactly one observation, in band five.
+ */
+class ObservationSurvivalTests {
+
+    private fun corner(id: Long, rM: Double, arc: Double) = Corner(
+        id, 1, 0.0, arc / 2, arc, Direction.LEFT, rM, rM, rM, arc, 0.9,
+    )
+
+    private fun horizonCorner(c: Corner, aheadM: Double) = HorizonCorner(
+        corner = c, distanceAheadM = aheadM, pathConfidence = 0.9,
+        band = SeverityBand.TWO, modifiers = emptyList(),
+        vTargetMps = 14.0, brakingPointM = 0.0, triggerDistanceM = 0.0,
+    )
+
+    @Test
+    fun `a corner driven through survives the mid-corner horizon rebuild`() {
+        val col = com.rallycopilot.core.profile.ObservationCollector(
+            runId = 1, conditions = com.rallycopilot.core.model.Conditions.DRY)
+        val c = corner(1, 35.0, arc = 60.0)
+        var ahead = 10.0
+        var t = 0L
+        val speed = 15.0
+        // Approach: the corner is on the horizon and we enter it.
+        repeat(3) {
+            col.tick(t, speed, null, listOf(horizonCorner(c, ahead)), spiritedNow = true) { ahead }
+            ahead -= 5.0; t += 333
+        }
+        // Turning in: heading swings, the horizon is rebuilt, and the corner we are
+        // INSIDE is no longer listed on it.
+        col.onHorizonRebuilt(emptyList())
+        // Drive the rest of the corner with an empty horizon.
+        repeat(30) {
+            col.tick(t, speed, null, emptyList(), spiritedNow = true) { -999.0 }
+            t += 333
+        }
+        val obs = col.observations
+        assertEquals("the corner must produce exactly one observation", 1, obs.size)
+        assertEquals(1L, obs[0].cornerId)
+        assertTrue("entry speed recorded", obs[0].vEntryMps > 0)
+        assertTrue("lateral g computed", obs[0].aLatObserved > 0)
+    }
+
+    @Test
+    fun `an approaching corner that vanishes for real is still closed, not leaked`() {
+        val col = com.rallycopilot.core.profile.ObservationCollector(
+            runId = 1, conditions = com.rallycopilot.core.model.Conditions.DRY)
+        val c = corner(2, 35.0, arc = 40.0)
+        col.tick(0, 12.0, null, listOf(horizonCorner(c, 5.0)), spiritedNow = true) { 5.0 }
+        col.onHorizonRebuilt(emptyList())
+        // Long enough to run past the arc plus the margin at 12 m/s.
+        var t = 100L
+        repeat(60) { col.tick(t, 12.0, null, emptyList(), spiritedNow = true) { -999.0 }; t += 200 }
+        assertEquals(1, col.observations.size)
+    }
+}

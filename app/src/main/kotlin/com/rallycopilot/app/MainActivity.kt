@@ -816,6 +816,53 @@ fun SettingsScreen(activity: MainActivity) {
             modifier = Modifier.padding(top = 4.dp),
         )
 
+        // ---- black box ----
+        Spacer(Modifier.height(16.dp))
+        Text("BLACK BOX", color = Color(0xFF7C8B9A), fontSize = 11.sp,
+            letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        var blackbox by remember { mutableStateOf(db.kvGet("blackbox") != "off") }
+        Button(
+            onClick = {
+                blackbox = !blackbox
+                db.kvPut("blackbox", if (blackbox) "on" else "off")
+            },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (blackbox) Color(0xFF2EE06B) else Color(0xFF141C24)),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+        ) {
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    if (blackbox) "Black box: recording" else "Black box: off",
+                    fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                    color = if (blackbox) Color.Black else Color(0xFFEAF0F6),
+                )
+                Text(
+                    "full telemetry per drive, for debugging over a cable",
+                    fontSize = 10.sp, maxLines = 1,
+                    color = if (blackbox) Color(0xCC06080B) else Color(0xFF7C8B9A),
+                )
+            }
+        }
+        run {
+            val dir = com.rallycopilot.app.debug.BlackBox.directory(activity)
+            val files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
+            val totalKb = files.sumOf { it.length() } / 1024
+            Text(
+                "${files.size} drive${if (files.size == 1) "" else "s"} recorded, $totalKb KB. " +
+                    "Every fix, match, horizon, call, near-miss and rejected observation, " +
+                    "with the reason. Pull it with:",
+                color = Color(0xFF667788), fontSize = 11.sp,
+            )
+            Text(
+                "adb pull ${dir.absolutePath}",
+                color = Color(0xFF8FD9FF), fontSize = 10.sp,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+
         // ---- what the co-driver does to your music ----
         Spacer(Modifier.height(16.dp))
         Text("YOUR MUSIC", color = Color(0xFF7C8B9A), fontSize = 11.sp,
