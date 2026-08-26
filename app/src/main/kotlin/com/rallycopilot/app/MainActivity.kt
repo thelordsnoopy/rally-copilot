@@ -10,6 +10,8 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -71,6 +73,17 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
+    /** Set when a newer release has been downloaded and is ready to install. */
+    val updateReady = androidx.compose.runtime.mutableStateOf<com.rallycopilot.app.update.Updater.Available?>(null)
+
+    private fun checkForUpdates() {
+        lifecycleScope.launch {
+            updateReady.value = com.rallycopilot.app.update.Updater.check(
+                this@MainActivity, BuildConfig.VERSION_NAME
+            )
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         permissionLauncher.launch(
@@ -80,6 +93,7 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.BLUETOOTH_CONNECT,
             )
         )
+        checkForUpdates()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 AppNav(this)
@@ -146,6 +160,25 @@ fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
             color = inkDim, fontSize = 11.sp, letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold,
         )
         Spacer(Modifier.height(26.dp))
+
+        // OTA update banner: appears only when a newer release is downloaded and ready.
+        activity.updateReady.value?.let { update ->
+            Button(
+                onClick = { com.rallycopilot.app.update.Updater.install(activity, update) },
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6BB8FF)),
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "UPDATE v${update.version} READY — TAP TO INSTALL",
+                        fontSize = 14.sp, color = Color(0xFF06080B), fontWeight = FontWeight.Black,
+                    )
+                    Text("downloaded · one tap · data survives", fontSize = 10.sp, color = Color(0xCC06080B))
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+        }
 
         Button(
             onClick = { activity.startDrive(wet, calibration = false); onNav("drive") },
