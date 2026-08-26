@@ -12,8 +12,8 @@ android {
         applicationId = "com.rallycopilot.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.6.0"
+        versionCode = 10
+        versionName = "0.7.0"
     }
 
     buildTypes {
@@ -49,5 +49,8 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.navigation:navigation-compose:2.7.7")
+    // Explicit modern Fragment: the activity-result API rejects the ancient
+    // transitive fragment version at lint/runtime.
+    implementation("androidx.fragment:fragment-ktx:1.8.2")
     implementation("com.google.android.gms:play-services-location:21.3.0")
 }

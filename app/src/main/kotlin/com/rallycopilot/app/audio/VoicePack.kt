@@ -21,8 +21,12 @@ import java.io.File
 class VoicePack(private val context: Context) : AudioSink {
 
     private val durations = HashMap<String, Long>()   // "normal/left_four" -> ms
-    private val handler = Handler(Looper.getMainLooper())
-    private var speakingUntil = 0L
+    /** Playback runs on its own thread: MediaPlayer prepare() is synchronous I/O and
+     *  has no business on the main thread mid-drive. */
+    private val playbackThread = android.os.HandlerThread("voice").apply { start() }
+    private val handler = Handler(playbackThread.looper)
+    private var focusRequest: android.media.AudioFocusRequest? = null
+    @Volatile private var speakingUntil = 0L
     private var player: MediaPlayer? = null
     private var queue = ArrayDeque<String>()          // asset paths remaining in current utterance
     private var keepAlive: AudioTrack? = null
@@ -132,12 +136,28 @@ class VoicePack(private val context: Context) : AudioSink {
 
     fun requestFocus() {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        @Suppress("DEPRECATION")
-        am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+        val req = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(audioAttrs)
+            .build()
+        focusRequest = req
+        am.requestAudioFocus(req)
     }
 
     fun release() {
         stopKeepAlive()
-        stopPlayerQuietly()
+        handler.post { stopPlayerQuietly() }
+        // Give the driver their music back — holding transient focus after the drive
+        // leaves other apps ducked (or paused) until this process dies.
+        focusRequest?.let {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.abandonAudioFocusRequest(it)
+        }
+        focusRequest = null
+    }
+
+    /** Final teardown when the owning service dies. */
+    fun shutdown() {
+        release()
+        playbackThread.quitSafely()
     }
 }

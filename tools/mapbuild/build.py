@@ -195,6 +195,19 @@ def parse_maxspeed(v):
         return None
 
 
+def parse_width_m(v):
+    """Metric width tags only ("3", "2.5", "3 m"); anything else -> None."""
+    if not v:
+        return None
+    v = v.strip().lower()
+    if v.endswith("m"):
+        v = v[:-1].strip()
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
 class Collector(osmium.SimpleHandler):
     def __init__(self, bbox):
         super().__init__()
@@ -223,12 +236,24 @@ class Collector(osmium.SimpleHandler):
         nodes = [n.ref for n in w.nodes]
         if len(nodes) < 2:
             return
+        # oneway=-1 / reverse means "one way, AGAINST node order": normalise by
+        # flipping the node list, so downstream logic only ever sees forward oneways.
+        ow = w.tags.get("oneway")
+        if ow in ("-1", "reverse"):
+            nodes.reverse()
+            oneway = 1
+        else:
+            oneway = 1 if ow in ("yes", "1", "true") else 0
+        # Narrow bridges: bridge tag plus a metric width under 3.5 m earns a caution.
+        width = parse_width_m(w.tags.get("maxwidth")) or parse_width_m(w.tags.get("width"))
+        narrow_bridge = (w.tags.get("bridge") or "no") != "no" and width is not None and width <= 3.5
         tags = {
             "highway": hw,
             "name": w.tags.get("name"),
             "ref": w.tags.get("ref"),
             "maxspeed": parse_maxspeed(w.tags.get("maxspeed")),
-            "oneway": 1 if w.tags.get("oneway") in ("yes", "1", "true") else 0,
+            "oneway": oneway,
+            "narrow_bridge": narrow_bridge,
         }
         self.ways.append((w.id, nodes, tags))
         for nid in nodes:
@@ -335,14 +360,21 @@ def main():
             out_corners.append((cid, eid, c["start"], c["apex"], c["end"], c["dir"],
                                 c["min_r"], c["entry_r"], c["exit_r"], c["arc"], c["confidence"]))
             cid += 1
-        # hazards on this edge
-        cumd = [0.0]
-        for i in range(1, len(latlons)):
-            cumd.append(cumd[-1] + haversine(latlons[i - 1], latlons[i]))
-        for i, nid in enumerate(e["nodes"]):
+        # hazards on this edge — offsets measured along the SAME smoothed/resampled
+        # geometry the app stores. Measuring along the raw node polyline drifts late
+        # through bends (smoothing shortens the path) and can even exceed the stored
+        # edge length, which silently drops the hazard on reverse traversal.
+        rs_cum = [0.0]
+        for i in range(1, len(rs)):
+            rs_cum.append(rs_cum[-1] + haversine(rs[i - 1], rs[i]))
+        for nid in e["nodes"]:
             kind = col.hazard_nodes.get(nid)
-            if kind:
-                out_hazards.append((eid, cumd[i], kind))
+            if kind and nid in loc:
+                hz = loc[nid]
+                j = min(range(len(rs)), key=lambda k: haversine(rs[k], hz))
+                out_hazards.append((eid, rs_cum[j], kind))
+        if e["tags"].get("narrow_bridge"):
+            out_hazards.append((eid, length / 2.0, "NARROW_BRIDGE"))
         seen = set()
         for la, lo in rs:
             k = cell_of(la, lo)

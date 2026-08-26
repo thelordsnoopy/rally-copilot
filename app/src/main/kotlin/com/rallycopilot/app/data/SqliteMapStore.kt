@@ -17,8 +17,13 @@ import kotlin.math.floor
 
 /**
  * Reads the region database produced by tools/mapbuild. The bundled region asset is
- * copied to filesDir on first run. Edges are cached in memory as they are touched —
- * a drive touches a few hundred edges, not sixty thousand.
+ * copied to filesDir (atomically: temp file + rename, so a crash mid-copy never
+ * leaves a truncated database behind) and re-copied whenever the APK version
+ * changes — an update shipping corrected map data must actually take effect.
+ * Edges are cached in memory as they are touched — a drive touches a few hundred
+ * edges, not sixty thousand.
+ *
+ * Methods are synchronized: the engine thread and the map view both read this.
  */
 class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sqlite") : MapStore {
 
@@ -30,17 +35,43 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
 
     init {
         val f = File(context.filesDir, "region.sqlite")
-        if (!f.exists()) {
+        val versionFile = File(context.filesDir, "region.version")
+        val wantVersion = com.rallycopilot.app.BuildConfig.VERSION_CODE.toString()
+
+        fun copyAsset() {
+            val tmp = File(context.filesDir, "region.sqlite.tmp")
             context.assets.open(assetName).use { input ->
-                f.outputStream().use { input.copyTo(it) }
+                tmp.outputStream().use { input.copyTo(it) }
             }
+            if (f.exists()) f.delete()
+            if (!tmp.renameTo(f)) throw java.io.IOException("rename failed: ${tmp.path}")
+            versionFile.writeText(wantVersion)
         }
-        db = SQLiteDatabase.openDatabase(f.path, null, SQLiteDatabase.OPEN_READONLY)
+
+        fun openValidated(): SQLiteDatabase {
+            val d = SQLiteDatabase.openDatabase(f.path, null, SQLiteDatabase.OPEN_READONLY)
+            // Cheap integrity probe: a truncated copy fails here, not mid-drive.
+            d.rawQuery("SELECT value FROM meta WHERE key='schema'", null).use { it.moveToFirst() }
+            return d
+        }
+
+        if (!f.exists() || versionFile.takeIf { it.exists() }?.readText() != wantVersion) copyAsset()
+        db = try {
+            openValidated()
+        } catch (_: Exception) {
+            // Corrupt (earlier crash mid-copy on an old build, or disk trouble): recopy once.
+            copyAsset()
+            openValidated()
+        }
     }
+
+    @Synchronized
+    fun close() { runCatching { db.close() } }
 
     private fun cellOf(lat: Double, lon: Double) =
         "${floor(lat * 100).toInt()}:${floor(lon * 100).toInt()}"
 
+    @Synchronized
     override fun edgesNear(p: LatLon, radiusM: Double): List<Edge> {
         // 0.01 deg cells are ~1.1 km; a 3x3 neighbourhood always covers a 35 m search.
         val cells = ArrayList<String>(9)
@@ -58,6 +89,7 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
         return ids.mapNotNull { edge(it) }
     }
 
+    @Synchronized
     override fun edge(id: Long): Edge? = edgeCache.getOrPut(id) {
         db.rawQuery("SELECT * FROM edges WHERE id=?", arrayOf(id.toString())).use { c ->
             if (!c.moveToFirst()) return null
@@ -76,6 +108,7 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
         }
     }
 
+    @Synchronized
     override fun junction(nodeId: Long): Junction? = junctionCache.getOrPut(nodeId) {
         db.rawQuery("SELECT lat, lon, edge_ids FROM junctions WHERE node_id=?", arrayOf(nodeId.toString())).use { c ->
             if (!c.moveToFirst()) null
@@ -84,6 +117,7 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
         }
     }
 
+    @Synchronized
     override fun cornersOn(edgeId: Long): List<Corner> = cornerCache.getOrPut(edgeId) {
         val out = ArrayList<Corner>()
         db.rawQuery("SELECT * FROM corners WHERE edge_id=? ORDER BY start_m", arrayOf(edgeId.toString())).use { c ->
@@ -100,6 +134,7 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
         out
     }
 
+    @Synchronized
     override fun hazardsOn(edgeId: Long): List<Hazard> = hazardCache.getOrPut(edgeId) {
         val out = ArrayList<Hazard>()
         db.rawQuery("SELECT offset_m, kind FROM hazards WHERE edge_id=?", arrayOf(edgeId.toString())).use { c ->
@@ -111,6 +146,7 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
         out
     }
 
+    @Synchronized
     override fun isEmptyAt(p: LatLon): Boolean = edgesNear(p, 500.0).isEmpty()
 
     private fun unpack(blob: ByteArray): List<LatLon> {

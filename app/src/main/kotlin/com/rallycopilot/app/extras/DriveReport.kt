@@ -27,7 +27,7 @@ object DriveReport {
     )
 
     fun build(context: Context, runId: Long): Full {
-        val db = AppDb(context)
+        val db = AppDb.get(context)
         val fixes = db.fixesFor(runId)
         val obs = db.observationsFor(runId)
         val run = db.runs().firstOrNull { it.id == runId }

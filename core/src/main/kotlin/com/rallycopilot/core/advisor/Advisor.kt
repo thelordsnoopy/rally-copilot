@@ -23,8 +23,10 @@ class Advisor(
     var conditions: Conditions = Conditions.DRY,
     /** Personal knowledge layer: learned speed factor for a stretch of an edge. */
     var speedFactorLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double)? = null,
-    /** Learned camber, degrees, positive = road leans car-left. Null until measured. */
+    /** Learned camber, degrees, positive = road leans car-left when driven FORWARD (node order). */
     var camberLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double?)? = null,
+    /** Gear suggestion for a target speed (learned from OBD). Null = no gear calls. */
+    var gearLookup: ((vTargetMps: Double) -> Int?)? = null,
 ) {
     data class Params(
         /** Comfortable but firm braking on the road, m/s². */
@@ -32,7 +34,8 @@ class Advisor(
         val reactionSeconds: Double = 1.0,
         /** Driver must have heard the whole note this long before the braking point. */
         val endLeadSeconds: Double = 1.2,
-        /** Corners whose confidence is below this are called one band softer, with caution. */
+        /** Corners whose map confidence is below this are called with a leading "caution" —
+         *  the band and target speed stay honest (softening the band would RAISE the speed). */
         val softenBelowConfidence: Double = 0.55,
         /** tightens/opens threshold: exit vs entry radius ratio. */
         val radiusTrendRatio: Double = 0.75,
@@ -54,6 +57,13 @@ class Advisor(
         return v.coerceAtMost(params.userMaxMps)
     }
 
+    /** Metres needed to shed [vNow] down to [vTarget] at the comfortable braking rate. */
+    fun brakingDistanceM(vNow: Double, vTarget: Double): Double =
+        if (vNow > vTarget) (vNow * vNow - vTarget * vTarget) / (2 * params.aBrake) else 0.0
+
+    /** Seconds of thinking + settling the driver needs after the note finishes. */
+    val noteLeadSeconds: Double get() = params.reactionSeconds + params.endLeadSeconds
+
     /**
      * Annotate a raw horizon. [currentSpeedMps] drives braking-point maths; recomputed
      * per horizon rebuild and refined at trigger time by the engine.
@@ -61,20 +71,20 @@ class Advisor(
     fun annotate(raw: HorizonBuilder.RawHorizon, currentSpeedMps: Double, nowMs: Long): Horizon {
         val out = ArrayList<HorizonCorner>(raw.corners.size)
         for ((i, entry) in raw.corners.withIndex()) {
-            val (corner, aheadM, pathConf) = entry
-            var band = severityTable.bandFor(corner.minRadiusM)
+            val corner = entry.corner
+            val aheadM = entry.distanceAheadM
+            val pathConf = entry.pathConfidence
+            val band = severityTable.bandFor(corner.minRadiusM)
             if (band == SeverityBand.FLAT) continue
 
-            // Low map confidence: call it one band softer rather than with false precision.
-            val soften = corner.confidence < params.softenBelowConfidence
-            if (soften) band = softerBand(band)
-
-            val modifiers = ArrayList<Modifier>(2)
+            val modifiers = ArrayList<Modifier>(3)
+            // Low map confidence: keep the honest band and speed, lead with "caution".
+            if (corner.confidence < params.softenBelowConfidence) modifiers += Modifier.CAUTION
             if (corner.exitRadiusM < corner.entryRadiusM * params.radiusTrendRatio) modifiers += Modifier.TIGHTENS
             else if (corner.entryRadiusM < corner.exitRadiusM * params.radiusTrendRatio) modifiers += Modifier.OPENS
             if (corner.arcLengthM > params.longArcM) modifiers += Modifier.LONG
             val next = raw.corners.getOrNull(i + 1)
-            if (next != null && next.second - (aheadM + corner.arcLengthM) < params.intoGapM) modifiers += Modifier.INTO
+            if (next != null && next.distanceAheadM - (aheadM + corner.arcLengthM) < params.intoGapM) modifiers += Modifier.INTO
 
             var vTarget = vTargetFor(corner, band)
             // Your history with this exact stretch of road trims the suggestion.
@@ -82,8 +92,11 @@ class Advisor(
                 vTarget *= lookup(corner.edgeId, corner.startOffsetM, corner.endOffsetM)
             }
             // Measured camber: off-camber corners get called and slowed — the radius
-            // maths flatters exactly these. Positive camber helps LEFT turns.
-            val camber = camberLookup?.invoke(corner.edgeId, corner.startOffsetM, corner.endOffsetM)
+            // maths flatters exactly these. Positive camber helps LEFT turns. Camber is
+            // stored in the edge's forward frame; driving the edge the other way, the
+            // same crown leans the other way in the car frame.
+            val storedCamber = camberLookup?.invoke(corner.edgeId, corner.startOffsetM, corner.endOffsetM)
+            val camber = storedCamber?.let { if (entry.forward) it else -it }
             if (camber != null) {
                 val adverseDeg = when (corner.direction) {
                     Direction.LEFT -> (-camber).coerceAtLeast(0.0)
@@ -94,11 +107,11 @@ class Advisor(
                     vTarget *= (1.0 - 0.03 * adverseDeg).coerceAtLeast(0.85)
                 }
             }
+            // Braking point / trigger for the HUD, from build-time speed. The ENGINE
+            // recomputes both from live speed every tick — these are display values.
             val v = currentSpeedMps
-            val brakingDistance = if (v > vTarget) (v * v - vTarget * vTarget) / (2 * params.aBrake) else 0.0
-            val brakingPointM = (aheadM - brakingDistance).coerceAtLeast(0.0)
-            val triggerDistanceM = (brakingPointM - v * (params.reactionSeconds + params.endLeadSeconds))
-                .coerceAtLeast(0.0)
+            val brakingPointM = (aheadM - brakingDistanceM(v, vTarget)).coerceAtLeast(0.0)
+            val triggerDistanceM = (brakingPointM - v * noteLeadSeconds).coerceAtLeast(0.0)
 
             out += HorizonCorner(
                 corner = corner,
@@ -109,8 +122,10 @@ class Advisor(
                 vTargetMps = vTarget,
                 brakingPointM = brakingPointM,
                 triggerDistanceM = triggerDistanceM,
+                gear = gearLookup?.invoke(vTarget),
             )
         }
+        val firstEdge = raw.steps.firstOrNull()?.edge
         return Horizon(
             builtAtMs = nowMs,
             pathEdgeIds = raw.steps.map { it.edge.id },
@@ -118,17 +133,9 @@ class Advisor(
             confidenceAtEnd = raw.confidenceAtEnd,
             corners = out,
             hazards = raw.hazards.map { HorizonHazard(it.first, it.second, it.third) },
+            currentEdgeHighway = firstEdge?.highwayClass,
+            currentEdgeMaxspeedKph = firstEdge?.maxspeedKph,
         )
-    }
-
-    private fun softerBand(b: SeverityBand): SeverityBand = when (b) {
-        SeverityBand.HAIRPIN -> SeverityBand.ONE
-        SeverityBand.ONE -> SeverityBand.TWO
-        SeverityBand.TWO -> SeverityBand.THREE
-        SeverityBand.THREE -> SeverityBand.FOUR
-        SeverityBand.FOUR -> SeverityBand.FIVE
-        SeverityBand.FIVE -> SeverityBand.SIX
-        else -> SeverityBand.SIX
     }
 }
 

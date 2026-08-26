@@ -119,6 +119,8 @@ enum class Modifier(val spoken: String) {
     INTO("into"),
     /** Road leans out of the corner — the radius maths flatters this one. */
     OFF_CAMBER("off_camber"),
+    /** Low map confidence: the geometry may under-claim. Spoken before the call. */
+    CAUTION("caution"),
 }
 
 /** A corner projected onto the current predicted path. */
@@ -144,6 +146,9 @@ data class Horizon(
     val confidenceAtEnd: Double,
     val corners: List<HorizonCorner>,
     val hazards: List<HorizonHazard>,
+    /** Road class of the edge the horizon starts on — the expected-speed baseline resets when it changes. */
+    val currentEdgeHighway: String? = null,
+    val currentEdgeMaxspeedKph: Int? = null,
 )
 
 enum class Conditions { DRY, WET }

@@ -54,10 +54,20 @@ class MapMatcher(private val map: MapStore) {
             for (forward in dirs) {
                 val travelBearing = if (forward) edgeBearing else (edgeBearing + 180.0) % 360.0
                 val hDiff = Geo.bearingDiffDeg(fix.bearingDeg, travelBearing)
-                // Heading only meaningful when moving.
-                val headingScore = if (fix.speedMps < 2.0) 1.0
+                // Heading only meaningful when moving and actually reported (NaN = no bearing).
+                val headingUsable = fix.speedMps >= 2.0 && !fix.bearingDeg.isNaN()
+                val headingScore = if (!headingUsable) 1.0
                 else exp(-(hDiff * hDiff) / (2 * 40.0 * 40.0))
-                var s = distScore * (1 - params.headingWeight + params.headingWeight * headingScore)
+                // At real driving speed the bearing is decisive: without this, the reverse
+                // direction of the matched edge keeps ~half the winner's score and caps
+                // confidence near 0.70 on a lone unambiguous road, muting the co-driver
+                // beyond the next junction.
+                val w = when {
+                    !headingUsable -> 0.0
+                    fix.speedMps < 4.0 -> params.headingWeight
+                    else -> 0.95
+                }
+                var s = distScore * (1 - w + w * headingScore)
                 val pv = prev
                 if (pv != null) {
                     val connected = pv.edgeId == edge.id ||

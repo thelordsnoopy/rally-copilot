@@ -13,22 +13,38 @@ class ObservationCollector(
     private val conditions: Conditions,
 ) {
     private data class Tracking(
-        val hc: HorizonCorner,
+        var hc: HorizonCorner,
         var vEntry: Double = Double.NaN,
         var vMin: Double = Double.MAX_VALUE,
         var vExit: Double = Double.NaN,
         var throttleSum: Double = 0.0,
         var throttleN: Int = 0,
         var sawStopAfter: Boolean = false,
-        var wasSpirited: Boolean = true,
+        var wasSpirited: Boolean = false,
     )
 
-    private var spiritedNow: Boolean = true
+    private var spiritedNow: Boolean = false
 
     private val active = ArrayList<Tracking>()
     private val done = ArrayList<CornerObservation>()
 
     val observations: List<CornerObservation> get() = done
+
+    /**
+     * The horizon was rebuilt: every active tracker's distances are stale. Remap each
+     * onto the corner's fresh HorizonCorner, or abort trackers whose corner is gone —
+     * closing them against old coordinates would ratchet vMin through unrelated road
+     * and save a garbage observation.
+     */
+    fun onHorizonRebuilt(newCorners: List<HorizonCorner>) {
+        val byId = newCorners.associateBy { it.corner.id }
+        val it = active.iterator()
+        while (it.hasNext()) {
+            val t = it.next()
+            val fresh = byId[t.hc.corner.id]
+            if (fresh == null) it.remove() else t.hc = fresh
+        }
+    }
 
     /**
      * Feed the collector each engine tick.
@@ -40,7 +56,8 @@ class ObservationCollector(
         speedMps: Double,
         throttle01: Double?,
         horizonCorners: List<HorizonCorner>,
-        spiritedNow: Boolean = true,
+        // Fail CLOSED: with no style verdict, corners must not train the profile.
+        spiritedNow: Boolean = false,
         distanceAheadOf: (HorizonCorner) -> Double,
     ) {
         this.spiritedNow = spiritedNow

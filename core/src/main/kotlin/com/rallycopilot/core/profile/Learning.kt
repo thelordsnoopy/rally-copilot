@@ -91,7 +91,9 @@ object Learning {
         history: List<CornerObservation>,
     ): DriverProfile {
         val (derived, counts) = derive(history)
-        val ratcheted = HashMap<SeverityBand, Double>()
+        // MERGE onto the current profile: a band absent from this input keeps its
+        // learned value — wholesale replacement would silently revert it to seed.
+        val ratcheted = HashMap(current.aLatByBand)
         for ((band, target) in derived) {
             val prev = current.aLatByBand[band]
             ratcheted[band] = if (prev == null) target
@@ -101,7 +103,9 @@ object Learning {
                 target.coerceIn(maxDown, maxUp)
             }
         }
-        return current.copy(aLatByBand = ratcheted, sampleCountByBand = counts)
+        val mergedCounts = HashMap(current.sampleCountByBand)
+        mergedCounts.putAll(counts)
+        return current.copy(aLatByBand = ratcheted, sampleCountByBand = mergedCounts)
     }
 
     /** Easy/Good/Hard. "Hard" = it was pushing me → back off. */

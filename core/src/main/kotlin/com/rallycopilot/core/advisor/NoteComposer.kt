@@ -27,11 +27,13 @@ object NoteComposer {
     fun cornerKeys(c: HorizonCorner, includeGear: Boolean): List<String> {
         val dir = c.corner.direction.spoken()
         val keys = ArrayList<String>(4)
+        // "caution" leads the call; the rest trail it.
+        if (com.rallycopilot.core.model.Modifier.CAUTION in c.modifiers) keys += "caution"
         keys += when (c.band) {
             SeverityBand.HAIRPIN -> "${dir}_hairpin"
             else -> "${dir}_${c.band.spoken}"
         }
-        for (m in c.modifiers) keys += m.spoken
+        for (m in c.modifiers) if (m != com.rallycopilot.core.model.Modifier.CAUTION) keys += m.spoken
         if (includeGear && c.gear != null) keys += "gear_${c.gear}"
         return keys
     }

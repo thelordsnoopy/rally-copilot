@@ -83,8 +83,8 @@ private fun severityDigit(band: SeverityBand): String = when (band) {
 }
 
 /**
- * The live HUD. Landscape-locked. Real road geometry behind, notation panel on the
- * left, instruments along the bottom. Silence is always explained by a status chip.
+ * The live HUD. Portrait-locked. Real road geometry behind, notation panel on top,
+ * instruments along the bottom. Silence is always explained by a status chip.
  */
 @Composable
 fun DriveScreen(activity: MainActivity, onExit: () -> Unit) {
@@ -156,8 +156,10 @@ fun DriveScreen(activity: MainActivity, onExit: () -> Unit) {
                 val secondsLeft = ((prompt.deadlineMs - System.currentTimeMillis()) / 1000)
                     .coerceAtLeast(0)
                 Button(
+                    // Marshalled onto the engine thread by the service — the engine
+                    // has no locks of its own.
                     onClick = {
-                        runCatching { activity.driveService?.engine?.answerHazardPrompt(true) }
+                        runCatching { activity.driveService?.answerHazard(true) }
                     },
                     modifier = Modifier.align(Alignment.BottomCenter)
                         .padding(bottom = 18.dp).fillMaxWidth(0.85f).height(72.dp),
@@ -367,23 +369,36 @@ private fun Chip(label: String, colour: Color) {
 @Composable
 private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier: Modifier) {
     val store: SqliteMapStore? = activity.driveService?.map
-    // Cache nearby edges; refresh when the matched edge changes.
-    var cachedFor by remember { mutableStateOf(-1L) }
     var nearby by remember { mutableStateOf<List<com.rallycopilot.core.model.Edge>>(emptyList()) }
     var centre by remember { mutableStateOf<LatLon?>(null) }
+    // The matcher legitimately drops individual fixes (GPS jitter, momentary
+    // ambiguity). Blanking the whole map for every dropped fix reads as the screen
+    // "randomly going black" — keep drawing the last good position instead; the
+    // status chip already explains the gap.
+    var lastGood by remember { mutableStateOf<com.rallycopilot.core.model.MatchedPosition?>(null) }
+    hud?.matched?.let { lastGood = it }
 
-    val matched = hud?.matched
-    if (store != null && matched != null && matched.edgeId != cachedFor) {
-        val e = store.edge(matched.edgeId)
-        if (e != null) {
-            val cum = Polyline.cumulative(e.geometry)
-            val c = Polyline.pointAt(e.geometry, cum, matched.offsetM)
-            centre = c
-            nearby = store.edgesNear(c, 700.0)
-            cachedFor = matched.edgeId
+    val matched = hud?.matched ?: lastGood
+    // The 9-cell spatial query loads hundreds of edges with geometry unpacking —
+    // that is IO work keyed on the matched edge, not something to run (or even
+    // start) inside composition.
+    androidx.compose.runtime.LaunchedEffect(store, matched?.edgeId) {
+        val s = store ?: return@LaunchedEffect
+        val m = matched ?: return@LaunchedEffect
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val e = s.edge(m.edgeId)
+            if (e != null) {
+                val cum = Polyline.cumulative(e.geometry)
+                val c = Polyline.pointAt(e.geometry, cum, m.offsetM)
+                val near = s.edgesNear(c, 700.0)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    centre = c; nearby = near
+                }
+            }
         }
-    } else if (store != null && matched != null && centre != null) {
-        // update centre along the current edge without re-querying
+    }
+    // Track the car along the already-cached current edge (cache hit, no IO).
+    if (store != null && matched != null && centre != null) {
         val e = store.edge(matched.edgeId)
         if (e != null) {
             val cum = Polyline.cumulative(e.geometry)
@@ -401,7 +416,7 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
     ) {
         val c = centre ?: return@Canvas
         val m = matched ?: return@Canvas
-        val pathEdges = hud.horizon?.pathEdgeIds?.toHashSet() ?: hashSetOf()
+        val pathEdges = hud?.horizon?.pathEdgeIds?.toHashSet() ?: hashSetOf()
 
         val scale = (size.height / 520f) // px per metre-ish: ~520 m visible vertically
         val cx = size.width * 0.5f
@@ -476,7 +491,7 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
  */
 @Composable
 fun FeedbackSheet(activity: MainActivity, onDone: () -> Unit) {
-    val db = remember { AppDb(activity) }
+    val db = remember { AppDb.get(activity) }
     // Capture everything we need BEFORE stopping the drive.
     val svc = activity.driveService
     val runId = remember { svc?.runId ?: -1 }
@@ -491,9 +506,23 @@ fun FeedbackSheet(activity: MainActivity, onDone: () -> Unit) {
         if (!stopped) { stopped = true; activity.stopDrive() }
     }
 
-    fun relearn() {
-        val history = db.allObservations().filter { it.conditions == cond }
-        db.saveProfile(Learning.applySession(db.loadProfile(cond), history), cond)
+    /** Full-history learning pass — real work, never on the main thread. */
+    fun relearnAsync(alsoOverride: Boolean? = null) {
+        Thread {
+            runCatching {
+                if (alsoOverride != null && runId >= 0) {
+                    // stopDrive() persists this run's observations asynchronously;
+                    // wait for them to land before rewriting their style flag.
+                    val deadline = System.currentTimeMillis() + 10_000
+                    while (db.observationsFor(runId).isEmpty() &&
+                        System.currentTimeMillis() < deadline
+                    ) Thread.sleep(200)
+                    db.overrideRunStyle(runId, alsoOverride)
+                }
+                val history = db.allObservations().filter { it.conditions == cond }
+                db.saveProfile(Learning.applySession(db.loadProfile(cond), history), cond)
+            }
+        }.start()
     }
 
     Column(
@@ -528,7 +557,7 @@ fun FeedbackSheet(activity: MainActivity, onDone: () -> Unit) {
                 Button(
                     onClick = {
                         endDrive()
-                        if (runId >= 0) { db.overrideRunStyle(runId, false); relearn() }
+                        relearnAsync(alsoOverride = false)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232D38)),
                     shape = RoundedCornerShape(8.dp),
@@ -536,7 +565,7 @@ fun FeedbackSheet(activity: MainActivity, onDone: () -> Unit) {
                 Button(
                     onClick = {
                         endDrive()
-                        if (runId >= 0) { db.overrideRunStyle(runId, true); relearn() }
+                        relearnAsync(alsoOverride = true)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232D38)),
                     shape = RoundedCornerShape(8.dp),

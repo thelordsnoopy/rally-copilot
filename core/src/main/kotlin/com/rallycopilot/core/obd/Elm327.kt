@@ -67,14 +67,30 @@ object Elm327 {
      * supported PID numbers within that range, e.g. 0x0C, 0x0D for a 0100 query.
      */
     fun supportedPids(basePid: Int, raw: String): Set<Int> {
+        // Multiple ECUs may answer a supported-PIDs query (with headers off they are
+        // indistinguishable). Union every responder's mask — taking only the first
+        // could cache a narrower ECU's mask and hide PIDs the engine ECU supports.
         val pidHex = "01%02X".format(basePid)
-        val d = dataBytes(pidHex, raw) ?: return emptySet()
-        if (d.size < 4) return emptySet()
+        val c = clean(raw).replace(" ", "").uppercase()
+        if (c.contains("NODATA") || c.contains("ERROR") || c.contains("?")) return emptySet()
+        val header = "41" + pidHex.substring(2)
         val out = HashSet<Int>()
-        for (byteIdx in 0 until 4) {
-            for (bit in 0 until 8) {
-                if (d[byteIdx] and (0x80 shr bit) != 0) out += basePid + byteIdx * 8 + bit + 1
+        var idx = c.indexOf(header)
+        while (idx >= 0) {
+            val hex = c.substring(idx + header.length)
+            if (hex.length >= 8) {
+                val d = try {
+                    IntArray(4) { hex.substring(it * 2, it * 2 + 2).toInt(16) }
+                } catch (_: NumberFormatException) { null }
+                if (d != null) {
+                    for (byteIdx in 0 until 4) {
+                        for (bit in 0 until 8) {
+                            if (d[byteIdx] and (0x80 shr bit) != 0) out += basePid + byteIdx * 8 + bit + 1
+                        }
+                    }
+                }
             }
+            idx = c.indexOf(header, idx + header.length)
         }
         return out
     }
@@ -94,9 +110,9 @@ object Elm327 {
     fun percent01(pid: String, raw: String): Double? =
         dataBytes(pid, raw)?.getOrNull(0)?.let { it / 255.0 }
 
-    /** Strip ELM chatter: echoes, prompts, whitespace. */
+    /** Strip ELM chatter: echoes, prompts, whitespace, and the NUL bytes clones emit. */
     fun clean(raw: String): String =
-        raw.replace(">", "").replace("\r", " ").replace("\n", " ").trim()
+        raw.replace("\u0000", "").replace(">", "").replace("\r", " ").replace("\n", " ").trim()
 
     /**
      * Parse a mode-01 response. E.g. request 010D → response "41 0D 3C" (or "410D3C").

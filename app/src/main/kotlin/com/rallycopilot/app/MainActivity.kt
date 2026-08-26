@@ -70,8 +70,29 @@ class MainActivity : ComponentActivity() {
         override fun onServiceDisconnected(name: ComponentName?) { driveService = null }
     }
 
+    /** Location grant state, observed by the UI so DRIVE can gate on it. */
+    val locationGranted = androidx.compose.runtime.mutableStateOf(false)
+
     private val permissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            locationGranted.value = hasLocationPermission()
+        }
+
+    fun hasLocationPermission(): Boolean =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    fun requestPermissions() {
+        permissionLauncher.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.POST_NOTIFICATIONS,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            )
+        )
+    }
 
     /** Set when a newer release has been downloaded and is ready to install. */
     val updateReady = androidx.compose.runtime.mutableStateOf<com.rallycopilot.app.update.Updater.Available?>(null)
@@ -86,17 +107,34 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        permissionLauncher.launch(
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.POST_NOTIFICATIONS,
-                Manifest.permission.BLUETOOTH_CONNECT,
-            )
-        )
+        locationGranted.value = hasLocationPermission()
+        // Ask only when something is actually missing — re-firing dialogs on every
+        // recreation burns through the system's "don't ask again" budget.
+        val missing = arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.POST_NOTIFICATIONS,
+            Manifest.permission.BLUETOOTH_CONNECT,
+        ).any {
+            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing) requestPermissions()
         checkForUpdates()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 AppNav(this)
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // A drive may already be running (activity recreated at dusk by the theme
+        // flip, or relaunched from the notification): reconnect to it, or END would
+        // be a silent no-op and the drive unreachable.
+        if (!bound) {
+            DriveService.instance?.let {
+                bindService(Intent(this, DriveService::class.java), connection, 0)
+                bound = true
             }
         }
     }
@@ -107,12 +145,11 @@ class MainActivity : ComponentActivity() {
             .putExtra(DriveService.EXTRA_CALIBRATION, calibration)
             .putExtra(DriveService.EXTRA_DEMO, demo)
         startForegroundService(i)
-        bindService(i, connection, Context.BIND_AUTO_CREATE)
-        bound = true
+        if (!bound) { bindService(i, connection, Context.BIND_AUTO_CREATE); bound = true }
     }
 
     fun stopDrive() {
-        driveService?.stopDrive()
+        (driveService ?: DriveService.instance)?.stopDrive()
         if (bound) { runCatching { unbindService(connection) }; bound = false }
         driveService = null
     }
@@ -138,7 +175,19 @@ fun AppNav(activity: MainActivity) {
 
 @Composable
 fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
-    var wet by remember { mutableStateOf(false) }
+    // Saveable: the dusk theme flip recreates the activity and must not silently
+    // reset a deliberately-chosen WET back to DRY.
+    var wet by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+    val locationGranted by activity.locationGranted
+    // Real drives need location before the service starts: on Android 14+ a
+    // location-type foreground service CRASHES if started without the grant.
+    fun startRealDrive(calibration: Boolean) {
+        if (locationGranted) {
+            activity.startDrive(wet, calibration); onNav("drive")
+        } else {
+            activity.requestPermissions()
+        }
+    }
     val bg = Color(0xFF06080B)
     val panel = Color(0xFF11161D)
     val ink = Color(0xFFEAF0F6)
@@ -181,18 +230,25 @@ fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
         }
 
         Button(
-            onClick = { activity.startDrive(wet, calibration = false); onNav("drive") },
+            onClick = { startRealDrive(calibration = false) },
             modifier = Modifier.fillMaxWidth().height(92.dp),
             shape = RoundedCornerShape(18.dp),
             colors = ButtonDefaults.buttonColors(containerColor = green),
         ) {
             Text("DRIVE", fontSize = 30.sp, color = Color(0xFF06080B), fontWeight = FontWeight.Black, letterSpacing = 4.sp)
         }
+        if (!locationGranted) {
+            Text(
+                "location permission needed for a real drive — tap DRIVE to grant",
+                color = Color(0xFFFFB74D), fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp, start = 4.dp),
+            )
+        }
         Spacer(Modifier.height(10.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
-                onClick = { activity.startDrive(wet, calibration = true); onNav("drive") },
+                onClick = { startRealDrive(calibration = true) },
                 modifier = Modifier.weight(1f).height(58.dp),
                 shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = panel),
@@ -280,7 +336,7 @@ fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
 
 @Composable
 fun ProfileScreen(activity: MainActivity) {
-    val db = remember { AppDb(activity) }
+    val db = remember { AppDb.get(activity) }
     var cond by remember { mutableStateOf(com.rallycopilot.core.model.Conditions.DRY) }
     var profile by remember(cond) { mutableStateOf(db.loadProfile(cond)) }
     Column(Modifier.fillMaxSize().background(Color(0xFF0B0F14)).padding(20.dp)) {
@@ -341,7 +397,7 @@ fun ProfileScreen(activity: MainActivity) {
 
 @Composable
 fun RunsScreen(activity: MainActivity) {
-    val db = remember { AppDb(activity) }
+    val db = remember { AppDb.get(activity) }
     val runs = remember { db.runs() }
     val fmt = remember { SimpleDateFormat("EEE d MMM HH:mm", Locale.UK) }
     Column(Modifier.fillMaxSize().background(Color(0xFF0B0F14)).padding(20.dp)) {
@@ -361,13 +417,20 @@ fun RunsScreen(activity: MainActivity) {
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
-                                onClick = { com.rallycopilot.app.extras.DriveReport.share(activity, run.id) },
+                                // Card rendering reads the whole run log — off the main thread.
+                                onClick = {
+                                    Thread {
+                                        runCatching { com.rallycopilot.app.extras.DriveReport.share(activity, run.id) }
+                                    }.start()
+                                },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1DB954)),
                             ) { Text("Share card", color = Color.Black, fontSize = 13.sp) }
                             Button(
+                                // runCatching: an encoder/MediaStore failure must fail
+                                // one export, not take down the whole process.
                                 onClick = {
                                     Thread {
-                                        com.rallycopilot.app.extras.OverlayExporter.export(activity, run.id)
+                                        runCatching { com.rallycopilot.app.extras.OverlayExporter.export(activity, run.id) }
                                     }.start()
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2A3540)),
@@ -382,7 +445,7 @@ fun RunsScreen(activity: MainActivity) {
 
 @Composable
 fun SettingsScreen(activity: MainActivity) {
-    val db = remember { AppDb(activity) }
+    val db = remember { AppDb.get(activity) }
     var verbosity by remember { mutableStateOf(db.kvGet("verbosity") ?: "all") }
     var cap by remember { mutableStateOf(db.kvGet("capG")?.toFloatOrNull() ?: 0f) }
     Column(
@@ -423,7 +486,13 @@ fun SettingsScreen(activity: MainActivity) {
         Text("OBD dongle", color = Color(0xFFB8C4D0))
         val selectedMac = remember { mutableStateOf(db.kvGet("obd_mac")) }
         val bonded = remember {
-            runCatching {
+            // BLUETOOTH_CONNECT (API 31+) may be denied — check first instead of
+            // letting a SecurityException decide the outcome.
+            val btAllowed = android.os.Build.VERSION.SDK_INT < 31 ||
+                activity.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!btAllowed) emptyList()
+            else runCatching {
                 android.bluetooth.BluetoothAdapter.getDefaultAdapter()
                     ?.bondedDevices?.map { (it.name ?: "unknown") to it.address }.orEmpty()
             }.getOrDefault(emptyList())

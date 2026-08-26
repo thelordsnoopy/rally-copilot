@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Card
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -43,16 +44,27 @@ fun rankRoads(context: Context, limit: Int = 30): List<RoadRank> {
     if (!f.exists()) return emptyList()
     val db = SQLiteDatabase.openDatabase(f.path, null, SQLiteDatabase.OPEN_READONLY)
     val rows = ArrayList<RoadRank>()
+    // Corners are pre-aggregated per edge BEFORE joining: a plain edges JOIN corners
+    // counts an edge's length once per corner on it (a 4-corner-per-edge road reported
+    // ~4x its length) and drops zero-corner edges from the length entirely — deflating
+    // twistiness in proportion to corner density, punishing exactly the twisty roads
+    // this screen exists to find.
     db.rawQuery(
         """
         SELECT COALESCE(e.ref, e.name) road,
                SUM(e.length_m) len,
-               SUM(CASE WHEN c.min_r < 12 THEN 6.0 WHEN c.min_r < 25 THEN 5.0
-                        WHEN c.min_r < 40 THEN 4.0 WHEN c.min_r < 70 THEN 3.0
-                        WHEN c.min_r < 120 THEN 2.0 WHEN c.min_r < 200 THEN 1.0
-                        ELSE 0.5 END * c.confidence) w,
-               SUM(CASE WHEN c.min_r < 12 AND c.confidence > 0.5 THEN 1 ELSE 0 END) hp
-        FROM edges e JOIN corners c ON c.edge_id = e.id
+               SUM(COALESCE(cw.w, 0)) w,
+               SUM(COALESCE(cw.hp, 0)) hp
+        FROM edges e
+        LEFT JOIN (
+            SELECT edge_id,
+                   SUM(CASE WHEN min_r < 12 THEN 6.0 WHEN min_r < 25 THEN 5.0
+                            WHEN min_r < 40 THEN 4.0 WHEN min_r < 70 THEN 3.0
+                            WHEN min_r < 120 THEN 2.0 WHEN min_r < 200 THEN 1.0
+                            ELSE 0.5 END * confidence) w,
+                   SUM(CASE WHEN min_r < 12 AND confidence > 0.5 THEN 1 ELSE 0 END) hp
+            FROM corners GROUP BY edge_id
+        ) cw ON cw.edge_id = e.id
         WHERE road IS NOT NULL AND e.highway NOT IN ('residential','motorway','trunk')
         GROUP BY road
         HAVING len > 3000
@@ -71,7 +83,7 @@ fun rankRoads(context: Context, limit: Int = 30): List<RoadRank> {
     }
     // Learned quietness: for roads you have driven, the constrained fraction of your
     // observations on their edges. Roads never driven stay null (unknown, not "quiet").
-    val appDb = AppDb(context)
+    val appDb = AppDb.get(context)
     val edgeRoad = HashMap<Long, String>()
     db.rawQuery(
         "SELECT id, COALESCE(ref, name) FROM edges WHERE COALESCE(ref, name) IS NOT NULL", null
@@ -79,10 +91,12 @@ fun rankRoads(context: Context, limit: Int = 30): List<RoadRank> {
     db.close()
 
     val stats = HashMap<String, IntArray>() // road -> [constrained, total]
+    // BETWEEN (not ABS) keeps the time filter sargable against idx_rf_run_t.
     appDb.readableDatabase.rawQuery(
         """
         SELECT rf.edge_id, o.constrained FROM observations o
-        JOIN run_fixes rf ON rf.run_id = o.run_id AND ABS(rf.t_ms - o.t_ms) < 3000
+        JOIN run_fixes rf ON rf.run_id = o.run_id
+            AND rf.t_ms BETWEEN o.t_ms - 3000 AND o.t_ms + 3000
         WHERE rf.edge_id IS NOT NULL
         """, null
     ).use { c ->
@@ -105,7 +119,12 @@ fun rankRoads(context: Context, limit: Int = 30): List<RoadRank> {
 
 @Composable
 fun RoadFinderScreen(context: Context) {
-    val roads = remember { rankRoads(context) }
+    // The ranking joins months of run fixes — background it, never inside remember{}.
+    val roads by androidx.compose.runtime.produceState(initialValue = emptyList<RoadRank>()) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { rankRoads(context) }.getOrDefault(emptyList())
+        }
+    }
     Column(Modifier.fillMaxSize().background(Color(0xFF0B0F14)).padding(20.dp)) {
         Text("ROAD FINDER", color = Color.White, fontSize = 24.sp)
         Text(

@@ -7,7 +7,10 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Legacy Bluetooth permission: bondedDevices needs it on Android 8-11. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
@@ -28,10 +31,12 @@
             </intent-filter>
         </activity>
 
+        <!-- mediaPlayback covers DEMO mode (and denied-location safety): a location-type
+             startForeground throws on API 34+ unless location is actually granted. -->
         <service
             android:name=".drive.DriveService"
             android:exported="false"
-            android:foregroundServiceType="location" />
+            android:foregroundServiceType="location|mediaPlayback" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

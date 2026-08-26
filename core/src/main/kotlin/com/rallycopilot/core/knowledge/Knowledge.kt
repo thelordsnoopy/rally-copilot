@@ -42,9 +42,10 @@ interface KnowledgeStore {
 }
 
 object KnowledgeMath {
-    /** A bucket earns a spoken caution when confirmed, or when evidence has piled up. */
+    /** A bucket earns a spoken caution when confirmed, or when evidence has piled up.
+     *  Roughness needs several windows — one kerb strike is not a rough road. */
     fun warrantsCaution(b: RoadBucket): Boolean =
-        b.hazardConfirmed || b.slowEvents >= 3 || b.roughness > ROUGH_CAUTION
+        b.hazardConfirmed || b.slowEvents >= 3 || (b.roughness > ROUGH_CAUTION && b.roughN >= 3)
 
     const val ROUGH_CAUTION = 3.2       // m/s2 vertical RMS: genuinely rough surface
 
@@ -81,8 +82,21 @@ object KnowledgeMath {
             speedFactor = relax,
             hazardConfirmed = stillConfirmed,
             slowEvents = if (passes % 3 == 0 && b.slowEvents > 0) b.slowEvents - 1 else b.slowEvents,
+            // Roughness fades too — resurfaced roads and one-off strikes must not
+            // caution forever. Mean decays ~10% per clean pass.
+            roughSum = b.roughSum * 0.9,
         )
     }
+
+    /**
+     * The driver explicitly answered "no, there was no hazard here". That is evidence
+     * AGAINST the bucket: walk the slow-event count back and count it as a clean pass.
+     * (A silent prompt timeout records nothing at all.)
+     */
+    fun applyNegativeAnswer(b: RoadBucket): RoadBucket = b.copy(
+        slowEvents = maxOf(0, b.slowEvents - 1),
+        cleanPasses = b.cleanPasses + 1,
+    )
 
     fun addRoughness(b: RoadBucket, rms: Double): RoadBucket =
         b.copy(roughSum = b.roughSum + rms, roughN = b.roughN + 1)

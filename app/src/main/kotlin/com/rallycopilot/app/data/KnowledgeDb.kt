@@ -98,15 +98,19 @@ class KnowledgeDb(private val db: AppDb) : KnowledgeStore {
         return null
     }
 
-    /** Camber sample accrual for the bucket currently under the wheels. */
+    /** Camber sample accrual for the bucket currently under the wheels. NaN never persists. */
+    @Synchronized
     fun addCamber(edgeId: Long, offsetM: Double, deg: Double) {
+        if (!deg.isFinite()) return
         val bucket = RoadBucket.bucketOf(offsetM)
         val b = get(edgeId, bucket) ?: RoadBucket(edgeId, bucket)
         put(KnowledgeMath.addCamber(b, deg))
     }
 
-    /** IMU roughness accrual for the bucket currently under the wheels. */
+    /** IMU roughness accrual for the bucket currently under the wheels. NaN never persists. */
+    @Synchronized
     fun addRoughness(edgeId: Long, offsetM: Double, rms: Double) {
+        if (!rms.isFinite()) return
         val bucket = RoadBucket.bucketOf(offsetM)
         val b = get(edgeId, bucket) ?: RoadBucket(edgeId, bucket)
         put(KnowledgeMath.addRoughness(b, rms))

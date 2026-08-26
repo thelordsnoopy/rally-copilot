@@ -42,11 +42,24 @@ class HorizonBuilder(
         val confidence: Double,
     )
 
+    /**
+     * A corner projected onto the path. [corner] is already expressed in TRAVEL frame:
+     * direction and entry/exit radii are mirrored when the edge is traversed against
+     * its node order. Offsets stay in the edge's forward frame (knowledge-store keys).
+     * [forward] records the traversal so camber (stored forward-frame) can be re-signed.
+     */
+    data class RawCorner(
+        val corner: Corner,
+        val distanceAheadM: Double,
+        val pathConfidence: Double,
+        val forward: Boolean,
+    )
+
     data class RawHorizon(
         val steps: List<PathStep>,
         val totalLengthM: Double,
         val confidenceAtEnd: Double,
-        val corners: List<Triple<Corner, Double, Double>>,   // corner, distanceAhead, pathConfidence
+        val corners: List<RawCorner>,
         val hazards: List<Triple<Hazard, Double, Double>>,
     )
 
@@ -69,10 +82,18 @@ class HorizonBuilder(
             val endNode = if (forward) edge.toNodeId else edge.fromNodeId
             val junction = map.junction(endNode) ?: break
             val exitBearing = exitBearingOf(edge, forward)
-            val choices = junction.edgeIds
+            val nextEdges = junction.edgeIds
                 .filter { it != edge.id }
                 .mapNotNull { map.edge(it) }
-                .mapNotNull { next -> scoreContinuation(edge, exitBearing, next, endNode) }
+            var choices = nextEdges
+                .mapNotNull { next -> scoreContinuation(edge, exitBearing, next, endNode, maxDeflectionDeg = 150.0) }
+            if (choices.isEmpty()) {
+                // A switchback split at its apex node deflects > 150° yet is the genuine
+                // continuation. Allow it only when it is the SOLE way on, at reduced score.
+                val relaxed = nextEdges
+                    .mapNotNull { next -> scoreContinuation(edge, exitBearing, next, endNode, maxDeflectionDeg = 168.0) }
+                if (relaxed.size == 1) choices = relaxed.map { it.first to it.second * 0.4 }
+            }
             if (choices.isEmpty()) break
 
             val totalScore = choices.sumOf { it.second }
@@ -89,7 +110,7 @@ class HorizonBuilder(
         if (steps.isEmpty()) return null
 
         // Project corners and hazards into distance-ahead space.
-        val corners = ArrayList<Triple<Corner, Double, Double>>()
+        val corners = ArrayList<RawCorner>()
         val hazards = ArrayList<Triple<Hazard, Double, Double>>()
         for (step in steps) {
             val stepStartOffset = if (step === steps.first()) pos.offsetM else if (step.forward) 0.0 else step.edge.lengthM
@@ -98,7 +119,20 @@ class HorizonBuilder(
                 val delta = directedDelta(step.forward, stepStartOffset, entryOffset, step.edge.lengthM)
                     ?: continue
                 val aheadAt = step.startAheadM + delta
-                if (aheadAt in 0.0..params.horizonM) corners += Triple(c, aheadAt, step.confidence)
+                if (aheadAt in 0.0..params.horizonM) {
+                    // Corner geometry is stored in the edge's node order. Driving the edge
+                    // the other way, a stored LEFT is the driver's RIGHT and the entry and
+                    // exit thirds swap.
+                    val directed = if (step.forward) c else c.copy(
+                        direction = when (c.direction) {
+                            com.rallycopilot.core.model.Direction.LEFT -> com.rallycopilot.core.model.Direction.RIGHT
+                            com.rallycopilot.core.model.Direction.RIGHT -> com.rallycopilot.core.model.Direction.LEFT
+                        },
+                        entryRadiusM = c.exitRadiusM,
+                        exitRadiusM = c.entryRadiusM,
+                    )
+                    corners += RawCorner(directed, aheadAt, step.confidence, step.forward)
+                }
             }
             val learned = knowledge?.cautionsOn(step.edge.id)?.map { b ->
                 com.rallycopilot.core.model.Hazard(
@@ -116,7 +150,7 @@ class HorizonBuilder(
                 if (aheadAt in 0.0..params.horizonM) hazards += Triple(h, aheadAt, step.confidence)
             }
         }
-        corners.sortBy { it.second }
+        corners.sortBy { it.distanceAheadM }
         hazards.sortBy { it.second }
 
         return RawHorizon(
@@ -148,6 +182,7 @@ class HorizonBuilder(
         exitBearing: Double,
         next: Edge,
         viaNode: Long,
+        maxDeflectionDeg: Double = 150.0,
     ): Pair<Pair<Edge, Boolean>, Double>? {
         val forward = when (viaNode) {
             next.fromNodeId -> true
@@ -159,7 +194,7 @@ class HorizonBuilder(
         val entryBearing = if (forward) Geo.bearingDeg(next.geometry[0], next.geometry[1])
         else Geo.bearingDeg(next.geometry[next.geometry.size - 1], next.geometry[next.geometry.size - 2])
         val deflection = Geo.bearingDiffDeg(exitBearing, entryBearing)
-        if (deflection > 150.0) return null // effectively a U-turn
+        if (deflection > maxDeflectionDeg) return null // effectively a U-turn
 
         var score = 1.0
         // Straightest continuation preferred.

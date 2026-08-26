@@ -96,28 +96,39 @@ class DriveEngine(
     /** Metres consumed along the horizon since it was built (dead-reckoned between fixes). */
     private var progressM = 0.0
     private var lastTickMs = 0L
-    private val spokenCornerIds = HashSet<Long>()
-    private val spokenHazardKeys = HashSet<String>()
+    /** Spoken corners: id → last tick (ms) it was still relevant. Entries leave the set
+     *  once the corner is passed, or after it has been absent from the horizon for a
+     *  while — so the return leg of an out-and-back gets its calls again. */
+    private val spokenCorners = HashMap<Long, Long>()
+    private val spokenHazards = HashMap<String, Long>()
+    private val suppressionLogged = HashSet<Long>()
     private var activePrompt: HazardPrompt? = null
     private val cleanPassChecked = HashSet<Long>()
     /** Rolling recent-speed window for the "expected speed on a straight" baseline. */
     private val recentSpeeds = ArrayDeque<Pair<Long, Double>>()
+    private var lastEdgeChangeMs = 0L
 
     /** UI answer to the hazard prompt. YES confirms; the deadline auto-answers NO. */
     fun answerHazardPrompt(yes: Boolean) {
         val p = activePrompt ?: return
         activePrompt = null
-        resolvePrompt(p, yes)
+        resolvePrompt(p, confirmed = yes, explicit = true)
     }
 
-    private fun resolvePrompt(p: HazardPrompt, confirmed: Boolean) {
+    private fun resolvePrompt(p: HazardPrompt, confirmed: Boolean, explicit: Boolean) {
         val store = knowledge ?: return
         val bucket = RoadBucket.bucketOf(p.offsetM)
         val existing = store.get(p.edgeId, bucket) ?: RoadBucket(p.edgeId, bucket)
-        store.put(KnowledgeMath.applySlowEvent(existing, p.ratio, confirmed))
+        when {
+            confirmed -> store.put(KnowledgeMath.applySlowEvent(existing, p.ratio, true))
+            // An explicit NO is evidence AGAINST a hazard here; a silent timeout is no
+            // evidence at all. Neither may accrue slow-event counts (that turned three
+            // "no, it's fine" answers into a spoken caution).
+            explicit -> store.put(KnowledgeMath.applyNegativeAnswer(existing))
+        }
         runLog.logEvent(RunEvent(clock.nowMs(),
             if (confirmed) RunEventType.HAZARD_CONFIRMED else RunEventType.HAZARD_AUTO_NO,
-            "${'$'}{p.edgeId}:${'$'}{p.offsetM.toInt()}"))
+            "${p.edgeId}:${p.offsetM.toInt()}"))
     }
 
     fun onFix(fix: Fix) {
@@ -148,14 +159,17 @@ class DriveEngine(
             return
         }
 
-        // ---- horizon: rebuild on edge change or big heading change, else re-anchor progress ----
+        // ---- horizon: rebuild on edge change, direction flip, or big heading change ----
         val h = horizon
+        val edgeChanged = lastMatch?.edgeId != m.edgeId
         val needRebuild = h == null ||
-            lastMatch?.edgeId != m.edgeId ||
+            edgeChanged ||
+            lastBuildForward != m.forward ||
             com.rallycopilot.core.geo.Geo.bearingDiffDeg(
                 lastMatch?.bearingDeg ?: m.bearingDeg, m.bearingDeg
             ) > params.rebuildHeadingDeg
         lastMatch = m
+        if (edgeChanged) lastEdgeChangeMs = fix.tMs
 
         if (needRebuild) {
             val raw = horizonBuilder.build(m)
@@ -164,10 +178,18 @@ class DriveEngine(
                 runLog.logEvent(RunEvent(fix.tMs, RunEventType.MPP_AMBIGUOUS))
             } else {
                 val speed = fusedSpeed(fix.speedMps)
-                horizon = advisor.annotate(raw, speed, fix.tMs)
+                val prevHighway = horizon?.currentEdgeHighway
+                val newHorizon = advisor.annotate(raw, speed, fix.tMs)
+                // Road class changed → the recent-pace baseline belongs to the old road.
+                if (prevHighway != null && newHorizon.currentEdgeHighway != prevHighway) recentSpeeds.clear()
+                horizon = newHorizon
                 progressM = 0.0
                 lastBuildOffset = m.offsetM
-                spokenHazardKeys.clear()
+                lastBuildForward = m.forward
+                // Corner trackers hold distances from the OLD horizon — remap or drop
+                // them, or a corner in progress reopens and ratchets vMin through
+                // unrelated road into a garbage observation.
+                collector?.onHorizonRebuilt(newHorizon.corners)
                 runLog.logEvent(RunEvent(fix.tMs, RunEventType.HORIZON_REBUILT))
             }
         } else {
@@ -206,6 +228,12 @@ class DriveEngine(
             }
         }
 
+        // Prompt deadline runs regardless of GPS/horizon state — a prompt raised just
+        // before match loss must still auto-resolve, not linger forever.
+        activePrompt?.let { p ->
+            if (now >= p.deadlineMs) { activePrompt = null; resolvePrompt(p, confirmed = false, explicit = false) }
+        }
+
         if (h == null || !gpsOk) {
             _hud.value = HudState(
                 matched = lastMatch, horizon = null, speedMps = speed,
@@ -213,11 +241,36 @@ class DriveEngine(
                 incidentSuspected = incident,
                 spirited = styleDetector?.isSpirited ?: false,
                 spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
+                hazardPrompt = activePrompt,
             )
             return
         }
 
         fun aheadOf(c: HorizonCorner) = c.distanceAheadM - progressM
+
+        // ---- retire spoken notes once they are passed or long gone from the horizon ----
+        run {
+            val inHorizon = HashMap<Long, HorizonCorner>(h.corners.size)
+            for (c in h.corners) inHorizon[c.corner.id] = c
+            val it = spokenCorners.entries.iterator()
+            while (it.hasNext()) {
+                val e = it.next()
+                val hc = inHorizon[e.key]
+                if (hc != null) {
+                    if (aheadOf(hc) < -(hc.corner.arcLengthM + 30.0)) it.remove() else e.setValue(now)
+                } else if (now - e.value > 30_000) it.remove()
+            }
+            val hzIt = spokenHazards.entries.iterator()
+            val hazardKeys = HashMap<String, Double>(h.hazards.size)
+            for (hz in h.hazards) hazardKeys["${hz.hazard.edgeId}:${hz.hazard.offsetM.toInt()}"] = hz.distanceAheadM - progressM
+            while (hzIt.hasNext()) {
+                val e = hzIt.next()
+                val rel = hazardKeys[e.key]
+                if (rel != null) {
+                    if (rel < -50.0) hzIt.remove() else e.setValue(now)
+                } else if (now - e.value > 30_000) hzIt.remove()
+            }
+        }
 
         // ---- style detection: is this spirited driving? ----
         val insideCorner = h.corners.firstOrNull { c ->
@@ -229,10 +282,14 @@ class DriveEngine(
                 tMs = now, speedMps = speed,
                 rpm = vehicle.rpm(), pedal01 = vehicle.throttle01(), gear = gear,
                 aLatMps2 = insideCorner?.let { (speed * speed) / it.corner.minRadiusM },
+                // Lets the detector tell necessary braking (for a corner) from
+                // traffic/hesitation braking, which breaks a "spirited" run.
+                nearestCornerM = h.corners.minOfOrNull { kotlin.math.abs(aheadOf(it)) },
             ),
             advisorProfile(),
         )
-        val spiritedNow = styleDetector?.isSpirited ?: true
+        // No detector wired = no learning. Fail CLOSED: this flag gates the profile.
+        val spiritedNow = styleDetector?.isSpirited ?: false
 
         // ---- feed the observation collector (runs behind the car) ----
         collector?.tick(now, speed, vehicle.throttle01(), h.corners, spiritedNow) { aheadOf(it) }
@@ -248,17 +305,19 @@ class DriveEngine(
             val recentP90 = recentSpeeds.map { it.second }.sorted()
                 .let { if (it.isEmpty()) 0.0 else it[((it.size - 1) * 0.9).toInt()] }
             val expected = nearCorner?.vTargetMps ?: recentP90
-            val nearestMapped = h.hazards
+            // Slowing right after a junction/edge change is explained by the turn, not a
+            // hazard — treat the passage itself as a nearby mapped feature for a while.
+            val nearestMapped = if (now - lastEdgeChangeMs < 8_000) 0.0
+            else h.hazards
                 .filter { it.hazard.kind != com.rallycopilot.core.model.HazardKind.LEARNED }
                 .minOfOrNull { kotlin.math.abs(it.distanceAheadM - progressM) }
             slowdown.tick(now, m.edgeId, m.offsetM, speed, expected, nearestMapped)?.let { anomaly ->
-                activePrompt = HazardPrompt(anomaly.edgeId, anomaly.offsetM, anomaly.observedRatio, now + 7_000)
-                runLog.logEvent(RunEvent(now, RunEventType.HAZARD_PROMPT,
-                    if (anomaly.hadBump) "bump" else ""))
-            }
-            // Prompt deadline: silence = "no" (but still soft evidence).
-            activePrompt?.let { p ->
-                if (now >= p.deadlineMs) { activePrompt = null; resolvePrompt(p, confirmed = false) }
+                // Never clobber a prompt the driver hasn't answered yet.
+                if (activePrompt == null) {
+                    activePrompt = HazardPrompt(anomaly.edgeId, anomaly.offsetM, anomaly.observedRatio, now + 7_000)
+                    runLog.logEvent(RunEvent(now, RunEventType.HAZARD_PROMPT,
+                        if (anomaly.hadBump) "bump" else ""))
+                }
             }
             // Clean passes over known trouble spots relax them over time.
             for (hz in h.hazards) {
@@ -301,10 +360,10 @@ class DriveEngine(
         for (hz in h.hazards) {
             val ahead = hz.distanceAheadM - progressM
             val key = "${hz.hazard.edgeId}:${hz.hazard.offsetM.toInt()}"
-            if (ahead in 0.0..(speed * 6.0 + 50.0) && key !in spokenHazardKeys &&
+            if (ahead in 0.0..(speed * 6.0 + 50.0) && key !in spokenHazards &&
                 hz.pathConfidence >= params.speakConfidence
             ) {
-                spokenHazardKeys += key
+                spokenHazards[key] = now
                 val keys = NoteComposer.hazardKeys(
                     com.rallycopilot.core.model.HorizonHazard(hz.hazard, ahead, hz.pathConfidence)
                 )
@@ -314,41 +373,64 @@ class DriveEngine(
             }
         }
 
-        // Find the first unspoken corner whose trigger point we have reached.
-        val due = h.corners.firstOrNull { c ->
-            c.corner.id !in spokenCornerIds && aheadOf(c) > 0 &&
-                progressM + speechLeadM(speed, c) >= c.triggerDistanceM
-        } ?: return
-
-        if (due.pathConfidence < params.speakConfidence) {
-            spokenCornerIds += due.corner.id
-            runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, due.corner.id.toString()))
-            return
+        // Corners we could speak, nearest first. Low-confidence corners are skipped but
+        // NOT marked spoken — a transient ambiguity must not silence them forever.
+        val speakable = h.corners.filter { c ->
+            val ok = c.corner.id !in spokenCorners && aheadOf(c) > 0
+            if (ok && c.pathConfidence < params.speakConfidence) {
+                if (suppressionLogged.add(c.corner.id)) {
+                    runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
+                }
+                false
+            } else ok
         }
+        if (speakable.isEmpty()) return
 
-        // Chain: pull in following corners that would overlap this utterance.
+        // Trigger from LIVE speed: braking distance to this corner's target plus the
+        // reaction lead plus the time the clips take to play. Build-time trigger
+        // distances go stale the moment speed changes.
+        fun triggerReached(c: HorizonCorner): Boolean {
+            val need = advisor.brakingDistanceM(speed, c.vTargetMps) +
+                speed * advisor.noteLeadSeconds + speechLeadM(speed, c)
+            return aheadOf(c) <= need
+        }
+        val due = speakable.firstOrNull { triggerReached(it) } ?: return
+
+        // Speak from the NEAREST speakable corner: if a far severe corner comes due
+        // while a nearer gentle one hasn't triggered yet, the driver still must hear
+        // them in road order — "six left into hairpin right", never the reverse.
         val chain = ArrayList<HorizonCorner>()
         val gaps = ArrayList<Double?>()
-        chain += due; gaps += null
-        var tail = due
-        for (c in h.corners) {
-            if (c.corner.id in spokenCornerIds || c === due) continue
-            val gap = c.distanceAheadM - (tail.distanceAheadM + tail.corner.arcLengthM)
-            if (c.distanceAheadM > tail.distanceAheadM && gap < params.chainGapM + speed * 1.5) {
-                chain += c; gaps += gap.coerceAtLeast(0.0); tail = c
-            } else if (c.distanceAheadM > tail.distanceAheadM) break
+        var tail: HorizonCorner? = null
+        for (c in speakable) {
+            if (c.distanceAheadM > due.distanceAheadM) {
+                // Past the due corner: keep chaining only while gaps genuinely overlap.
+                val t = tail ?: break
+                val gap = c.distanceAheadM - (t.distanceAheadM + t.corner.arcLengthM)
+                if (gap < params.chainGapM + speed * 1.5) {
+                    chain += c; gaps += gap.coerceAtLeast(0.0); tail = c
+                } else break
+            } else {
+                gaps += tail?.let { (c.distanceAheadM - (it.distanceAheadM + it.corner.arcLengthM)).coerceAtLeast(0.0) }
+                chain += c
+                tail = c
+            }
         }
+        if (chain.isEmpty()) return
         if (chain.size > 1) runLog.logEvent(RunEvent(now, RunEventType.NOTE_CHAINED, chain.size.toString()))
 
+        val first = chain.first()
+        // The whole utterance must be DONE by the first corner's braking point.
+        val deadline = (aheadOf(first) - advisor.brakingDistanceM(speed, first.vTargetMps)).coerceAtLeast(0.0)
         val utterance = NoteComposer.compose(
             chain = chain,
             gapsM = gaps,
             includeGear = params.includeGear && vehicle.rpm() != null,
-            deadlineDistanceM = aheadOf(due),
+            deadlineDistanceM = deadline,
             budgetMs = params.burstBudgetMs,
             durationOf = { audio.clipDurationMs(it) },
         )
-        chain.forEach { spokenCornerIds += it.corner.id }
+        chain.forEach { spokenCorners[it.corner.id] = now }
         audio.play(utterance)
         runLog.logEvent(RunEvent(now, RunEventType.NOTE_SPOKEN, chain.joinToString(",") { it.corner.id.toString() }))
     }
@@ -369,11 +451,13 @@ class DriveEngine(
         // Progress space starts at the position the horizon was built from on the same edge.
         val firstEdge = h.pathEdgeIds.firstOrNull() ?: return null
         if (m.edgeId != firstEdge) return null
-        // The horizon's distance-ahead space was measured from the build position;
-        // the difference in matched offsets maps 1:1 while we stay on the first edge.
-        return if (m.forward) m.offsetM - (lastBuildOffset ?: m.offsetM)
+        // A direction flip since the build forces a rebuild before this is used again;
+        // anchoring must use the direction the horizon was BUILT with.
+        if (m.forward != lastBuildForward) return null
+        return if (lastBuildForward) m.offsetM - (lastBuildOffset ?: m.offsetM)
         else (lastBuildOffset ?: m.offsetM) - m.offsetM
     }
 
     private var lastBuildOffset: Double? = null
+    private var lastBuildForward: Boolean = true
 }

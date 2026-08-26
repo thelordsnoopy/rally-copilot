@@ -12,6 +12,15 @@ import com.rallycopilot.core.model.DriverProfile
  * falls back to longitudinal/lateral acceleration. Each signal votes 0..1; the
  * blended score crosses in/out of SPIRITED with hysteresis so it doesn't flicker.
  *
+ * Two profile-level gates sit ON TOP of the instantaneous score, because a brief
+ * pull LOOKS spirited on every instantaneous signal without meaning anything:
+ *  - PACE: once enough of the drive has been seen to trust it, your rolling window
+ *    is compared against your own drive-long moving average — only genuinely
+ *    quicker-than-your-normal pace votes spirited (heavily weighted).
+ *  - SUSTAIN: the verdict flips only after the commitment holds UNBROKEN for
+ *    [Params.sustainMs]. Stopping, crawling, or braking hard nowhere near a known
+ *    corner breaks the run and the clock restarts. One overtake logs nothing.
+ *
  * Tuned around a diesel road car (BMW 320d E90: idle ~800, redline ~4800, normal
  * upshifts under ~2200 rpm, spirited ones past ~3000) but every threshold is a
  * parameter, not a constant baked into logic.
@@ -38,6 +47,19 @@ class StyleDetector(
         /** Score thresholds with hysteresis: enter spirited above, leave below. */
         val enterSpirited: Double = 0.55,
         val exitSpirited: Double = 0.40,
+        /** Window pace vs your drive-long moving average: 1.05x reads normal, 1.30x committed. */
+        val paceRatioNormal: Double = 1.05,
+        val paceRatioSpirited: Double = 1.30,
+        /** The pace vote joins only after this much MOVING time — the average needs to mean something. */
+        val paceWarmupMs: Long = 120_000,
+        /** Commitment must hold unbroken this long before the verdict flips to spirited. */
+        val sustainMs: Long = 20_000,
+        /** Hard braking further than this from any known corner is not "necessary" braking. */
+        val necessaryBrakeNearCornerM: Double = 70.0,
+        /** Decel treated as a deliberate brake, m/s². */
+        val brakeDecelMps2: Double = 2.5,
+        /** Stopping or crawling always breaks the run. */
+        val breakSpeedMps: Double = 2.0,
     )
 
     data class Sample(
@@ -47,16 +69,29 @@ class StyleDetector(
         val pedal01: Double?,
         val gear: Int?,
         val aLatMps2: Double?,   // v^2/R when in a known corner, else null
+        /** Distance to the nearest known corner (|ahead|), for judging whether a
+         *  brake was necessary. Null = no horizon data — braking is then not judged. */
+        val nearestCornerM: Double? = null,
     )
 
     private val window = ArrayDeque<Sample>()
     private val shiftRpms = ArrayDeque<Double>()   // rpm observed just before each upshift
     private var lastGear: Int? = null
     private var lastRpm: Int? = null
+    /** Rpm at the last sample where a gear was actually engaged. Gear inference goes
+     *  null through the clutch gap while revs fall — capturing rpm when the NEW gear
+     *  registers would record the post-shift value, ~25-30% low, and chronically
+     *  suppress the spirited verdict that gates all learning. */
+    private var lastEngagedRpm: Int? = null
     private var spirited = false
     private var spiritedMs = 0L
     private var totalMs = 0L
     private var lastT = 0L
+    /** Drive-long moving-speed average (slow, ~5-minute time constant) — "my pace". */
+    private var movingAvg = 0.0
+    private var movingMs = 0L
+    /** When the current UNBROKEN committed stretch began; -1 = not committed. */
+    private var committedSinceMs = -1L
 
     /** Whether the current window reads as spirited driving. */
     val isSpirited: Boolean get() = spirited
@@ -69,15 +104,30 @@ class StyleDetector(
     val spiritedFraction: Double get() = if (totalMs == 0L) 0.0 else spiritedMs.toDouble() / totalMs
 
     fun tick(sample: Sample, profile: DriverProfile) {
-        // Track upshift rpm: gear increased -> remember the rpm we shifted at.
+        // Track upshift rpm: gear increased -> remember the rpm from BEFORE the shift
+        // (the last sample with the old gear engaged), not the fallen post-shift revs.
         val g = sample.gear
         val r = sample.rpm
-        if (g != null && lastGear != null && g == lastGear!! + 1 && lastRpm != null) {
-            shiftRpms += lastRpm!!.toDouble()
-            while (shiftRpms.size > 12) shiftRpms.removeFirst()
+        if (g != null && lastGear != null && g == lastGear!! + 1) {
+            (lastEngagedRpm ?: lastRpm)?.let {
+                shiftRpms += it.toDouble()
+                while (shiftRpms.size > 12) shiftRpms.removeFirst()
+            }
         }
         if (g != null) lastGear = g
         if (r != null) lastRpm = r
+        if (g != null && r != null) lastEngagedRpm = r
+
+        val prev = window.lastOrNull()
+
+        // Drive-long moving average: time-weighted slow EMA, moving samples only.
+        if (sample.speedMps > 3.0 && prev != null) {
+            val dtMs = (sample.tMs - prev.tMs).coerceIn(0, 5000)
+            movingMs += dtMs
+            val alpha = dtMs / 300_000.0
+            movingAvg = if (movingAvg == 0.0) sample.speedMps
+            else movingAvg + (sample.speedMps - movingAvg) * alpha
+        }
 
         window += sample
         while (window.isNotEmpty() && sample.tMs - window.first().tMs > params.windowMs) {
@@ -85,9 +135,26 @@ class StyleDetector(
         }
         if (window.size < 5) return
 
-        score = blend(profile)
+        score = blend(profile, window)
         val was = spirited
-        spirited = if (spirited) score > params.exitSpirited else score > params.enterSpirited
+
+        // ---- unbroken-commitment gate ----
+        // A run breaks on a stop/crawl, or on hard braking with no corner anywhere
+        // near to explain it (traffic, junctions, hesitation — not pressing on).
+        val dtS = prev?.let { (sample.tMs - it.tMs) / 1000.0 } ?: 0.0
+        val decel = if (prev != null && dtS in 0.05..3.0) (prev.speedMps - sample.speedMps) / dtS else 0.0
+        val unnecessaryBrake = decel > params.brakeDecelMps2 &&
+            sample.nearestCornerM != null && sample.nearestCornerM > params.necessaryBrakeNearCornerM
+        val broke = sample.speedMps < params.breakSpeedMps || unnecessaryBrake
+        // The clock runs on a SHORT (5 s) recency score, not the full 20 s window:
+        // the window's decay tail would otherwise let a 10-second pull read as half
+        // a minute of commitment. Hysteresis: reset needs a real break or drop.
+        val recentSamples = window.filter { it.tMs >= sample.tMs - 5_000 }
+        val recent = if (recentSamples.size >= 5) blend(profile, recentSamples) else score
+        val committed = recent > (if (committedSinceMs >= 0) params.exitSpirited else params.enterSpirited)
+        if (broke || !committed) committedSinceMs = -1
+        else if (committedSinceMs < 0) committedSinceMs = sample.tMs
+        spirited = committedSinceMs >= 0 && sample.tMs - committedSinceMs >= params.sustainMs
 
         if (lastT != 0L) {
             val dt = sample.tMs - lastT
@@ -99,11 +166,11 @@ class StyleDetector(
         lastT = sample.tMs
     }
 
-    private fun blend(profile: DriverProfile): Double {
-        val votes = ArrayList<Pair<Double, Double>>(4) // (vote, weight)
+    private fun blend(profile: DriverProfile, samples: List<Sample>): Double {
+        val votes = ArrayList<Pair<Double, Double>>(6) // (vote, weight)
 
         // Longitudinal acceleration from speed deltas — always available.
-        val accels = window.windowed(2).mapNotNull { (a, b) ->
+        val accels = samples.windowed(2).mapNotNull { (a, b) ->
             val dt = (b.tMs - a.tMs) / 1000.0
             if (dt in 0.05..3.0) kotlin.math.abs(b.speedMps - a.speedMps) / dt else null
         }
@@ -112,20 +179,20 @@ class StyleDetector(
         }
 
         // Lateral-g utilisation vs the learned profile — the most direct signal.
-        val lats = window.mapNotNull { it.aLatMps2 }
+        val lats = samples.mapNotNull { it.aLatMps2 }
         if (lats.isNotEmpty()) {
             val target = profile.aLatFor(com.rallycopilot.core.model.SeverityBand.THREE)
             if (target > 0) votes += rate(p90(lats) / target, params.latUseNormal, params.latUseSpirited) to 1.4
         }
 
         // Pedal commitment (OBD).
-        val pedals = window.mapNotNull { it.pedal01 }
+        val pedals = samples.mapNotNull { it.pedal01 }
         if (pedals.size >= 5) {
             votes += rate(p90(pedals), params.pedalNormal, params.pedalSpirited) to 1.2
         }
 
         // Rpm headroom used (OBD).
-        val rpms = window.mapNotNull { it.rpm?.toDouble() }
+        val rpms = samples.mapNotNull { it.rpm?.toDouble() }
         if (rpms.size >= 5) {
             val used = (p90(rpms) - params.idleRpm) / (params.redlineRpm - params.idleRpm)
             votes += rate(used, 0.30, 0.65) to 1.0
@@ -135,6 +202,17 @@ class StyleDetector(
         if (shiftRpms.size >= 2) {
             val med = shiftRpms.sorted()[shiftRpms.size / 2]
             votes += rate(med, params.shiftRpmNormal, params.shiftRpmSpirited) to 1.3
+        }
+
+        // Pace vs YOUR OWN average — the profile signal, heaviest weight. A pull can
+        // spike accel, revs, and pedal for ten seconds; only a genuinely held
+        // quicker-than-your-normal pace moves this vote.
+        if (movingMs >= params.paceWarmupMs && movingAvg > 3.0) {
+            val moving = samples.filter { it.speedMps > 3.0 }
+            if (moving.isNotEmpty()) {
+                val mean = moving.sumOf { it.speedMps } / moving.size
+                votes += rate(mean / movingAvg, params.paceRatioNormal, params.paceRatioSpirited) to 1.6
+            }
         }
 
         val totalW = votes.sumOf { it.second }

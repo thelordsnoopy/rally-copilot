@@ -23,7 +23,14 @@ import java.util.UUID
 class ObdClient(private val scope: CoroutineScope) : VehicleData {
 
     private val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-    private var socket: BluetoothSocket? = null
+    @Volatile private var socket: BluetoothSocket? = null
+    /** Socket still inside connect(); disconnect() must be able to close this too,
+     *  or a cancelled slow connect leaks an open RFCOMM link and the dongle stays
+     *  unreachable until Bluetooth is toggled. */
+    @Volatile private var connecting: BluetoothSocket? = null
+    /** Bumped on every connect/disconnect; a stale connect coroutine sees the
+     *  mismatch and closes its own socket instead of hijacking the field. */
+    @Volatile private var generation = 0
     private var job: Job? = null
     val gearInference = GearInference()
 
@@ -61,21 +68,32 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
         saveCache: (String, Set<Int>) -> Unit = { _, _ -> },
     ) {
         disconnect()
+        val myGen = ++generation
         job = scope.launch(Dispatchers.IO) {
+            var s: BluetoothSocket? = null
             try {
                 val adapter = BluetoothAdapter.getDefaultAdapter() ?: return@launch
                 val device = adapter.getRemoteDevice(address)
-                val s = device.createRfcommSocketToServiceRecord(sppUuid)
+                s = device.createRfcommSocketToServiceRecord(sppUuid)
+                connecting = s
+                if (generation != myGen) return@launch // superseded before connect
                 s.connect()
+                connecting = null
+                if (generation != myGen) return@launch // superseded during connect
                 socket = s
                 val out = s.outputStream
                 val inp = s.inputStream
 
-                fun cmd(c: String): String {
+                // One command in flight at a time. CRITICAL: drain stale bytes BEFORE
+                // writing — a response that outlived its deadline (ATZ takes ~1 s on
+                // genuine ELMs) otherwise leaves its tail + '>' in the stream and every
+                // later command reads the PREVIOUS command's answer, forever.
+                fun cmd(c: String, timeoutMs: Long = 900): String {
+                    while (inp.available() > 0) inp.read()
                     out.write((c + "\r").toByteArray())
                     out.flush()
                     val sb = StringBuilder()
-                    val deadline = System.currentTimeMillis() + 900
+                    val deadline = System.currentTimeMillis() + timeoutMs
                     while (System.currentTimeMillis() < deadline) {
                         while (inp.available() > 0) {
                             val ch = inp.read()
@@ -88,25 +106,29 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                     return sb.toString()
                 }
 
-                for (init in Elm327.INIT) { cmd(init); Thread.sleep(80) }
+                // ATZ resets the chip and is the slowest command it has.
+                for (init in Elm327.INIT) {
+                    cmd(init, if (init == "ATZ") 2500 else 1200)
+                    Thread.sleep(80)
+                }
 
                 // Car identity first: VIN via mode 09 when supported. The PID cache then
                 // follows the CAR (swap dongles freely); dongle MAC is the fallback key.
-                vin = Elm327.vin(cmd(Elm327.Pid.VIN))
+                vin = Elm327.vin(cmd(Elm327.Pid.VIN, 1500))
                 val cacheKey = vin?.let { "vin:" + it } ?: ("mac:" + address)
 
                 var supported = loadCache(cacheKey)
                 if (supported.isNullOrEmpty()) {
-                    var scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                    var scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20, 1500))
                     if (scanned.isEmpty()) {
-                        cmd(Elm327.FALLBACK_PROTOCOL); Thread.sleep(120)
-                        scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                        cmd(Elm327.FALLBACK_PROTOCOL, 1200); Thread.sleep(120)
+                        scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20, 1500))
                         // Re-try VIN on the fallback protocol too.
                         if (vin == null) {
-                            vin = Elm327.vin(cmd(Elm327.Pid.VIN))
+                            vin = Elm327.vin(cmd(Elm327.Pid.VIN, 1500))
                         }
                     }
-                    scanned = scanned + Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60))
+                    scanned = scanned + Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60, 1500))
                     if (scanned.isNotEmpty()) {
                         saveCache(vin?.let { "vin:" + it } ?: ("mac:" + address), scanned)
                     }
@@ -115,20 +137,26 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 // On the E90 320d PID 0x11 is meaningless; 0x49 (accel pedal D) is the
                 // real signal. Pick the best one the ECU actually reports.
                 val pedalPid = Elm327.bestPedalPid(supported)
-                // No pedal PID at all? Engine load is a workable proxy for commitment.
+                // No pedal PID at all? Engine load is a workable proxy for commitment —
+                // but a diesel cruises near 30-40% load, which would sit right on the
+                // style detector's "relaxed" threshold. Remap so idle-ish load reads 0.
                 val loadFallback = pedalPid == null && 0x04 in supported
+                fun pedalFromLoad(load01: Double?): Double? =
+                    load01?.let { ((it - 0.15) / 0.70).coerceIn(0.0, 1.0) }
                 val hasAmbient = 0x46 in supported
                 val hasMap = 0x0B in supported
                 val hasFuel = 0x2F in supported
                 connected = true
 
                 var slowTick = 0
-                while (isActive && socket === s) {
+                while (isActive && generation == myGen && socket === s) {
                     speedKph = Elm327.speedKph(cmd(Elm327.Pid.SPEED))
                     rpmV = Elm327.rpm(cmd(Elm327.Pid.RPM))
                     throttleV = when {
                         pedalPid != null -> Elm327.percent01(pedalPid, cmd(pedalPid))
-                        loadFallback -> Elm327.percent01(Elm327.Pid.ENGINE_LOAD, cmd(Elm327.Pid.ENGINE_LOAD))
+                        loadFallback -> pedalFromLoad(
+                            Elm327.percent01(Elm327.Pid.ENGINE_LOAD, cmd(Elm327.Pid.ENGINE_LOAD))
+                        )
                         else -> null
                     }
                     if (hasMap) mapV = Elm327.mapKpa(cmd(Elm327.Pid.MAP_KPA))
@@ -145,6 +173,9 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
             } catch (_: Exception) {
                 // fall through to disconnect state
             } finally {
+                runCatching { s?.close() }
+                if (socket === s) socket = null
+                if (connecting === s) connecting = null
                 connected = false
                 speedKph = null; rpmV = null; throttleV = null
             }
@@ -152,8 +183,11 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     }
 
     fun disconnect() {
+        generation++
         job?.cancel(); job = null
+        try { connecting?.close() } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
+        connecting = null
         socket = null
         connected = false
     }

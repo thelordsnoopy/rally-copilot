@@ -13,6 +13,7 @@ data class Vec3(val x: Double, val y: Double, val z: Double) {
     fun cross(o: Vec3) = Vec3(y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x)
     fun norm() = sqrt(x * x + y * y + z * z)
     fun unit(): Vec3 { val n = norm(); return if (n < 1e-9) this else Vec3(x / n, y / n, z / n) }
+    fun isFinite() = x.isFinite() && y.isFinite() && z.isFinite()
 }
 
 /**
@@ -60,8 +61,14 @@ class MountAlignment(
     /**
      * Feed every IMU sample. [linearAccel] and [gravity] in phone frame,
      * [dvdtMps2] = signed speed derivative from GPS/OBD.
+     *
+     * CONVENTION: [gravity] is the PHYSICAL gravity vector — it points DOWN
+     * (flat phone on a table: (0, 0, −9.81)). Android's TYPE_GRAVITY reports the
+     * opposite sign; the app layer negates it before calling here.
      */
     fun tick(linearAccel: Vec3, gravity: Vec3, dvdtMps2: Double) {
+        // One NaN would poison the EMAs forever — reject non-finite samples outright.
+        if (!linearAccel.isFinite() || !gravity.isFinite() || !dvdtMps2.isFinite()) return
         // Body-down baseline updates on EVERY sample (slow EMA ~ tens of seconds),
         // so brief leans through corners barely move it.
         gravityEma = if (!haveGravityEma) gravity.also { haveGravityEma = true }
@@ -117,6 +124,7 @@ class CamberEstimator(
      * when a clean sample was possible, else null.
      */
     fun tick(linearAccel: Vec3, gravity: Vec3, speedMps: Double): Double? {
+        if (!linearAccel.isFinite() || !gravity.isFinite() || !speedMps.isFinite()) return null
         if (speedMps < params.minSpeedMps) return null
         val leftAxis = alignment.left() ?: return null
         // Body accelerating sideways? Reading would be polluted — skip.

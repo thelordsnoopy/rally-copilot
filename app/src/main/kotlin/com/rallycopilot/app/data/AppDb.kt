@@ -17,8 +17,21 @@ import org.json.JSONObject
  * App-side persistence: runs, fixes, events, observations, profile.
  * Plain SQLite by design — fewer build-time moving parts than Room, and the
  * write pattern (append-only logs) doesn't need an ORM.
+ *
+ * ONE instance per process (get()) — screens and the service previously opened six
+ * independent connections, risking SQLITE_BUSY between a screen query and the
+ * service's write transactions.
  */
-class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", null, 2) {
+class AppDb private constructor(context: Context) :
+    SQLiteOpenHelper(context.applicationContext, "rallycopilot.db", null, 3) {
+
+    companion object {
+        @Volatile private var instance: AppDb? = null
+        fun get(context: Context): AppDb =
+            instance ?: synchronized(this) {
+                instance ?: AppDb(context).also { instance = it }
+            }
+    }
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""CREATE TABLE runs(id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER,
@@ -28,21 +41,34 @@ class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", nul
             speed_mps REAL, bearing_deg REAL, accuracy_m REAL, edge_id INTEGER, offset_m REAL,
             confidence REAL, predicted INTEGER)""")
         db.execSQL("CREATE INDEX idx_rf ON run_fixes(run_id)")
+        db.execSQL("CREATE INDEX idx_rf_run_t ON run_fixes(run_id, t_ms)")
         db.execSQL("CREATE TABLE run_events(run_id INTEGER, t_ms INTEGER, type TEXT, payload TEXT)")
         db.execSQL("""CREATE TABLE observations(run_id INTEGER, corner_id INTEGER, t_ms INTEGER,
             band TEXT, min_r REAL, v_entry REAL, v_min REAL, v_exit REAL, a_lat REAL,
             map_conf REAL, path_conf REAL, constrained INTEGER, conditions TEXT, throttle REAL,
             spirited INTEGER DEFAULT 1)""")
+        db.execSQL("CREATE INDEX idx_obs_run ON observations(run_id)")
         db.execSQL("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {
         if (old < 2) db.execSQL("ALTER TABLE observations ADD COLUMN spirited INTEGER DEFAULT 1")
+        if (old < 3) {
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_rf_run_t ON run_fixes(run_id, t_ms)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_obs_run ON observations(run_id)")
+        }
     }
 
     // ---- runs ----
 
     fun startRun(conditions: Conditions, calibration: Boolean): Long {
+        // A run whose process died never got endRun — close it against its last fix
+        // so the log doesn't show phantom "0 min" runs forever.
+        writableDatabase.execSQL(
+            """UPDATE runs SET ended_at = COALESCE(
+                 (SELECT MAX(t_ms) FROM run_fixes WHERE run_id = runs.id), started_at)
+               WHERE ended_at IS NULL"""
+        )
         val v = ContentValues().apply {
             put("started_at", System.currentTimeMillis())
             put("conditions", conditions.name)
@@ -143,9 +169,9 @@ class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", nul
         }
     }
 
-    fun allObservations(): List<CornerObservation> {
+    private fun readObservations(where: String, args: Array<String>?): List<CornerObservation> {
         val out = ArrayList<CornerObservation>()
-        readableDatabase.rawQuery("SELECT * FROM observations ORDER BY t_ms", null).use { c ->
+        readableDatabase.rawQuery("SELECT * FROM observations $where ORDER BY t_ms", args).use { c ->
             while (c.moveToNext()) out += CornerObservation(
                 runId = c.getLong(0), cornerId = c.getLong(1), tMs = c.getLong(2),
                 band = SeverityBand.valueOf(c.getString(3)), minRadiusM = c.getDouble(4),
@@ -160,8 +186,10 @@ class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", nul
         return out
     }
 
+    fun allObservations(): List<CornerObservation> = readObservations("", null)
+
     fun observationsFor(runId: Long): List<CornerObservation> =
-        allObservations().filter { it.runId == runId }
+        readObservations("WHERE run_id=?", arrayOf(runId.toString()))
 
     /** User override from the post-drive sheet: reclassify a whole run's style, then
      *  the caller re-derives the profile from history so the correction takes effect. */

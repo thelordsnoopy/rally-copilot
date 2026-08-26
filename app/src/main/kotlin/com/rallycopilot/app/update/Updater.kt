@@ -50,11 +50,27 @@ object Updater {
             val out = File(dir, "update-$tag.apk")
             // Already downloaded on a previous check? Reuse.
             if (!out.exists() || out.length() < 1_000_000) {
-                val dl = URL(apkUrl).openConnection() as HttpURLConnection
-                dl.connectTimeout = 10000
-                dl.instanceFollowRedirects = true
-                dl.inputStream.use { input -> out.outputStream().use { input.copyTo(it) } }
-                dl.disconnect()
+                // Download to a temp name and rename only when COMPLETE — a partial
+                // file under the final name would be cached and re-offered as a
+                // broken installer forever.
+                val tmp = File(dir, "update-$tag.apk.part")
+                try {
+                    val dl = URL(apkUrl).openConnection() as HttpURLConnection
+                    dl.connectTimeout = 10000
+                    // No read timeout = a stalled network pins this thread forever.
+                    dl.readTimeout = 30000
+                    dl.instanceFollowRedirects = true
+                    val expected = dl.contentLengthLong
+                    dl.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                    dl.disconnect()
+                    if (expected > 0 && tmp.length() != expected) throw java.io.IOException(
+                        "short download: ${tmp.length()} of $expected"
+                    )
+                    if (out.exists()) out.delete()
+                    if (!tmp.renameTo(out)) throw java.io.IOException("rename failed")
+                } finally {
+                    tmp.delete()
+                }
             }
             // Clean older cached updates.
             dir.listFiles()?.forEach { if (it != out) it.delete() }

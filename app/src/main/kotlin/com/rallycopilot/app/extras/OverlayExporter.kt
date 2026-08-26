@@ -26,7 +26,7 @@ import java.io.File
 object OverlayExporter {
 
     fun export(context: Context, runId: Long, onProgress: (Int) -> Unit = {}): Uri? {
-        val db = AppDb(context)
+        val db = AppDb.get(context)
         val fixes = db.fixesFor(runId)
         if (fixes.size < 10) return null
 
@@ -51,6 +51,7 @@ object OverlayExporter {
         val muxer = MediaMuxer(outFile.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var track = -1
         var muxerStarted = false
+        var encodedFrames = 0L
         val bufferInfo = MediaCodec.BufferInfo()
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -70,6 +71,12 @@ object OverlayExporter {
                         if (bufferInfo.size > 0 && muxerStarted &&
                             (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
                         ) {
+                            // Surface-input PTS is wall-clock render time, which makes a
+                            // 20-minute drive encode into a ~40-second file. Restamp to
+                            // the drive's own timeline so the overlay lines up with
+                            // real-time dashcam footage — the file's entire purpose.
+                            bufferInfo.presentationTimeUs = encodedFrames * 1_000_000L / fps
+                            encodedFrames++
                             muxer.writeSampleData(track, buf, bufferInfo)
                         }
                         codec.releaseOutputBuffer(idx, false)
@@ -101,21 +108,32 @@ object OverlayExporter {
         runCatching { if (muxerStarted) muxer.stop(); muxer.release() }
         surface.release()
 
-        // Publish to Movies via MediaStore.
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, "rallycopilot_overlay_$runId.mp4")
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/RallyCopilot")
+        // Publish to Movies via MediaStore (RELATIVE_PATH exists from API 29; below
+        // that, app-external Movies needs no permission and no MediaStore insert).
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, "rallycopilot_overlay_$runId.mp4")
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/RallyCopilot")
+            }
+            val uri = context.contentResolver.insert(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+            ) ?: return null
+            context.contentResolver.openOutputStream(uri)?.use { out ->
+                outFile.inputStream().use { it.copyTo(out) }
+            }
+            outFile.delete()
+            onProgress(100)
+            return uri
+        } else {
+            val movies = context.getExternalFilesDir(android.os.Environment.DIRECTORY_MOVIES)
+                ?: return null
+            val dst = File(movies, "rallycopilot_overlay_$runId.mp4")
+            outFile.inputStream().use { input -> dst.outputStream().use { input.copyTo(it) } }
+            outFile.delete()
+            onProgress(100)
+            return Uri.fromFile(dst)
         }
-        val uri = context.contentResolver.insert(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
-        ) ?: return null
-        context.contentResolver.openOutputStream(uri)?.use { out ->
-            outFile.inputStream().use { it.copyTo(out) }
-        }
-        outFile.delete()
-        onProgress(100)
-        return uri
     }
 
     private fun drawTelemetry(
