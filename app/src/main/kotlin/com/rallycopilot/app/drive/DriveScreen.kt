@@ -150,6 +150,32 @@ fun DriveScreen(activity: MainActivity, onExit: () -> Unit) {
                 shape = RoundedCornerShape(8.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF321A20)),
             ) { Text("END", fontSize = 13.sp, color = Color(0xFFFF8A8A), fontWeight = FontWeight.Bold) }
+
+            // "Was there a hazard?" — auto-answers NO at the deadline; one big YES.
+            hud?.hazardPrompt?.let { prompt ->
+                val secondsLeft = ((prompt.deadlineMs - System.currentTimeMillis()) / 1000)
+                    .coerceAtLeast(0)
+                Button(
+                    onClick = {
+                        runCatching { activity.driveService?.engine?.answerHazardPrompt(true) }
+                    },
+                    modifier = Modifier.align(Alignment.BottomCenter)
+                        .padding(bottom = 18.dp).fillMaxWidth(0.85f).height(72.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Amber),
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            "HAZARD BACK THERE?  TAP = YES",
+                            fontSize = 18.sp, color = Bg, fontWeight = FontWeight.Black,
+                        )
+                        Text(
+                            "auto-dismisses as no in ${secondsLeft}s",
+                            fontSize = 12.sp, color = Color(0xCC06080B),
+                        )
+                    }
+                }
+            }
         }
 
         // ---- instrument bar, bottom ----

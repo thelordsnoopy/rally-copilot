@@ -74,6 +74,8 @@ enum class HazardKind(val spoken: String) {
     NARROW_BRIDGE("narrow bridge"),
     GATE("gate"),
     LEVEL_CROSSING("level crossing"),
+    /** Learned from YOUR drives — repeated slowdowns / rough surface / confirmed prompt. */
+    LEARNED("caution"),
 }
 
 data class Hazard(val edgeId: Long, val offsetM: Double, val kind: HazardKind)
@@ -209,6 +211,7 @@ enum class RunEventType {
     HORIZON_REBUILT, MPP_AMBIGUOUS, MATCH_LOST, GPS_LOST, REGION_MISSING,
     OBSERVATION_RECORDED, OBSERVATION_REJECTED, HAZARD_SPOKEN,
     OBD_CONNECTED, OBD_LOST, HEALTH_WARNING, INCIDENT_SUSPECTED,
+    HAZARD_PROMPT, HAZARD_CONFIRMED, HAZARD_AUTO_NO,
 }
 
 data class RunEvent(val tMs: Long, val type: RunEventType, val payload: String = "")

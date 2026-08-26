@@ -37,7 +37,8 @@ object NoteComposer {
     }
 
     fun hazardKeys(h: HorizonHazard): List<String> =
-        listOf("caution", h.hazard.kind.name.lowercase())
+        if (h.hazard.kind == com.rallycopilot.core.model.HazardKind.LEARNED) listOf("caution")
+        else listOf("caution", h.hazard.kind.name.lowercase())
 
     /**
      * Build one utterance for a chain of corners (and optional leading link distance),

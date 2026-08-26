@@ -17,6 +17,7 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.rallycopilot.app.audio.VoicePack
 import com.rallycopilot.app.data.AppDb
+import com.rallycopilot.app.data.KnowledgeDb
 import com.rallycopilot.app.data.SqliteMapStore
 import com.rallycopilot.app.obd.ObdClient
 import com.rallycopilot.core.advisor.Advisor
@@ -69,6 +70,9 @@ class DriveService : Service() {
         private set
     var map: SqliteMapStore? = null
         private set
+    private var knowledge: KnowledgeDb? = null
+    private var imu: ImuMonitor? = null
+    private var slowdownMonitor: com.rallycopilot.core.knowledge.SlowdownMonitor? = null
     private var distanceM = 0.0
     private var lastFix: Fix? = null
 
@@ -93,14 +97,21 @@ class DriveService : Service() {
 
         val map = SqliteMapStore(this)
         this.map = map
+        val know = KnowledgeDb(db)
+        knowledge = know
+        val slowMon = com.rallycopilot.core.knowledge.SlowdownMonitor()
+        slowdownMonitor = slowMon
         // Separate learned profiles per conditions: wet drives use and train the wet model.
         val profile = db.loadProfile(conditions)
         collector = ObservationCollector(runId, conditions)
         val clock = object : Clock { override fun nowMs() = System.currentTimeMillis() }
+        val advisor = Advisor(profile, conditions = conditions)
+        // Your road history trims suggestions where trouble was learned.
+        advisor.speedFactorLookup = { e, a, b -> know.factorFor(e, a, b) }
         engine = DriveEngine(
             matcher = MapMatcher(map),
-            horizonBuilder = HorizonBuilder(map),
-            advisor = Advisor(profile, conditions = conditions),
+            horizonBuilder = HorizonBuilder(map, know),
+            advisor = advisor,
             audio = voice,
             runLog = db.runLogFor(runId),
             clock = clock,
@@ -109,7 +120,20 @@ class DriveService : Service() {
             incidentDetector = IncidentDetector(),
             styleDetector = StyleDetector(),
             healthWatch = com.rallycopilot.core.obd.HealthWatch(),
+            knowledge = know,
+            slowdown = slowMon,
         )
+
+        // IMU: surface roughness + pothole spikes, tagged to the matched road bucket.
+        imu = ImuMonitor(
+            this,
+            onRoughness = { rms ->
+                engine.hud.value.matched?.let { m ->
+                    if (engine.hud.value.speedMps > 4.0) know.addRoughness(m.edgeId, m.offsetM, rms)
+                }
+            },
+            onBump = { slowMon.reportBump(System.currentTimeMillis()) },
+        ).also { it.start() }
 
         voice.requestFocus()
         voice.startKeepAlive()
@@ -228,6 +252,7 @@ class DriveService : Service() {
         runId = -1
         locationCallback?.let { fused?.removeLocationUpdates(it) }
         locationCallback = null
+        imu?.stop(); imu = null
         obd.disconnect()
         voice.release()
         // Do NOT cancel the scope here: Android may reuse this service instance for the

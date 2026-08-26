@@ -13,6 +13,10 @@ import com.rallycopilot.core.model.RunEvent
 import com.rallycopilot.core.model.RunEventType
 import com.rallycopilot.core.model.Utterance
 import com.rallycopilot.core.profile.ObservationCollector
+import com.rallycopilot.core.knowledge.KnowledgeMath
+import com.rallycopilot.core.knowledge.KnowledgeStore
+import com.rallycopilot.core.knowledge.RoadBucket
+import com.rallycopilot.core.knowledge.SlowdownMonitor
 import com.rallycopilot.core.obd.HealthWatch
 import com.rallycopilot.core.profile.StyleDetector
 import com.rallycopilot.core.report.IncidentDetector
@@ -39,6 +43,8 @@ class DriveEngine(
     private val incidentDetector: IncidentDetector? = null,
     val styleDetector: StyleDetector? = null,
     private val healthWatch: HealthWatch? = null,
+    private val knowledge: KnowledgeStore? = null,
+    private val slowdown: SlowdownMonitor? = null,
 ) {
     data class Params(
         val maxAccuracyM: Double = 25.0,
@@ -75,7 +81,11 @@ class DriveEngine(
         /** Style detector verdict: is this spirited driving right now? */
         val spirited: Boolean = false,
         val spiritedFraction: Double = 0.0,
+        /** Active "was there a hazard?" prompt: auto-answers NO at deadline. */
+        val hazardPrompt: HazardPrompt? = null,
     )
+
+    data class HazardPrompt(val edgeId: Long, val offsetM: Double, val ratio: Double, val deadlineMs: Long)
 
     private val _hud = MutableStateFlow(HudState())
     val hud: StateFlow<HudState> = _hud
@@ -88,6 +98,27 @@ class DriveEngine(
     private var lastTickMs = 0L
     private val spokenCornerIds = HashSet<Long>()
     private val spokenHazardKeys = HashSet<String>()
+    private var activePrompt: HazardPrompt? = null
+    private val cleanPassChecked = HashSet<Long>()
+    /** Rolling recent-speed window for the "expected speed on a straight" baseline. */
+    private val recentSpeeds = ArrayDeque<Pair<Long, Double>>()
+
+    /** UI answer to the hazard prompt. YES confirms; the deadline auto-answers NO. */
+    fun answerHazardPrompt(yes: Boolean) {
+        val p = activePrompt ?: return
+        activePrompt = null
+        resolvePrompt(p, yes)
+    }
+
+    private fun resolvePrompt(p: HazardPrompt, confirmed: Boolean) {
+        val store = knowledge ?: return
+        val bucket = RoadBucket.bucketOf(p.offsetM)
+        val existing = store.get(p.edgeId, bucket) ?: RoadBucket(p.edgeId, bucket)
+        store.put(KnowledgeMath.applySlowEvent(existing, p.ratio, confirmed))
+        runLog.logEvent(RunEvent(clock.nowMs(),
+            if (confirmed) RunEventType.HAZARD_CONFIRMED else RunEventType.HAZARD_AUTO_NO,
+            "${'$'}{p.edgeId}:${'$'}{p.offsetM.toInt()}"))
+    }
 
     fun onFix(fix: Fix) {
         val prev = lastFix
@@ -206,6 +237,42 @@ class DriveEngine(
         // ---- feed the observation collector (runs behind the car) ----
         collector?.tick(now, speed, vehicle.throttle01(), h.corners, spiritedNow) { aheadOf(it) }
 
+        // ---- personal knowledge: unexplained slowdowns become hazard evidence ----
+        recentSpeeds += now to speed
+        while (recentSpeeds.isNotEmpty() && now - recentSpeeds.first().first > 60_000) recentSpeeds.removeFirst()
+        val m = lastMatch
+        if (slowdown != null && knowledge != null && m != null) {
+            // Expected speed here: a nearby corner's target, else your own recent pace.
+            val nearCorner = h.corners.minByOrNull { kotlin.math.abs(aheadOf(it)) }
+                ?.takeIf { kotlin.math.abs(aheadOf(it)) < 40.0 }
+            val recentP90 = recentSpeeds.map { it.second }.sorted()
+                .let { if (it.isEmpty()) 0.0 else it[((it.size - 1) * 0.9).toInt()] }
+            val expected = nearCorner?.vTargetMps ?: recentP90
+            val nearestMapped = h.hazards
+                .filter { it.hazard.kind != com.rallycopilot.core.model.HazardKind.LEARNED }
+                .minOfOrNull { kotlin.math.abs(it.distanceAheadM - progressM) }
+            slowdown.tick(now, m.edgeId, m.offsetM, speed, expected, nearestMapped)?.let { anomaly ->
+                activePrompt = HazardPrompt(anomaly.edgeId, anomaly.offsetM, anomaly.observedRatio, now + 7_000)
+                runLog.logEvent(RunEvent(now, RunEventType.HAZARD_PROMPT,
+                    if (anomaly.hadBump) "bump" else ""))
+            }
+            // Prompt deadline: silence = "no" (but still soft evidence).
+            activePrompt?.let { p ->
+                if (now >= p.deadlineMs) { activePrompt = null; resolvePrompt(p, confirmed = false) }
+            }
+            // Clean passes over known trouble spots relax them over time.
+            for (hz in h.hazards) {
+                if (hz.hazard.kind != com.rallycopilot.core.model.HazardKind.LEARNED) continue
+                val rel = hz.distanceAheadM - progressM
+                val key = hz.hazard.edgeId * 100_000 + RoadBucket.bucketOf(hz.hazard.offsetM)
+                if (rel < -30 && key !in cleanPassChecked) {
+                    cleanPassChecked += key
+                    val b = knowledge.get(hz.hazard.edgeId, RoadBucket.bucketOf(hz.hazard.offsetM))
+                    if (b != null && activePrompt == null) knowledge.put(KnowledgeMath.applyCleanPass(b))
+                }
+            }
+        }
+
         // ---- decide what to speak ----
         maybeSpeak(h, speed, now, ::aheadOf)
 
@@ -223,6 +290,7 @@ class DriveEngine(
             incidentSuspected = incident,
             spirited = spiritedNow && styleDetector != null,
             spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
+            hazardPrompt = activePrompt,
         )
     }
 

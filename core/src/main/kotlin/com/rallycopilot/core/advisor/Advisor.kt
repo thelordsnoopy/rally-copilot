@@ -21,6 +21,8 @@ class Advisor(
     var profile: DriverProfile,
     var severityTable: SeverityTable = SeverityTable.DEFAULT,
     var conditions: Conditions = Conditions.DRY,
+    /** Personal knowledge layer: learned speed factor for a stretch of an edge. */
+    var speedFactorLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double)? = null,
 ) {
     data class Params(
         /** Comfortable but firm braking on the road, m/s². */
@@ -72,7 +74,11 @@ class Advisor(
             val next = raw.corners.getOrNull(i + 1)
             if (next != null && next.second - (aheadM + corner.arcLengthM) < params.intoGapM) modifiers += Modifier.INTO
 
-            val vTarget = vTargetFor(corner, band)
+            var vTarget = vTargetFor(corner, band)
+            // Your history with this exact stretch of road trims the suggestion.
+            speedFactorLookup?.let { lookup ->
+                vTarget *= lookup(corner.edgeId, corner.startOffsetM, corner.endOffsetM)
+            }
             val v = currentSpeedMps
             val brakingDistance = if (v > vTarget) (v * v - vTarget * vTarget) / (2 * params.aBrake) else 0.0
             val brakingPointM = (aheadM - brakingDistance).coerceAtLeast(0.0)

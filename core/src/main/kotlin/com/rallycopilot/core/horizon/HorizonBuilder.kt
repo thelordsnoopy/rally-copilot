@@ -16,7 +16,10 @@ import com.rallycopilot.core.model.MatchedPosition
  * A wrong note is worse than no note: the confidence this produces is what the engine
  * gates speech on.
  */
-class HorizonBuilder(private val map: MapStore) {
+class HorizonBuilder(
+    private val map: MapStore,
+    private val knowledge: com.rallycopilot.core.knowledge.KnowledgeStore? = null,
+) {
 
     data class Params(
         val horizonM: Double = 1200.0,
@@ -97,7 +100,15 @@ class HorizonBuilder(private val map: MapStore) {
                 val aheadAt = step.startAheadM + delta
                 if (aheadAt in 0.0..params.horizonM) corners += Triple(c, aheadAt, step.confidence)
             }
-            for (h in map.hazardsOn(step.edge.id)) {
+            val learned = knowledge?.cautionsOn(step.edge.id)?.map { b ->
+                com.rallycopilot.core.model.Hazard(
+                    step.edge.id,
+                    b.bucket * com.rallycopilot.core.knowledge.RoadBucket.BUCKET_M +
+                        com.rallycopilot.core.knowledge.RoadBucket.BUCKET_M / 2,
+                    com.rallycopilot.core.model.HazardKind.LEARNED,
+                )
+            } ?: emptyList()
+            for (h in map.hazardsOn(step.edge.id) + learned) {
                 val hOffset = if (step.forward) h.offsetM else step.edge.lengthM - h.offsetM
                 val delta = directedDelta(step.forward, stepStartOffset, hOffset, step.edge.lengthM)
                     ?: continue
