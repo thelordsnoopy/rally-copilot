@@ -89,6 +89,12 @@ class DriveEngine(
     @Volatile
     var maxSpokenBandOrdinal: Int = com.rallycopilot.core.model.SeverityBand.SIX.ordinal
 
+    /** Where speed comes from. AUTO uses OBD whenever it is live, GPS otherwise. */
+    enum class SpeedSource { AUTO, GPS_ONLY, OBD_ONLY }
+
+    @Volatile
+    var speedSource: SpeedSource = SpeedSource.AUTO
+
     /** Everything the HUD needs, updated every tick. */
     data class HudState(
         val matched: MatchedPosition? = null,
@@ -101,6 +107,8 @@ class DriveEngine(
         val gpsOk: Boolean = false,
         val mapOk: Boolean = true,
         val obdConnected: Boolean = false,
+        /** True when the displayed speed came from the car, false when from GPS. */
+        val speedFromObd: Boolean = false,
         val gear: Int? = null,
         val incidentSuspected: Boolean = false,
         /** Strict verdict — gates learning. */
@@ -270,7 +278,7 @@ class DriveEngine(
         if (h == null || !gpsOk) {
             _hud.value = HudState(
                 matched = lastMatch, horizon = null, speedMps = speed,
-                gpsOk = gpsOk, obdConnected = vehicle.rpm() != null, gear = gear,
+                gpsOk = gpsOk, obdConnected = vehicle.rpm() != null, speedFromObd = usingObdSpeed, gear = gear,
                 incidentSuspected = incident,
                 spirited = styleDetector?.isSpirited ?: false,
                 spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
@@ -379,6 +387,7 @@ class DriveEngine(
             nextNote = upcoming.getOrNull(1),
             gpsOk = true,
             obdConnected = vehicle.rpm() != null,
+            speedFromObd = usingObdSpeed,
             gear = gear,
             incidentSuspected = incident,
             spirited = spiritedNow && styleDetector != null,
@@ -514,8 +523,19 @@ class DriveEngine(
         return speed * (clipMs + params.a2dpLatencyMs) / 1000.0
     }
 
-    /** OBD wheel speed preferred over GPS speed when available (faster, steadier). */
-    private fun fusedSpeed(gpsSpeed: Double): Double = vehicle.obdSpeedMps() ?: gpsSpeed
+    /**
+     * OBD wheel speed is preferred over GPS when available (faster, steadier), but
+     * which one is actually in use is never left to guesswork — [usingObdSpeed]
+     * drives the HUD so a silent fallback is impossible.
+     */
+    private fun fusedSpeed(gpsSpeed: Double): Double {
+        val obd = if (speedSource == SpeedSource.GPS_ONLY) null else vehicle.obdSpeedMps()
+        usingObdSpeed = obd != null
+        return obd ?: gpsSpeed
+    }
+
+    @Volatile
+    private var usingObdSpeed = false
 
     private fun advisorProfile() = advisor.profile
 

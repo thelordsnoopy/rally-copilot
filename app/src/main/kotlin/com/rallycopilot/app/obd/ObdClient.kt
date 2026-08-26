@@ -22,6 +22,28 @@ import java.util.UUID
 @SuppressLint("MissingPermission") // BLUETOOTH_CONNECT checked by caller before connect()
 class ObdClient(private val scope: CoroutineScope) : VehicleData {
 
+    /** What the OBD link is doing, in words the settings screen can show. */
+    enum class State { OFF, NO_DEVICE, CONNECTING, HANDSHAKING, LIVE, RETRYING, FAILED }
+
+    @Volatile var state: State = State.OFF
+        private set
+    /** Why the last attempt failed, for the settings screen. */
+    @Volatile var lastError: String? = null
+        private set
+    @Volatile var attempts: Int = 0
+        private set
+    /** Human-readable one-liner: exactly what is happening with the dongle. */
+    val statusText: String
+        get() = when (state) {
+            State.OFF -> "not in use"
+            State.NO_DEVICE -> "no dongle paired - pair the ELM327 in Bluetooth settings"
+            State.CONNECTING -> "connecting to dongle..."
+            State.HANDSHAKING -> "talking to the car..."
+            State.LIVE -> "live" + (vin?.let { " - VIN $it" } ?: "")
+            State.RETRYING -> "retrying (attempt $attempts)" + (lastError?.let { " - last: $it" } ?: "")
+            State.FAILED -> lastError ?: "failed"
+        }
+
     private val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     @Volatile private var socket: BluetoothSocket? = null
     /** Socket still inside connect(); disconnect() must be able to close this too,
@@ -72,10 +94,21 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     ) {
         disconnect()
         val myGen = ++generation
+        attempts = 0
+        lastError = null
+        state = State.CONNECTING
         job = scope.launch(Dispatchers.IO) {
+          // Keep trying for the whole drive. A dongle can be plugged in late, the
+          // ignition can come on after the app, and cheap clones routinely refuse
+          // the first connect and take the second. Giving up after one attempt is
+          // why this "just falls back to GPS".
+          while (isActive && generation == myGen) {
+            attempts++
             var s: BluetoothSocket? = null
             try {
-                val adapter = BluetoothAdapter.getDefaultAdapter() ?: return@launch
+                val adapter = BluetoothAdapter.getDefaultAdapter()
+                if (adapter == null) { state = State.NO_DEVICE; lastError = "no Bluetooth adapter"; return@launch }
+                state = State.CONNECTING
                 val device = adapter.getRemoteDevice(address)
                 s = device.createRfcommSocketToServiceRecord(sppUuid)
                 connecting = s
@@ -84,6 +117,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 connecting = null
                 if (generation != myGen) return@launch // superseded during connect
                 socket = s
+                state = State.HANDSHAKING
                 val out = s.outputStream
                 val inp = s.inputStream
 
@@ -153,6 +187,8 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 val hasMap = 0x0B in supported
                 val hasFuel = 0x2F in supported
                 connected = true
+                state = State.LIVE
+                lastError = null
 
                 var slowTick = 0
                 while (isActive && generation == myGen && socket === s) {
@@ -180,8 +216,12 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                     }
                     delay(120)
                 }
-            } catch (_: Exception) {
-                // fall through to disconnect state
+            } catch (e: Exception) {
+                lastError = when (e) {
+                    is java.io.IOException -> e.message?.take(60) ?: "connect failed"
+                    is SecurityException -> "Bluetooth permission denied"
+                    else -> e.message?.take(60) ?: e.javaClass.simpleName
+                }
             } finally {
                 // Save whatever gearing was learned before the link dropped.
                 runCatching {
@@ -194,11 +234,21 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 connected = false
                 speedKph = null; rpmV = null; throttleV = null
             }
+            if (!isActive || generation != myGen) break
+            // Back off gently, capped, so a missing dongle costs almost nothing.
+            state = State.RETRYING
+            delay(when {
+                attempts < 3 -> 3_000L
+                attempts < 6 -> 8_000L
+                else -> 20_000L
+            })
+          }
         }
     }
 
     fun disconnect() {
         generation++
+        state = State.OFF
         job?.cancel(); job = null
         try { connecting?.close() } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}

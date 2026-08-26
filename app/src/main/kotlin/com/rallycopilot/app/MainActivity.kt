@@ -637,8 +637,58 @@ fun SettingsScreen(activity: MainActivity) {
                 inactiveTrackColor = Color(0xFF232D38),
             ),
         )
+        // ---- speed source ----
+        var speedSrc by remember { mutableStateOf(db.kvGet("speed_source") ?: "auto") }
+        Text("Speed source", color = Color(0xFFB8C4D0))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for ((key, label) in listOf(
+                "auto" to "Auto", "obd" to "OBD", "gps" to "GPS",
+            )) {
+                val selected = speedSrc == key
+                Button(
+                    onClick = {
+                        speedSrc = key
+                        db.kvPut("speed_source", key)
+                        activity.driveService?.setSpeedSource(key)
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) Color(0xFF2EE06B) else Color(0xFF141C24),
+                    ),
+                ) {
+                    Text(
+                        label, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                        color = if (selected) Color.Black else Color(0xFFB8C4D0),
+                    )
+                }
+            }
+        }
+        Text(
+            when (speedSrc) {
+                "gps" -> "GPS only — Bluetooth is never opened, so no OBD, no gear calls."
+                "obd" -> "Car speed preferred. GPS still covers you while the dongle " +
+                    "connects or if it drops, and the OBD/GPS lights show which is live."
+                else -> "Uses the car's own speed when the dongle is live, GPS otherwise. " +
+                    "The OBD and GPS lights on the drive screen show which one you're on."
+            },
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
         // ---- OBD dongle selection ----
         Text("OBD dongle", color = Color(0xFFB8C4D0))
+        // What the link is actually doing right now — connecting, retrying, why it
+        // failed. Polled so you can watch it come up while sitting in the car.
+        val obdLive by androidx.compose.runtime.produceState<String?>(initialValue = null) {
+            while (true) {
+                value = activity.driveService?.obdStatusText()
+                kotlinx.coroutines.delay(1000)
+            }
+        }
+        Text(
+            "Status: " + (obdLive ?: "no drive running — start one to connect"),
+            color = if (obdLive?.startsWith("live") == true) Color(0xFF2EE06B) else Color(0xFF8899AA),
+            fontSize = 12.sp,
+        )
         val selectedMac = remember { mutableStateOf(db.kvGet("obd_mac")) }
         val bonded = remember {
             // BLUETOOTH_CONNECT (API 31+) may be denied — check first instead of

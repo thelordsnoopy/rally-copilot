@@ -164,8 +164,9 @@ class DriveService : Service() {
         // Your road history trims suggestions where trouble was learned.
         advisor.speedFactorLookup = { e, a, b -> know.factorFor(e, a, b) }
         advisor.camberLookup = { e, a, b -> know.camberFor(e, a, b) }
-        // Gear calls from the learned ratio table (diesel: aim ~3000 rpm at target speed).
-        advisor.gearLookup = { v -> if (obd.connected) obd.gearInference.gearForSpeed(v, 3000.0) else null }
+        // Gear calls from the learned ratio table, aiming at the exit revs learned
+        // from how THIS driver actually shifts (see GearInference.exitRpm).
+        advisor.gearLookup = { v -> if (obd.connected) obd.gearInference.gearForSpeed(v) else null }
         engine = DriveEngine(
             matcher = MapMatcher(map),
             horizonBuilder = HorizonBuilder(map, know),
@@ -184,6 +185,7 @@ class DriveService : Service() {
         // "always" = call everything whenever driving; default = quiet unless pressing on.
         engine.alwaysSpeak = db.kvGet("speak_mode") == "always"
         engine.maxSpokenBandOrdinal = verbosityOrdinal(db.kvGet("verbosity"))
+        engine.speedSource = speedSourceOf(db.kvGet("speed_source"))
 
         // IMU: surface roughness, pothole spikes, mount self-alignment and camber —
         // all tagged to the matched road bucket. No calibration step anywhere: the
@@ -243,8 +245,10 @@ class DriveService : Service() {
             startGps()
             // Bonded-device access needs BLUETOOTH_CONNECT; never let a denial kill the drive.
             runCatching {
-                // User-selected dongle wins; otherwise guess by name.
-                val mac = db.kvGet("obd_mac") ?: obd.findBonded()
+                // GPS-only: do not touch Bluetooth at all, so the OBD chip stays dark
+                // and there is no ambiguity about where the speed came from.
+                val mac = if (db.kvGet("speed_source") == "gps") null
+                else db.kvGet("obd_mac") ?: obd.findBonded()
                 if (mac != null) {
                     // PID cache keyed by VIN when readable (follows the car), else MAC.
                     obd.connect(
@@ -283,6 +287,14 @@ class DriveService : Service() {
     fun setVerbosity(key: String?) {
         if (::engine.isInitialized) engine.maxSpokenBandOrdinal = verbosityOrdinal(key)
     }
+
+    /** Live change of the speed source; takes effect on the next tick. */
+    fun setSpeedSource(key: String?) {
+        if (::engine.isInitialized) engine.speedSource = speedSourceOf(key)
+    }
+
+    /** One-line description of what the OBD link is doing, for the settings screen. */
+    fun obdStatusText(): String = obd.statusText
 
     /** Live voice level/balance changes from the settings screen. */
     fun setVoiceVolume(v: Float) { if (::voice.isInitialized) voice.setVolume(v) }
@@ -453,6 +465,12 @@ class DriveService : Service() {
             "min" -> com.rallycopilot.core.model.SeverityBand.TWO.ordinal
             // Default stays "call everything" — the user's standing choice.
             else -> com.rallycopilot.core.model.SeverityBand.SIX.ordinal
+        }
+
+        fun speedSourceOf(key: String?): com.rallycopilot.core.engine.DriveEngine.SpeedSource = when (key) {
+            "gps" -> com.rallycopilot.core.engine.DriveEngine.SpeedSource.GPS_ONLY
+            "obd" -> com.rallycopilot.core.engine.DriveEngine.SpeedSource.OBD_ONLY
+            else -> com.rallycopilot.core.engine.DriveEngine.SpeedSource.AUTO
         }
 
         const val CHANNEL = "drive"
