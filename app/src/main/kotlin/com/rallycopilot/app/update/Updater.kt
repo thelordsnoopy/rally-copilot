@@ -22,8 +22,23 @@ object Updater {
 
     data class Available(val version: String, val apkFile: File, val notes: String)
 
+    /**
+     * Outcome of a check. A manual check needs to say WHY it found nothing —
+     * "you're up to date" and "I couldn't reach GitHub" look identical otherwise,
+     * and a silent no-op is exactly what makes a button feel broken.
+     */
+    sealed class Result {
+        data class Update(val available: Available) : Result()
+        data class UpToDate(val version: String) : Result()
+        data class Failed(val reason: String) : Result()
+    }
+
     /** Returns a downloaded, ready-to-install update, or null if we're current. */
-    suspend fun check(context: Context, currentVersion: String): Available? = withContext(Dispatchers.IO) {
+    suspend fun check(context: Context, currentVersion: String): Available? =
+        (checkNow(context, currentVersion) as? Result.Update)?.available
+
+    /** As [check], but reports the reason when no update comes back. */
+    suspend fun checkNow(context: Context, currentVersion: String): Result = withContext(Dispatchers.IO) {
         try {
             val conn = URL(API).openConnection() as HttpURLConnection
             conn.connectTimeout = 8000
@@ -34,9 +49,11 @@ object Updater {
 
             val json = JSONObject(body)
             val tag = json.optString("tag_name").removePrefix("v")
-            if (tag.isEmpty() || !isNewer(tag, currentVersion)) return@withContext null
+            if (tag.isEmpty()) return@withContext Result.Failed("no release found")
+            if (!isNewer(tag, currentVersion)) return@withContext Result.UpToDate(currentVersion)
 
-            val assets = json.optJSONArray("assets") ?: return@withContext null
+            val assets = json.optJSONArray("assets")
+                ?: return@withContext Result.Failed("release v$tag has no files")
             var apkUrl: String? = null
             for (i in 0 until assets.length()) {
                 val a = assets.getJSONObject(i)
@@ -44,7 +61,7 @@ object Updater {
                     apkUrl = a.optString("browser_download_url"); break
                 }
             }
-            apkUrl ?: return@withContext null
+            apkUrl ?: return@withContext Result.Failed("release v$tag has no APK")
 
             val dir = File(context.cacheDir, "updates").apply { mkdirs() }
             val out = File(dir, "update-$tag.apk")
@@ -75,9 +92,17 @@ object Updater {
             // Clean older cached updates.
             dir.listFiles()?.forEach { if (it != out) it.delete() }
 
-            Available(tag, out, json.optString("body", ""))
-        } catch (_: Exception) {
-            null // offline, rate-limited, or bad payload — silently stay current
+            Result.Update(Available(tag, out, json.optString("body", "")))
+        } catch (e: Exception) {
+            // Offline, rate-limited, or a bad payload. The launch check ignores this
+            // and stays current; a manual check surfaces it.
+            Result.Failed(
+                when (e) {
+                    is java.net.UnknownHostException -> "no internet connection"
+                    is java.net.SocketTimeoutException -> "GitHub timed out"
+                    else -> e.message?.take(60) ?: "check failed"
+                }
+            )
         }
     }
 

@@ -97,11 +97,35 @@ class MainActivity : ComponentActivity() {
     /** Set when a newer release has been downloaded and is ready to install. */
     val updateReady = androidx.compose.runtime.mutableStateOf<com.rallycopilot.app.update.Updater.Available?>(null)
 
-    private fun checkForUpdates() {
+    /** Human-readable outcome of the last manual check, for the settings screen. */
+    val updateStatus = androidx.compose.runtime.mutableStateOf<String?>(null)
+    val updateChecking = androidx.compose.runtime.mutableStateOf(false)
+
+    /**
+     * [manual] checks report their outcome; the silent check at launch does not,
+     * because "couldn't reach GitHub" is not worth interrupting a drive over.
+     */
+    fun checkForUpdates(manual: Boolean = false) {
+        if (updateChecking.value) return
+        updateChecking.value = true
+        if (manual) updateStatus.value = "checking…"
         lifecycleScope.launch {
-            updateReady.value = com.rallycopilot.app.update.Updater.check(
+            val result = com.rallycopilot.app.update.Updater.checkNow(
                 this@MainActivity, BuildConfig.VERSION_NAME
             )
+            when (result) {
+                is com.rallycopilot.app.update.Updater.Result.Update -> {
+                    updateReady.value = result.available
+                    updateStatus.value = "v${result.available.version} downloaded — tap to install"
+                }
+                is com.rallycopilot.app.update.Updater.Result.UpToDate -> {
+                    updateReady.value = null
+                    if (manual) updateStatus.value = "up to date (v${result.version})"
+                }
+                is com.rallycopilot.app.update.Updater.Result.Failed ->
+                    if (manual) updateStatus.value = "couldn't check: ${result.reason}"
+            }
+            updateChecking.value = false
         }
     }
 
@@ -454,6 +478,38 @@ fun SettingsScreen(activity: MainActivity) {
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text("SETTINGS", color = Color.White, fontSize = 24.sp)
+
+        // ---- updates ----
+        val checking by activity.updateChecking
+        val status by activity.updateStatus
+        val ready by activity.updateReady
+        Text("App version ${BuildConfig.VERSION_NAME}", color = Color(0xFFB8C4D0))
+        Button(
+            onClick = {
+                if (ready != null) com.rallycopilot.app.update.Updater.install(activity, ready!!)
+                else activity.checkForUpdates(manual = true)
+            },
+            enabled = !checking,
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (ready != null) Color(0xFF6BB8FF) else Color(0xFF232D38),
+                disabledContainerColor = Color(0xFF1A222B),
+            ),
+        ) {
+            Text(
+                when {
+                    checking -> "CHECKING…"
+                    ready != null -> "INSTALL v${ready!!.version}"
+                    else -> "CHECK FOR UPDATES"
+                },
+                fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                color = if (ready != null) Color(0xFF06080B) else Color(0xFFEAF0F6),
+            )
+        }
+        status?.let {
+            Text(it, color = if (ready != null) Color(0xFF6BB8FF) else Color(0xFF667788), fontSize = 12.sp)
+        }
 
         // ---- when does the co-driver talk? ----
         var speakMode by remember { mutableStateOf(db.kvGet("speak_mode") ?: "smart") }
