@@ -90,3 +90,30 @@ class ObdPidTests {
         assertEquals(1.0, Elm327.percent01("0145", "41 45 FF")!!, 0.01)
     }
 }
+
+class VinTests {
+    @Test
+    fun `single line vin parses`() {
+        // 49 02 01 then "WBAVB13506PT12345" as hex ASCII
+        val vin = "WBAVB13506PT12345"
+        val hex = vin.map { "%02X".format(it.code) }.joinToString("")
+        assertEquals(vin, Elm327.vin("490201$hex"))
+    }
+
+    @Test
+    fun `iso-tp segmented vin parses`() {
+        val raw = """
+            014
+            0:490201574241
+            1:56423133353036
+            2:50543132333435
+        """.trimIndent()
+        assertEquals("WBAVB13506PT12345", Elm327.vin(raw))
+    }
+
+    @Test
+    fun `garbage returns null`() {
+        assertNull(Elm327.vin("NO DATA"))
+        assertNull(Elm327.vin("490201414243")) // too short
+    }
+}

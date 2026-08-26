@@ -467,20 +467,23 @@ fun SettingsScreen(activity: MainActivity) {
                     )
                 }
             }
-            selectedMac.value?.let { mac ->
-                Button(
-                    onClick = {
-                        db.writableDatabase.execSQL("DELETE FROM kv WHERE key=?", arrayOf("obd_pids_$mac"))
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232D38)),
-                ) { Text("Rescan car PIDs on next connect", fontSize = 12.sp, color = Color(0xFFB8C4D0)) }
-                Text(
-                    if (db.kvGet("obd_pids_$mac") != null)
-                        "PIDs remembered for this car — connects instantly"
-                    else "PIDs will be scanned once on next connect, then remembered",
-                    color = Color(0xFF667788), fontSize = 11.sp,
-                )
-            }
+            Button(
+                onClick = {
+                    db.writableDatabase.execSQL("DELETE FROM kv WHERE key LIKE 'obd_pids_%'")
+                    db.writableDatabase.execSQL("DELETE FROM kv WHERE key='car_vin'")
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232D38)),
+            ) { Text("Rescan car PIDs on next connect", fontSize = 12.sp, color = Color(0xFFB8C4D0)) }
+            val vin = db.kvGet("car_vin")
+            Text(
+                when {
+                    vin != null -> "Car remembered by VIN $vin — PIDs cached, connects instantly, " +
+                        "and the cache follows the car even if you swap dongles"
+                    else -> "PIDs scan once on first connect, then are remembered — keyed by the " +
+                        "car's VIN when the ECU reports one, otherwise by the dongle"
+                },
+                color = Color(0xFF667788), fontSize = 11.sp,
+            )
         }
 
         Text(

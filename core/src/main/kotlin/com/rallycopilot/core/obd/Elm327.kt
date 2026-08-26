@@ -28,6 +28,38 @@ object Elm327 {
         const val FUEL_LEVEL = "012F"
         const val AMBIENT = "0146"
         const val VOLTAGE = "ATRV"
+        const val VIN = "0902"
+    }
+
+    /**
+     * Parse a mode-09 VIN response. Multi-frame over CAN, so the ELM emits either a
+     * single line or ISO-TP segments prefixed "0:", "1:", "2:" (plus an optional
+     * length line like "014"). Strategy: strip segment markers, join the hex, find
+     * the 49 02 01 header, decode the rest as ASCII, and sanity-check the result
+     * against VIN shape (17 chars, no I/O/Q).
+     */
+    fun vin(raw: String): String? {
+        val joined = raw.replace("\r", "\n").split("\n")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .joinToString("") { line ->
+                // drop "0:", "1:" ISO-TP segment markers and bare length lines like "014"
+                val noMarker = line.replace(Regex("^[0-9A-Fa-f]:"), "")
+                if (noMarker.replace(" ", "").matches(Regex("^[0-9A-Fa-f]{3}$"))) "" else noMarker
+            }
+            .replace(" ", "").uppercase()
+        val idx = joined.indexOf("490201")
+        if (idx < 0) return null
+        val hex = joined.substring(idx + 6)
+        val sb = StringBuilder()
+        var i = 0
+        while (i + 1 < hex.length && sb.length < 17) {
+            val b = hex.substring(i, i + 2).toIntOrNull(16) ?: break
+            if (b in 0x30..0x5A) sb.append(b.toChar()) // printable VIN charset region
+            i += 2
+        }
+        val v = sb.toString()
+        return if (v.length == 17 && v.none { it in "IOQ" }) v else null
     }
 
     /**

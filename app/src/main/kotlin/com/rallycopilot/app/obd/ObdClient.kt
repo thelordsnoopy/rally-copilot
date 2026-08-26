@@ -37,6 +37,9 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     @Volatile private var fuelV: Double? = null
     @Volatile var connected = false
         private set
+    /** VIN read over mode 09 at connect, when the ECU offers it. */
+    @Volatile var vin: String? = null
+        private set
 
     /** Find a likely ELM327 among bonded devices (named OBD/ELM/V-Link etc.). */
     fun findBonded(): String? {
@@ -48,14 +51,14 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     }
 
     /**
-     * [cachedPids]: supported-PID set remembered for this dongle — skips the scan.
-     * [onPidsScanned]: called with the fresh set when a scan does run, so the caller
-     * can persist it.
+     * PID cache is keyed by car identity: "vin:<VIN>" when the ECU reports one (cache
+     * follows the car), else "mac:<dongle address>" (cache follows the dongle).
+     * [loadCache] fetches a remembered PID set for a key; [saveCache] persists one.
      */
     fun connect(
         address: String,
-        cachedPids: Set<Int>? = null,
-        onPidsScanned: (Set<Int>) -> Unit = {},
+        loadCache: (String) -> Set<Int>? = { null },
+        saveCache: (String, Set<Int>) -> Unit = { _, _ -> },
     ) {
         disconnect()
         job = scope.launch(Dispatchers.IO) {
@@ -87,18 +90,26 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
 
                 for (init in Elm327.INIT) { cmd(init); Thread.sleep(80) }
 
-                // Supported PIDs: use the remembered set for this dongle if we have one;
-                // otherwise probe once (with protocol fallback) and hand the result back
-                // for persistence.
-                var supported = cachedPids
+                // Car identity first: VIN via mode 09 when supported. The PID cache then
+                // follows the CAR (swap dongles freely); dongle MAC is the fallback key.
+                vin = Elm327.vin(cmd(Elm327.Pid.VIN))
+                val cacheKey = vin?.let { "vin:" + it } ?: ("mac:" + address)
+
+                var supported = loadCache(cacheKey)
                 if (supported.isNullOrEmpty()) {
                     var scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
                     if (scanned.isEmpty()) {
                         cmd(Elm327.FALLBACK_PROTOCOL); Thread.sleep(120)
                         scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                        // Re-try VIN on the fallback protocol too.
+                        if (vin == null) {
+                            vin = Elm327.vin(cmd(Elm327.Pid.VIN))
+                        }
                     }
                     scanned = scanned + Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60))
-                    if (scanned.isNotEmpty()) onPidsScanned(scanned)
+                    if (scanned.isNotEmpty()) {
+                        saveCache(vin?.let { "vin:" + it } ?: ("mac:" + address), scanned)
+                    }
                     supported = scanned
                 }
                 // On the E90 320d PID 0x11 is meaningless; 0x49 (accel pedal D) is the

@@ -120,12 +120,18 @@ class DriveService : Service() {
                 // User-selected dongle wins; otherwise guess by name.
                 val mac = db.kvGet("obd_mac") ?: obd.findBonded()
                 if (mac != null) {
-                    // Per-dongle PID cache: no rescan on every connect.
-                    val cached = db.kvGet("obd_pids_" + mac)
-                        ?.split(",")?.mapNotNull { it.toIntOrNull() }?.toSet()
-                    obd.connect(mac, cached) { scanned ->
-                        db.kvPut("obd_pids_" + mac, scanned.joinToString(","))
-                    }
+                    // PID cache keyed by VIN when readable (follows the car), else MAC.
+                    obd.connect(
+                        mac,
+                        loadCache = { key ->
+                            db.kvGet("obd_pids_" + key)
+                                ?.split(",")?.mapNotNull { it.toIntOrNull() }?.toSet()
+                        },
+                        saveCache = { key, scanned ->
+                            db.kvPut("obd_pids_" + key, scanned.joinToString(","))
+                            if (key.startsWith("vin:")) db.kvPut("car_vin", key.removePrefix("vin:"))
+                        },
+                    )
                 }
             }
         }
