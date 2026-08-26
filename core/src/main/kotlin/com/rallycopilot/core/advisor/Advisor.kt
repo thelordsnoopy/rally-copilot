@@ -23,6 +23,8 @@ class Advisor(
     var conditions: Conditions = Conditions.DRY,
     /** Personal knowledge layer: learned speed factor for a stretch of an edge. */
     var speedFactorLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double)? = null,
+    /** Learned camber, degrees, positive = road leans car-left. Null until measured. */
+    var camberLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double?)? = null,
 ) {
     data class Params(
         /** Comfortable but firm braking on the road, m/s². */
@@ -78,6 +80,19 @@ class Advisor(
             // Your history with this exact stretch of road trims the suggestion.
             speedFactorLookup?.let { lookup ->
                 vTarget *= lookup(corner.edgeId, corner.startOffsetM, corner.endOffsetM)
+            }
+            // Measured camber: off-camber corners get called and slowed — the radius
+            // maths flatters exactly these. Positive camber helps LEFT turns.
+            val camber = camberLookup?.invoke(corner.edgeId, corner.startOffsetM, corner.endOffsetM)
+            if (camber != null) {
+                val adverseDeg = when (corner.direction) {
+                    Direction.LEFT -> (-camber).coerceAtLeast(0.0)
+                    Direction.RIGHT -> camber.coerceAtLeast(0.0)
+                }
+                if (adverseDeg >= com.rallycopilot.core.knowledge.KnowledgeMath.CAMBER_ADVERSE_DEG) {
+                    modifiers += Modifier.OFF_CAMBER
+                    vTarget *= (1.0 - 0.03 * adverseDeg).coerceAtLeast(0.85)
+                }
             }
             val v = currentSpeedMps
             val brakingDistance = if (v > vTarget) (v * v - vTarget * vTarget) / (2 * params.aBrake) else 0.0

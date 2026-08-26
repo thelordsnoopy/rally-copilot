@@ -18,8 +18,12 @@ class KnowledgeDb(private val db: AppDb) : KnowledgeStore {
                 slow_events INTEGER DEFAULT 0, clean_passes INTEGER DEFAULT 0,
                 rough_sum REAL DEFAULT 0, rough_n INTEGER DEFAULT 0,
                 hazard_confirmed INTEGER DEFAULT 0, speed_factor REAL DEFAULT 1.0,
+                camber_sum REAL DEFAULT 0, camber_n INTEGER DEFAULT 0,
                 PRIMARY KEY(edge_id, bucket))"""
         )
+        // Older installs: add camber columns in place.
+        runCatching { db.writableDatabase.execSQL("ALTER TABLE knowledge ADD COLUMN camber_sum REAL DEFAULT 0") }
+        runCatching { db.writableDatabase.execSQL("ALTER TABLE knowledge ADD COLUMN camber_n INTEGER DEFAULT 0") }
     }
 
     override fun get(edgeId: Long, bucket: Int): RoadBucket? =
@@ -32,6 +36,7 @@ class KnowledgeDb(private val db: AppDb) : KnowledgeStore {
                 slowEvents = c.getInt(2), cleanPasses = c.getInt(3),
                 roughSum = c.getDouble(4), roughN = c.getInt(5),
                 hazardConfirmed = c.getInt(6) == 1, speedFactor = c.getDouble(7),
+                camberSum = c.getDouble(8), camberN = c.getInt(9),
             )
         }
 
@@ -42,6 +47,7 @@ class KnowledgeDb(private val db: AppDb) : KnowledgeStore {
             put("rough_sum", b.roughSum); put("rough_n", b.roughN)
             put("hazard_confirmed", if (b.hazardConfirmed) 1 else 0)
             put("speed_factor", b.speedFactor)
+            put("camber_sum", b.camberSum); put("camber_n", b.camberN)
         }
         db.writableDatabase.insertWithOnConflict(
             "knowledge", null, v, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE
@@ -59,6 +65,7 @@ class KnowledgeDb(private val db: AppDb) : KnowledgeStore {
                     slowEvents = c.getInt(2), cleanPasses = c.getInt(3),
                     roughSum = c.getDouble(4), roughN = c.getInt(5),
                     hazardConfirmed = c.getInt(6) == 1, speedFactor = c.getDouble(7),
+                    camberSum = c.getDouble(8), camberN = c.getInt(9),
                 )
                 if (KnowledgeMath.warrantsCaution(b)) out += b
             }
@@ -75,6 +82,27 @@ class KnowledgeDb(private val db: AppDb) : KnowledgeStore {
             arrayOf(edgeId.toString(), b0.toString(), b1.toString())
         ).use { c -> if (c.moveToFirst() && !c.isNull(0)) factor = c.getDouble(0) }
         return factor.coerceIn(0.6, 1.0)
+    }
+
+    override fun camberFor(edgeId: Long, startM: Double, endM: Double): Double? {
+        val b0 = RoadBucket.bucketOf(minOf(startM, endM))
+        val b1 = RoadBucket.bucketOf(maxOf(startM, endM))
+        db.readableDatabase.rawQuery(
+            "SELECT SUM(camber_sum), SUM(camber_n) FROM knowledge WHERE edge_id=? AND bucket BETWEEN ? AND ?",
+            arrayOf(edgeId.toString(), b0.toString(), b1.toString())
+        ).use { c ->
+            if (c.moveToFirst() && !c.isNull(1) && c.getInt(1) >= 5) {
+                return c.getDouble(0) / c.getInt(1)
+            }
+        }
+        return null
+    }
+
+    /** Camber sample accrual for the bucket currently under the wheels. */
+    fun addCamber(edgeId: Long, offsetM: Double, deg: Double) {
+        val bucket = RoadBucket.bucketOf(offsetM)
+        val b = get(edgeId, bucket) ?: RoadBucket(edgeId, bucket)
+        put(KnowledgeMath.addCamber(b, deg))
     }
 
     /** IMU roughness accrual for the bucket currently under the wheels. */

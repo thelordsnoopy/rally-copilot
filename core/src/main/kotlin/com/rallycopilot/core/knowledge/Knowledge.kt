@@ -17,8 +17,11 @@ data class RoadBucket(
     val roughN: Int = 0,
     val hazardConfirmed: Boolean = false,
     val speedFactor: Double = 1.0, // learned multiplier applied to vTarget here
+    val camberSum: Double = 0.0,   // degrees; positive = road leans car-LEFT
+    val camberN: Int = 0,
 ) {
     val roughness: Double get() = if (roughN == 0) 0.0 else roughSum / roughN
+    val camberDeg: Double? get() = if (camberN < 5) null else camberSum / camberN
 
     companion object {
         const val BUCKET_M = 25.0
@@ -34,6 +37,8 @@ interface KnowledgeStore {
     fun cautionsOn(edgeId: Long): List<RoadBucket>
     /** Smallest learned speed factor across [startM, endM] of this edge. */
     fun factorFor(edgeId: Long, startM: Double, endM: Double): Double
+    /** Mean learned camber across [startM, endM], degrees (positive = leans left), or null. */
+    fun camberFor(edgeId: Long, startM: Double, endM: Double): Double?
 }
 
 object KnowledgeMath {
@@ -81,6 +86,12 @@ object KnowledgeMath {
 
     fun addRoughness(b: RoadBucket, rms: Double): RoadBucket =
         b.copy(roughSum = b.roughSum + rms, roughN = b.roughN + 1)
+
+    fun addCamber(b: RoadBucket, deg: Double): RoadBucket =
+        b.copy(camberSum = b.camberSum + deg, camberN = b.camberN + 1)
+
+    /** Off-camber threshold, degrees: below this a corner is treated as flat. */
+    const val CAMBER_ADVERSE_DEG = 2.0
 }
 
 /**

@@ -117,6 +117,8 @@ enum class Modifier(val spoken: String) {
     OPENS("opens"),
     LONG("long"),
     INTO("into"),
+    /** Road leans out of the corner — the radius maths flatters this one. */
+    OFF_CAMBER("off_camber"),
 }
 
 /** A corner projected onto the current predicted path. */

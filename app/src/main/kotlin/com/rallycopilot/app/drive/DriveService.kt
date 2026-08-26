@@ -108,6 +108,7 @@ class DriveService : Service() {
         val advisor = Advisor(profile, conditions = conditions)
         // Your road history trims suggestions where trouble was learned.
         advisor.speedFactorLookup = { e, a, b -> know.factorFor(e, a, b) }
+        advisor.camberLookup = { e, a, b -> know.camberFor(e, a, b) }
         engine = DriveEngine(
             matcher = MapMatcher(map),
             horizonBuilder = HorizonBuilder(map, know),
@@ -124,7 +125,14 @@ class DriveService : Service() {
             slowdown = slowMon,
         )
 
-        // IMU: surface roughness + pothole spikes, tagged to the matched road bucket.
+        // IMU: surface roughness, pothole spikes, mount self-alignment and camber —
+        // all tagged to the matched road bucket. No calibration step anywhere: the
+        // forward axis is learned from firm accelerate/brake events automatically.
+        val mount = com.rallycopilot.core.imu.MountAlignment()
+        val camber = com.rallycopilot.core.imu.CamberEstimator(mount)
+        var lastSpeed = 0.0
+        var lastSpeedT = 0L
+        var lastCamberWriteT = 0L
         imu = ImuMonitor(
             this,
             onRoughness = { rms ->
@@ -133,6 +141,22 @@ class DriveService : Service() {
                 }
             },
             onBump = { slowMon.reportBump(System.currentTimeMillis()) },
+            onSample = { accel, grav ->
+                val hudNow = engine.hud.value
+                val now = System.currentTimeMillis()
+                val dt = (now - lastSpeedT) / 1000.0
+                val dvdt = if (lastSpeedT != 0L && dt in 0.02..2.0)
+                    (hudNow.speedMps - lastSpeed) / dt else 0.0
+                lastSpeed = hudNow.speedMps
+                lastSpeedT = now
+                mount.tick(accel, grav, dvdt)
+                val deg = camber.tick(accel, grav, hudNow.speedMps)
+                // Persist camber at ~1 Hz against the current bucket.
+                if (deg != null && now - lastCamberWriteT > 1000) {
+                    lastCamberWriteT = now
+                    hudNow.matched?.let { m -> know.addCamber(m.edgeId, m.offsetM, deg) }
+                }
+            },
         ).also { it.start() }
 
         voice.requestFocus()

@@ -687,3 +687,22 @@ current vs suggested speed.
 :feature:export       overlay video renderer, drive card renderer
 :tools:voicebuild     desktop script — TTS vocabulary generation + normalisation
 ```
+
+## 13. v0.6: mount self-alignment + camber (agreed 2026-08-26)
+
+**MountAlignment** (`core/imu/`): finds car-forward in phone coordinates with no
+calibration step. During firm accel/brake events (|dv/dt| ≥ 1.5 m/s² from GPS/OBD),
+the horizontal accelerometer swing direction is accumulated (sign-flipped when
+braking). Aligned when ≥25 events agree with coherence ≥0.75; a knocked mount loses
+coherence and silently re-learns. The car body's DOWN axis is a slow gravity EMA
+(~tens of seconds), so brief corner leans don't move the baseline — camber measured
+against instantaneous gravity would read zero by construction.
+
+**CamberEstimator**: gravity's lean along the car-left axis, sampled only when
+|lateral accel| < 1.2 m/s² (mid-corner readings are camber+body-roll and are simply
+skipped — camber belongs to the road, not the moment). Convention: positive =
+road leans car-LEFT = helps left-handers.
+
+**Effect**: camber EMA stored per 25 m knowledge bucket (≥5 samples before trusted).
+Corners with ≥2° adverse camber gain an OFF CAMBER modifier (spoken + HUD) and a
+speed trim of 3%/degree, floored at 0.85×.

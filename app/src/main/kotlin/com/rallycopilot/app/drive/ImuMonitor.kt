@@ -12,13 +12,15 @@ import kotlin.math.sqrt
  * vector, so "vertical" needs no mount calibration whatsoever. Emits a 1 s RMS
  * (surface roughness) and discrete spikes (pothole hits, sunk grids).
  *
- * Yaw alignment (which way is FORWARD in the mount) — needed for camber — is
- * deliberately not attempted here; roughness and grade don't need it.
+ * Raw samples are also handed to the mount-alignment + camber estimators via
+ * [onSample]; this class stays a dumb sensor pump.
  */
 class ImuMonitor(
     context: Context,
     private val onRoughness: (rms: Double) -> Unit,
     private val onBump: () -> Unit,
+    /** Raw phone-frame vectors for mount alignment and camber, ~50 Hz. */
+    private val onSample: (accel: com.rallycopilot.core.imu.Vec3, gravity: com.rallycopilot.core.imu.Vec3) -> Unit = { _, _ -> },
 ) : SensorEventListener {
 
     private val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -58,6 +60,10 @@ class ImuMonitor(
                 val vert = (e.values[0] * gravity[0] + e.values[1] * gravity[1] +
                     e.values[2] * gravity[2]) / gMag
 
+                onSample(
+                    com.rallycopilot.core.imu.Vec3(e.values[0].toDouble(), e.values[1].toDouble(), e.values[2].toDouble()),
+                    com.rallycopilot.core.imu.Vec3(gravity[0].toDouble(), gravity[1].toDouble(), gravity[2].toDouble()),
+                )
                 val now = System.currentTimeMillis()
                 if (kotlin.math.abs(vert) > bumpThresholdMps2 && now - lastBumpMs > bumpCooldownMs) {
                     lastBumpMs = now
