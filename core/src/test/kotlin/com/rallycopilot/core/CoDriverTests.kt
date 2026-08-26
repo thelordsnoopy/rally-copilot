@@ -1,0 +1,226 @@
+package com.rallycopilot.core
+
+import com.rallycopilot.core.advisor.NoteComposer
+import com.rallycopilot.core.model.Corner
+import com.rallycopilot.core.model.Direction
+import com.rallycopilot.core.model.DriverProfile
+import com.rallycopilot.core.model.Hazard
+import com.rallycopilot.core.model.HazardKind
+import com.rallycopilot.core.model.HorizonCorner
+import com.rallycopilot.core.model.HorizonHazard
+import com.rallycopilot.core.model.Modifier
+import com.rallycopilot.core.model.SeverityBand
+import com.rallycopilot.core.obd.GearInference
+import com.rallycopilot.core.profile.StyleDetector
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/** v0.8.0: gear calibration, quiet mode, and what the co-driver actually says. */
+
+class GearCalibrationTests {
+
+    /** Synthetic 6-speed: rpm-per-m/s for each gear. */
+    private val ratios = listOf(420.0, 245.0, 170.0, 128.0, 103.0, 86.0)
+
+    private fun drive(g: GearInference, passes: Int = 4) {
+        // Sweep each gear through its usable speed range, as real driving would.
+        repeat(passes) {
+            for (r in ratios) {
+                var v = 1400.0 / r
+                while (v * r < 3600.0) {
+                    g.addSample((v * r).toInt(), v)
+                    v += 0.4
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `gearing is learned from ordinary driving`() {
+        val g = GearInference()
+        drive(g)
+        g.refit()
+        assertTrue("calibrated", g.isCalibrated)
+        assertEquals(6, g.gearCount)
+        // Learned ratios should match the synthetic car within a few percent.
+        for ((i, expected) in ratios.withIndex()) {
+            val got = g.learnedRatios[i]
+            assertTrue("gear ${i + 1}: got $got want $expected",
+                kotlin.math.abs(got - expected) / expected < 0.06)
+        }
+    }
+
+    @Test
+    fun `calibration survives a round trip so gear calls work from the first corner`() {
+        val a = GearInference()
+        drive(a)
+        a.refit()
+        val saved = a.serialise()
+
+        val b = GearInference()
+        assertFalse(b.isCalibrated)
+        b.restore(saved)
+        assertTrue("restored calibration", b.isCalibrated)
+        assertEquals(a.gearCount, b.gearCount)
+        // And it can immediately answer the question the co-driver asks.
+        assertNotNull(b.gearForSpeed(15.0))
+    }
+
+    @Test
+    fun `knows how quick each gear is`() {
+        val g = GearInference()
+        drive(g)
+        g.refit()
+        // Top speed per gear = redline / ratio, and gears get progressively longer.
+        val tops = (1..g.gearCount).mapNotNull { g.topSpeedOf(it) }
+        assertEquals(g.gearCount, tops.size)
+        for (i in 1 until tops.size) {
+            assertTrue("gear ${i + 1} must be longer than gear $i", tops[i] > tops[i - 1])
+        }
+        // Second gear on this car tops out somewhere sane for a road car.
+        val second = g.topSpeedOf(2)!!
+        assertTrue("2nd tops at ${second * 2.23694} mph", second * 2.23694 in 25.0..70.0)
+    }
+
+    @Test
+    fun `corner gear lands in the usable band and never bounces off the limiter`() {
+        val g = GearInference()
+        drive(g)
+        g.refit()
+        // A 30 mph corner (13.4 m/s).
+        val gear = g.gearForSpeed(13.4)
+        assertNotNull(gear)
+        val revs = g.rpmAt(gear!!, 13.4)!!
+        assertTrue("revs=$revs", revs < g.redlineRpm * 0.85)
+        assertTrue("revs=$revs should be pulling, not bogging", revs > 1200.0)
+    }
+
+    @Test
+    fun `exit revs follow how the driver actually shifts`() {
+        val lazy = GearInference()
+        val keen = GearInference()
+        lazy.restore("420,245,170,128;4600;1900,2000,1950,2050")
+        keen.restore("420,245,170,128;4600;3600,3800,3700,3650")
+        assertTrue("keen driver should be given more revs",
+            keen.exitRpm > lazy.exitRpm + 400)
+    }
+}
+
+class QuietModeTests {
+    private val profile = DriverProfile.COLD_START
+
+    private fun feed(
+        d: StyleDetector, fromS: Int, toS: Int,
+        speed: (Int) -> Double, rpm: Int? = null, pedal: Double? = null,
+    ) {
+        for (i in fromS * 5 until toS * 5) {
+            d.tick(
+                StyleDetector.Sample(
+                    tMs = i * 200L, speedMps = speed(i), rpm = rpm, pedal01 = pedal,
+                    gear = null, aLatMps2 = null, nearestCornerM = 40.0,
+                ),
+                profile,
+            )
+        }
+    }
+
+    @Test
+    fun `pottering along keeps the co-driver quiet`() {
+        val d = StyleDetector()
+        feed(d, 0, 60, { 13.0 }, rpm = 1600, pedal = 0.15)
+        assertFalse("should be quiet", d.isPressingOn)
+    }
+
+    @Test
+    fun `the co-driver wakes up as soon as the driving does`() {
+        val d = StyleDetector()
+        feed(d, 0, 40, { 13.0 }, rpm = 1600, pedal = 0.15)
+        assertFalse(d.isPressingOn)
+        // Start pressing on — this must come alive within a few seconds, long before
+        // the strict learning gate would ever agree.
+        feed(d, 40, 48, { i -> 24.0 + 8.0 * kotlin.math.sin(i / 4.0) }, rpm = 3800, pedal = 0.9)
+        assertTrue("fast gate should be live (score=${d.fastScore})", d.isPressingOn)
+        assertFalse("learning gate must NOT be fooled this fast", d.isSpirited)
+    }
+
+    @Test
+    fun `a village mid-blast does not chop the co-driver off`() {
+        val d = StyleDetector()
+        feed(d, 0, 30, { i -> 24.0 + 8.0 * kotlin.math.sin(i / 4.0) }, rpm = 3800, pedal = 0.9)
+        assertTrue(d.isPressingOn)
+        // 20 s of 30 mph village — still within the hangover, keep talking.
+        feed(d, 30, 50, { 13.0 }, rpm = 1600, pedal = 0.15)
+        assertTrue("hangover should hold through a village", d.isPressingOn)
+        // But a long potter afterwards does eventually go quiet.
+        feed(d, 50, 110, { 13.0 }, rpm = 1600, pedal = 0.15)
+        assertFalse("should be quiet again", d.isPressingOn)
+    }
+}
+
+class SpokenCallTests {
+    private fun hc(
+        band: SeverityBand, vTarget: Double, gear: Int? = null,
+        mods: List<Modifier> = emptyList(),
+    ) = HorizonCorner(
+        corner = Corner(1, 1, 0.0, 15.0, 30.0, Direction.RIGHT, 30.0, 40.0, 40.0, 30.0, 0.9),
+        distanceAheadM = 150.0, pathConfidence = 0.9, band = band, modifiers = mods,
+        vTargetMps = vTarget, brakingPointM = 80.0, triggerDistanceM = 40.0, gear = gear,
+    )
+
+    @Test
+    fun `target speed is spoken in five mph steps`() {
+        assertEquals("s_40", NoteComposer.speedKey(40 / 2.23694))
+        assertEquals("s_30", NoteComposer.speedKey(31 / 2.23694))
+        assertEquals("s_55", NoteComposer.speedKey(54 / 2.23694))
+        assertNull("out of range", NoteComposer.speedKey(120 / 2.23694))
+    }
+
+    @Test
+    fun `a full call reads as a co-driver would say it`() {
+        val c = hc(SeverityBand.TWO, 40 / 2.23694, gear = 2,
+            mods = listOf(Modifier.LONG, Modifier.TIGHTENS))
+        val keys = NoteComposer.cornerKeys(c, NoteComposer.Detail(speed = true, gear = true))
+        assertEquals(listOf("right_two", "long", "tightens", "s_40", "gear_2"), keys)
+    }
+
+    @Test
+    fun `speed and gear are left out when they say nothing`() {
+        val c = hc(SeverityBand.FIVE, 60 / 2.23694, gear = 4)
+        val keys = NoteComposer.cornerKeys(c, NoteComposer.Detail())
+        assertEquals(listOf("right_five"), keys)
+    }
+
+    @Test
+    fun `compression drops gear before speed and speed before the danger call`() {
+        val c = hc(SeverityBand.TWO, 40 / 2.23694, gear = 2,
+            mods = listOf(Modifier.LONG, Modifier.TIGHTENS))
+        val detail = NoteComposer.Detail(speed = true, gear = true)
+        fun at(budget: Long) = NoteComposer.compose(
+            listOf(c), listOf(null), detail,
+            deadlineDistanceM = 100.0, budgetMs = budget, durationOf = { 500 },
+        ).clipKeys
+
+        assertEquals(listOf("right_two", "long", "tightens", "s_40", "gear_2"), at(10_000))
+        assertTrue("gear goes first", "gear_2" !in at(2_000))
+        assertTrue("shape goes next", "long" !in at(1_600))
+        val tight = at(1_100)
+        assertTrue("speed goes before the danger call", "s_40" !in tight)
+        assertTrue("tightens survives longer than speed", "tightens" in tight)
+        assertEquals("the corner call is never dropped", listOf("right_two"), at(400))
+    }
+
+    @Test
+    fun `a camera is stated plainly, never as a caution`() {
+        val cam = HorizonHazard(Hazard(1, 0.0, HazardKind.SPEED_CAMERA), 200.0, 0.9)
+        assertEquals(listOf("speed_camera"), NoteComposer.hazardKeys(cam))
+        val ford = HorizonHazard(Hazard(1, 0.0, HazardKind.FORD), 200.0, 0.9)
+        assertEquals(listOf("caution", "ford"), NoteComposer.hazardKeys(ford))
+        assertTrue(HazardKind.SPEED_CAMERA.isAlwaysAnnounced)
+        assertTrue(HazardKind.AVERAGE_CAMERA.isAlwaysAnnounced)
+        assertFalse(HazardKind.FORD.isAlwaysAnnounced)
+    }
+}

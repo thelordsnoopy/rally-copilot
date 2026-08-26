@@ -232,6 +232,8 @@ class DriveService : Service() {
             },
         ).also { it.start() }
 
+        voice.setVolume(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f)
+        voice.setBalance(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f)
         voice.requestFocus()
         voice.startKeepAlive()
         if (isDemo) startDemo(map) else {
@@ -252,6 +254,9 @@ class DriveService : Service() {
                             db.kvPut("obd_pids_" + key, scanned.joinToString(","))
                             if (key.startsWith("vin:")) db.kvPut("car_vin", key.removePrefix("vin:"))
                         },
+                        // Gear calibration follows the car, same key as the PID cache.
+                        loadGears = { key -> db.kvGet("obd_gears_" + key) },
+                        saveGears = { key, data -> db.kvPut("obd_gears_" + key, data) },
                     )
                 }
             }
@@ -264,6 +269,21 @@ class DriveService : Service() {
                 delay(100)
             }
         }
+    }
+
+    /** Live voice level/balance changes from the settings screen. */
+    fun setVoiceVolume(v: Float) { if (::voice.isInitialized) voice.setVolume(v) }
+    fun setVoiceBalance(b: Float) { if (::voice.isInitialized) voice.setBalance(b) }
+
+    /** Play a sample so the driver can set level and balance with the engine running. */
+    fun previewVoice() {
+        if (!::voice.isInitialized) return
+        voice.play(
+            com.rallycopilot.core.model.Utterance(
+                clipKeys = listOf("left_four"), urgent = false,
+                deadlineDistanceM = 0.0, forCornerId = null,
+            )
+        )
     }
 
     /** UI answer to the hazard prompt, marshalled onto the engine thread. */

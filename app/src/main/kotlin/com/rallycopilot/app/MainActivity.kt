@@ -455,6 +455,58 @@ fun SettingsScreen(activity: MainActivity) {
     ) {
         Text("SETTINGS", color = Color.White, fontSize = 24.sp)
 
+        // ---- voice level and where it comes out ----
+        var vol by remember { mutableStateOf(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f) }
+        var bal by remember { mutableStateOf(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f) }
+
+        Text("Voice volume: ${(vol * 100).toInt()}%", color = Color(0xFFB8C4D0))
+        Slider(
+            value = vol,
+            onValueChange = { vol = it; activity.driveService?.setVoiceVolume(it) },
+            onValueChangeFinished = {
+                db.kvPut("voice_volume", vol.toString())
+                activity.driveService?.previewVoice()
+            },
+            valueRange = 0.1f..1f,
+            colors = androidx.compose.material3.SliderDefaults.colors(
+                thumbColor = Color(0xFF2EE06B),
+                activeTrackColor = Color(0xFF2EE06B),
+                inactiveTrackColor = Color(0xFF232D38),
+            ),
+        )
+
+        Text(
+            when {
+                bal <= -0.95f -> "Speaker: hard LEFT (driver's side)"
+                bal < -0.1f -> "Speaker: biased left ${(-bal * 100).toInt()}%"
+                bal > 0.95f -> "Speaker: hard RIGHT"
+                bal > 0.1f -> "Speaker: biased right ${(bal * 100).toInt()}%"
+                else -> "Speaker: centre (both sides)"
+            },
+            color = Color(0xFFB8C4D0),
+        )
+        Slider(
+            value = bal,
+            onValueChange = { bal = it; activity.driveService?.setVoiceBalance(it) },
+            onValueChangeFinished = {
+                db.kvPut("voice_balance", bal.toString())
+                activity.driveService?.previewVoice()
+            },
+            valueRange = -1f..1f,
+            colors = androidx.compose.material3.SliderDefaults.colors(
+                thumbColor = Color(0xFF6BB8FF),
+                activeTrackColor = Color(0xFF6BB8FF),
+                inactiveTrackColor = Color(0xFF232D38),
+            ),
+        )
+        Text(
+            "Over Bluetooth the car owns its speakers — Android can only pan the voice " +
+                "left or right, not pick one physical speaker. Hard left puts it in the " +
+                "driver's-side speakers; use the car's own fader to push it forward. " +
+                "Slide during a drive to hear a sample.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
         Text("Verbosity", color = Color(0xFFB8C4D0))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             for ((key, label) in listOf("all" to "Everything", "tight" to "4+ only", "min" to "Min")) {

@@ -58,8 +58,15 @@ class DriveEngine(
         val burstBudgetMs: Long = 4000,
         /** Chain corners whose utterances would overlap within this gap. */
         val chainGapM: Double = 60.0,
-        val a2dpLatencyMs: Long = 250,
+        /** Bluetooth A2DP output delay to the car. SBC to a car head unit measures
+         *  150-250 ms; this is the figure the end-anchored timing works back from. */
+        val a2dpLatencyMs: Long = 220,
         val includeGear: Boolean = true,
+        /** Call the target speed when a corner is this much slower than current pace. */
+        val speakSpeed: Boolean = true,
+        val speakSpeedBelowRatio: Double = 0.85,
+        /** Minimum distance travelled between two camera announcements. */
+        val cameraRepeatM: Double = 400.0,
     )
 
     val params = Params()
@@ -78,9 +85,11 @@ class DriveEngine(
         val obdConnected: Boolean = false,
         val gear: Int? = null,
         val incidentSuspected: Boolean = false,
-        /** Style detector verdict: is this spirited driving right now? */
+        /** Strict verdict — gates learning. */
         val spirited: Boolean = false,
         val spiritedFraction: Double = 0.0,
+        /** Fast verdict — gates speech. False = quiet mode (cameras only). */
+        val pressingOn: Boolean = false,
         /** Active "was there a hazard?" prompt: auto-answers NO at deadline. */
         val hazardPrompt: HazardPrompt? = null,
     )
@@ -107,6 +116,10 @@ class DriveEngine(
     /** Rolling recent-speed window for the "expected speed on a straight" baseline. */
     private val recentSpeeds = ArrayDeque<Pair<Long, Double>>()
     private var lastEdgeChangeMs = 0L
+    /** Distance travelled this drive. Never reset — unlike progressM, which is
+     *  relative to the current horizon — so it can gate repeat announcements. */
+    private var odometerM = 0.0
+    private var lastCameraOdoM = Double.NEGATIVE_INFINITY
 
     /** UI answer to the hazard prompt. YES confirms; the deadline auto-answers NO. */
     fun answerHazardPrompt(yes: Boolean) {
@@ -211,7 +224,7 @@ class DriveEngine(
         val speed = fusedSpeed(fix?.speedMps ?: 0.0)
 
         // ---- dead-reckon between fixes ----
-        if (gpsOk && dt > 0) progressM += speed * dt
+        if (gpsOk && dt > 0) { progressM += speed * dt; odometerM += speed * dt }
 
         val h = horizon
         val incident = incidentDetector?.tick(now, speed) == true
@@ -241,6 +254,7 @@ class DriveEngine(
                 incidentSuspected = incident,
                 spirited = styleDetector?.isSpirited ?: false,
                 spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
+                pressingOn = styleDetector?.isPressingOn ?: true,
                 hazardPrompt = activePrompt,
             )
             return
@@ -349,6 +363,7 @@ class DriveEngine(
             incidentSuspected = incident,
             spirited = spiritedNow && styleDetector != null,
             spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
+            pressingOn = styleDetector?.isPressingOn ?: true,
             hazardPrompt = activePrompt,
         )
     }
@@ -356,14 +371,32 @@ class DriveEngine(
     private fun maybeSpeak(h: Horizon, speed: Double, now: Long, aheadOf: (HorizonCorner) -> Double) {
         if (audio.isSpeaking()) return
 
+        // QUIET MODE: pottering along, the co-driver shuts up. Speed cameras are the
+        // exception and are always called — an alert you only get when pressing on is
+        // an alert you cannot rely on.
+        val quiet = !(styleDetector?.isPressingOn ?: true)
+
         // Hazards first: they are short and urgent.
         for (hz in h.hazards) {
             val ahead = hz.distanceAheadM - progressM
             val key = "${hz.hazard.edgeId}:${hz.hazard.offsetM.toInt()}"
-            if (ahead in 0.0..(speed * 6.0 + 50.0) && key !in spokenHazards &&
+            if (quiet && !hz.hazard.kind.isAlwaysAnnounced) continue
+            // Cameras get a longer runway: you want to be at the limit well before it,
+            // not braking on top of it.
+            val window = if (hz.hazard.kind.isAlwaysAnnounced) speed * 10.0 + 120.0
+            else speed * 6.0 + 50.0
+            // One call per camera SITE. A gantry, a dual carriageway, or a road split
+            // at a junction can put several camera nodes within a few metres on
+            // different edges, which per-edge declustering in the map builder cannot
+            // merge — so gate on distance travelled since the last camera call too.
+            if (hz.hazard.kind.isAlwaysAnnounced &&
+                odometerM - lastCameraOdoM < params.cameraRepeatM
+            ) continue
+            if (ahead in 0.0..window && key !in spokenHazards &&
                 hz.pathConfidence >= params.speakConfidence
             ) {
                 spokenHazards[key] = now
+                if (hz.hazard.kind.isAlwaysAnnounced) lastCameraOdoM = odometerM
                 val keys = NoteComposer.hazardKeys(
                     com.rallycopilot.core.model.HorizonHazard(hz.hazard, ahead, hz.pathConfidence)
                 )
@@ -372,6 +405,9 @@ class DriveEngine(
                 return
             }
         }
+
+        // Not pressing on: no corner calls at all. They resume the moment you do.
+        if (quiet) return
 
         // Corners we could speak, nearest first. Low-confidence corners are skipped but
         // NOT marked spoken — a transient ambiguity must not silence them forever.
@@ -422,10 +458,26 @@ class DriveEngine(
         val first = chain.first()
         // The whole utterance must be DONE by the first corner's braking point.
         val deadline = (aheadOf(first) - advisor.brakingDistanceM(speed, first.vTargetMps)).coerceAtLeast(0.0)
+
+        // Speak speed and gear only when they tell you something you would not
+        // already assume. Calling the target speed of a corner you are already
+        // slower than is exactly the noise that makes a co-driver ignorable.
+        val needsSlowing = chain.any { it.vTargetMps < speed * params.speakSpeedBelowRatio }
+        val severe = chain.any { it.band == com.rallycopilot.core.model.SeverityBand.HAIRPIN ||
+            it.band == com.rallycopilot.core.model.SeverityBand.ONE ||
+            it.band == com.rallycopilot.core.model.SeverityBand.TWO }
+        val currentGear = vehicle.currentGear()
+        val needsDownshift = currentGear != null &&
+            chain.any { c -> c.gear != null && c.gear < currentGear }
+        val detail = NoteComposer.Detail(
+            speed = params.speakSpeed && (needsSlowing || severe),
+            gear = params.includeGear && vehicle.rpm() != null && needsDownshift,
+        )
+
         val utterance = NoteComposer.compose(
             chain = chain,
             gapsM = gaps,
-            includeGear = params.includeGear && vehicle.rpm() != null,
+            detail = detail,
             deadlineDistanceM = deadline,
             budgetMs = params.burstBudgetMs,
             durationOf = { audio.clipDurationMs(it) },

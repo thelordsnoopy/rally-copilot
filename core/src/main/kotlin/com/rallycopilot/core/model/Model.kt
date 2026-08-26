@@ -76,6 +76,15 @@ enum class HazardKind(val spoken: String) {
     LEVEL_CROSSING("level crossing"),
     /** Learned from YOUR drives — repeated slowdowns / rough surface / confirmed prompt. */
     LEARNED("caution"),
+    /** Fixed speed camera. The one call that is ALWAYS made, spirited or not. */
+    SPEED_CAMERA("speed camera"),
+    /** Average-speed (SPECS-style) enforcement zone. */
+    AVERAGE_CAMERA("average speed check"),
+    ;
+
+    /** Announced even in quiet mode — the whole point of quiet mode is that these
+     *  still get through when nothing else does. */
+    val isAlwaysAnnounced: Boolean get() = this == SPEED_CAMERA || this == AVERAGE_CAMERA
 }
 
 data class Hazard(val edgeId: Long, val offsetM: Double, val kind: HazardKind)

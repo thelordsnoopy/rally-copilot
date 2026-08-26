@@ -226,7 +226,7 @@ class ComposerTests {
         )
         val gaps = listOf(null, 70.0, 70.0)
         // Give every clip a fat duration so compression must engage fully.
-        val u = NoteComposer.compose(chain, gaps, includeGear = false,
+        val u = NoteComposer.compose(chain, gaps, detail = NoteComposer.Detail(),
             deadlineDistanceM = 100.0, budgetMs = 2000, durationOf = { 600 })
         // Fully compressed: exactly one key per corner, no links, no modifiers.
         assertEquals(3, u.clipKeys.size)
@@ -238,7 +238,7 @@ class ComposerTests {
     fun `uncompressed keeps links and modifiers`() {
         val chain = listOf(hc(1, SeverityBand.FOUR, 100.0), hc(2, SeverityBand.FIVE, 260.0))
         val gaps = listOf(null, 100.0)
-        val u = NoteComposer.compose(chain, gaps, includeGear = false,
+        val u = NoteComposer.compose(chain, gaps, detail = NoteComposer.Detail(),
             deadlineDistanceM = 100.0, budgetMs = 60_000, durationOf = { 300 })
         assertEquals(listOf("left_four", "tightens", "d_100", "left_five", "tightens"), u.clipKeys)
         assertFalse(u.urgent)

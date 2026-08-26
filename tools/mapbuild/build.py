@@ -27,6 +27,11 @@ DRIVABLE = {
 
 HAZARD_NODE_TAGS = [
     # (key, value or None=any, hazard kind)
+    # Cameras first: they win over a co-located crossing tag.
+    ("highway", "speed_camera", "SPEED_CAMERA"),
+    ("enforcement", "maxspeed", "SPEED_CAMERA"),
+    ("enforcement", "average_speed", "AVERAGE_CAMERA"),
+    ("man_made", "surveillance", None),          # only when it enforces speed; see node()
     ("ford", None, "FORD"),
     ("barrier", "cattle_grid", "CATTLE_GRID"),
     ("barrier", "gate", "GATE"),
@@ -34,6 +39,34 @@ HAZARD_NODE_TAGS = [
     ("highway", "crossing", "CROSSING"),
 ]
 
+# Every way OSM uses to mark a speed camera, across the tagging schemes that have
+# been in use over the years — mappers are not consistent and a missed camera is
+# the one hazard the driver actually pays for.
+def camera_kind(tags):
+    """Return SPEED_CAMERA / AVERAGE_CAMERA / None for a node's tag dict."""
+    get = tags.get
+    hw = get("highway")
+    if hw == "speed_camera":
+        # Average-speed cameras are sometimes only distinguishable by these.
+        if get("enforcement") == "average_speed" or get("speed_camera") == "section" \
+                or get("speed_camera:type") in ("section", "average"):
+            return "AVERAGE_CAMERA"
+        return "SPEED_CAMERA"
+    enf = get("enforcement")
+    if enf in ("maxspeed", "speed"):
+        return "SPEED_CAMERA"
+    if enf == "average_speed":
+        return "AVERAGE_CAMERA"
+    if get("man_made") == "surveillance" and get("surveillance:type") in ("camera", "ALPR"):
+        # Only count surveillance that is explicitly traffic/speed enforcement.
+        if get("surveillance:zone") in ("traffic", "road") or get("camera:type") == "fixed":
+            if enf or get("maxspeed"):
+                return "SPEED_CAMERA"
+    if get("device") == "speed_camera" or get("speed_camera") is not None:
+        return "SPEED_CAMERA"
+    return None
+
+CAMERA_CLUSTER_M = 150.0    # cameras closer than this are one enforcement site
 RESAMPLE_M = 5.0
 STRAIGHT_RADIUS_M = 500.0   # above this, treat as straight
 MIN_CORNER_POINTS = 2
@@ -216,6 +249,7 @@ class Collector(osmium.SimpleHandler):
         self.node_use = defaultdict(int)
         self.node_loc = {}
         self.hazard_nodes = {}    # node_id -> kind
+        self.camera_nodes = {}    # node_id -> camera kind (subset of hazard_nodes)
 
     def in_bbox(self, lon, lat):
         if not self.bbox:
@@ -223,8 +257,16 @@ class Collector(osmium.SimpleHandler):
         return self.bbox[0] <= lon <= self.bbox[2] and self.bbox[1] <= lat <= self.bbox[3]
 
     def node(self, n):
+        tags = {t.k: t.v for t in n.tags}
+        cam = camera_kind(tags)
+        if cam:
+            self.hazard_nodes[n.id] = cam
+            self.camera_nodes[n.id] = cam
+            return
         for key, val, kind in HAZARD_NODE_TAGS:
-            tv = n.tags.get(key)
+            if kind is None:
+                continue
+            tv = tags.get(key)
             if tv and (val is None or tv == val):
                 self.hazard_nodes[n.id] = kind
                 break
@@ -331,6 +373,21 @@ def main():
         if len(run) >= 2:
             edges_from_run(run, tags, edges, junction_edges)
 
+    # Speed cameras sit on a post BESIDE the carriageway, so they are almost never
+    # members of the road way — they have to be snapped to the nearest edge by
+    # distance. Index them into a 3x3 block of cells so one cell lookup per edge
+    # finds every camera that could possibly be near it.
+    cam_by_cell = defaultdict(list)
+    for nid, kind in col.camera_nodes.items():
+        if nid not in loc:
+            continue
+        la, lo = loc[nid]
+        for dla in (-0.01, 0.0, 0.01):
+            for dlo in (-0.01, 0.0, 0.01):
+                cam_by_cell[cell_of(la + dla, lo + dlo)].append(nid)
+    cam_best = {}   # node_id -> (distance_m, edge_id, offset_m)
+    print(f"  {len(col.camera_nodes)} speed cameras to snap")
+
     # Process geometry per edge.
     print(f"processing {len(edges)} edges")
     out_edges, out_corners, out_hazards, cells = [], [], [], []
@@ -369,7 +426,9 @@ def main():
             rs_cum.append(rs_cum[-1] + haversine(rs[i - 1], rs[i]))
         for nid in e["nodes"]:
             kind = col.hazard_nodes.get(nid)
-            if kind and nid in loc:
+            # Cameras go through the snapping pass below — emitting them here too
+            # would call the same camera twice.
+            if kind and nid in loc and nid not in col.camera_nodes:
                 hz = loc[nid]
                 j = min(range(len(rs)), key=lambda k: haversine(rs[k], hz))
                 out_hazards.append((eid, rs_cum[j], kind))
@@ -381,6 +440,43 @@ def main():
             if k not in seen:
                 seen.add(k)
                 cells.append((k, eid))
+        # Snap any nearby camera to this edge, keeping the closest edge overall.
+        nearby_cams = set()
+        for k in seen:
+            nearby_cams.update(cam_by_cell.get(k, ()))
+        for cam_id in nearby_cams:
+            cla, clo = loc[cam_id]
+            bd, boff = None, 0.0
+            for j, p in enumerate(rs):
+                d = haversine(p, (cla, clo))
+                if bd is None or d < bd:
+                    bd, boff = d, rs_cum[j]
+            prev = cam_best.get(cam_id)
+            if bd is not None and (prev is None or bd < prev[0]):
+                cam_best[cam_id] = (bd, eid, boff)
+
+    # Emit snapped cameras. 45 m covers a camera on the far verge of a dual
+    # carriageway without dragging one in from the parallel road.
+    #
+    # A gantry is mapped as one node per camera head, and both carriageways of a
+    # dual sit within a few metres, so a single enforcement point can arrive here
+    # as four nodes. Declustered per edge: one call per site, because "camera
+    # camera camera camera" is worse than no call at all.
+    per_edge = defaultdict(list)
+    for cam_id, (d, eid, off) in cam_best.items():
+        if d <= 45.0:
+            per_edge[eid].append((off, col.camera_nodes[cam_id]))
+    snapped = 0
+    for eid, items in per_edge.items():
+        items.sort()
+        last_off = None
+        for off, kind in items:
+            if last_off is not None and off - last_off < CAMERA_CLUSTER_M:
+                continue
+            out_hazards.append((eid, off, kind))
+            last_off = off
+            snapped += 1
+    print(f"  snapped {snapped} camera sites from {len(col.camera_nodes)} camera nodes")
 
     kept = {e[0] for e in out_edges}
     out_junctions = []

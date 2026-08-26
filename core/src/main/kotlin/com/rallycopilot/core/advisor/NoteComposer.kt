@@ -5,16 +5,27 @@ import com.rallycopilot.core.model.HorizonHazard
 import com.rallycopilot.core.model.Modifier
 import com.rallycopilot.core.model.SeverityBand
 import com.rallycopilot.core.model.Utterance
+import kotlin.math.roundToInt
 
 /**
  * Composes utterances as ordered vocabulary clip keys, and applies burst compression.
  *
  * Clip key convention (must match the voice pack manifest from tools/voicebuild):
  *   "left_four", "right_hairpin", "tightens", "opens", "long", "into",
- *   "d_100" (link distances), "brake", "caution", "gear_2".., hazards by name.
+ *   "d_100" (link distances, spoken BEFORE a call), "s_40" (target speed in mph,
+ *   spoken AFTER a call — position is what tells the two apart), "brake",
+ *   "caution", "gear_2".., hazards by name.
  * Urgent variants are the same key in the "urgent/" set, chosen by [Utterance.urgent].
  */
 object NoteComposer {
+
+    /** What to include beyond the bare corner call. The engine decides per corner. */
+    data class Detail(
+        val speed: Boolean = false,
+        val gear: Boolean = false,
+        val dangerModifiers: Boolean = true,
+        val shapeModifiers: Boolean = true,
+    )
 
     /** Round a link distance to the spoken vocabulary. */
     fun linkKey(distanceM: Double): String? {
@@ -24,34 +35,59 @@ object NoteComposer {
         return "d_$nearest"
     }
 
-    fun cornerKeys(c: HorizonCorner, includeGear: Boolean): List<String> {
+    /** Target speed in mph, rounded to the spoken 5 mph steps. */
+    fun speedKey(vTargetMps: Double): String? {
+        val mph = vTargetMps * 2.23694
+        val step = (mph / 5.0).roundToInt() * 5
+        return if (step in 20..100) "s_$step" else null
+    }
+
+    /** Modifiers that change how dangerous the corner is — the last thing to drop. */
+    private val DANGER = setOf(Modifier.TIGHTENS, Modifier.OPENS, Modifier.OFF_CAMBER)
+
+    fun cornerKeys(c: HorizonCorner, detail: Detail): List<String> {
         val dir = c.corner.direction.spoken()
-        val keys = ArrayList<String>(4)
-        // "caution" leads the call; the rest trail it.
-        if (com.rallycopilot.core.model.Modifier.CAUTION in c.modifiers) keys += "caution"
+        val keys = ArrayList<String>(6)
+        if (Modifier.CAUTION in c.modifiers) keys += "caution"
         keys += when (c.band) {
             SeverityBand.HAIRPIN -> "${dir}_hairpin"
             else -> "${dir}_${c.band.spoken}"
         }
-        for (m in c.modifiers) if (m != com.rallycopilot.core.model.Modifier.CAUTION) keys += m.spoken
-        if (includeGear && c.gear != null) keys += "gear_${c.gear}"
+        if (detail.shapeModifiers && Modifier.LONG in c.modifiers) keys += Modifier.LONG.spoken
+        if (detail.dangerModifiers) {
+            for (m in c.modifiers) if (m in DANGER) keys += m.spoken
+        }
+        if (detail.speed) speedKey(c.vTargetMps)?.let { keys += it }
+        if (detail.gear) c.gear?.let { keys += "gear_$it" }
+        if (detail.shapeModifiers && Modifier.INTO in c.modifiers) keys += Modifier.INTO.spoken
         return keys
     }
 
-    fun hazardKeys(h: HorizonHazard): List<String> =
-        if (h.hazard.kind == com.rallycopilot.core.model.HazardKind.LEARNED) listOf("caution")
-        else listOf("caution", h.hazard.kind.name.lowercase())
+    /** Backwards-compatible shorthand used by the engine's speech-lead estimate. */
+    fun cornerKeys(c: HorizonCorner, includeGear: Boolean): List<String> =
+        cornerKeys(c, Detail(gear = includeGear))
+
+    fun hazardKeys(h: HorizonHazard): List<String> = when {
+        h.hazard.kind == com.rallycopilot.core.model.HazardKind.LEARNED -> listOf("caution")
+        // A camera is not a hazard to be cautious of, it is a fact to act on —
+        // "caution camera" would be both wrong and slower to say.
+        h.hazard.kind.isAlwaysAnnounced -> listOf(h.hazard.kind.name.lowercase())
+        else -> listOf("caution", h.hazard.kind.name.lowercase())
+    }
 
     /**
      * Build one utterance for a chain of corners (and optional leading link distance),
-     * compressing to fit [budgetMs] of speech. Drop order: link distances first, then
-     * modifiers, keeping every corner call. Losing "one hundred" is survivable;
-     * arriving at the corner still talking about the last one is not.
+     * compressing to fit [budgetMs] of speech.
+     *
+     * Drop order, least to most important — arriving at a corner still talking about
+     * the last one is the one failure that actually costs you:
+     *   link distances → gear → shape (long/into) → target speed → tightens/opens/
+     *   off-camber → never the corner call itself.
      */
     fun compose(
         chain: List<HorizonCorner>,
         gapsM: List<Double?>,               // gap BEFORE each corner (null for the first)
-        includeGear: Boolean,
+        detail: Detail,
         deadlineDistanceM: Double,
         budgetMs: Long,
         durationOf: (String) -> Long,
@@ -59,20 +95,28 @@ object NoteComposer {
         require(chain.isNotEmpty())
         val urgent = chain.any { it.band.urgent }
 
-        fun assemble(withLinks: Boolean, withModifiers: Boolean): List<String> {
+        fun assemble(withLinks: Boolean, d: Detail): List<String> {
             val keys = ArrayList<String>()
             for ((i, c) in chain.withIndex()) {
                 if (withLinks && i > 0) gapsM[i]?.let { g -> linkKey(g)?.let { keys += it } }
-                val cornerKeys = cornerKeys(c, includeGear)
-                keys += if (withModifiers) cornerKeys else cornerKeys.take(1) +
-                    (if (includeGear && c.gear != null) listOf("gear_${c.gear}") else emptyList())
+                keys += cornerKeys(c, d)
             }
             return keys
         }
 
-        var keys = assemble(withLinks = true, withModifiers = true)
-        if (keys.sumOf(durationOf) > budgetMs) keys = assemble(withLinks = false, withModifiers = true)
-        if (keys.sumOf(durationOf) > budgetMs) keys = assemble(withLinks = false, withModifiers = false)
+        val ladder = listOf(
+            true to detail,
+            false to detail,
+            false to detail.copy(gear = false),
+            false to detail.copy(gear = false, shapeModifiers = false),
+            false to detail.copy(gear = false, shapeModifiers = false, speed = false),
+            false to Detail(speed = false, gear = false, dangerModifiers = false, shapeModifiers = false),
+        )
+        var keys = assemble(ladder.first().first, ladder.first().second)
+        for ((withLinks, d) in ladder) {
+            keys = assemble(withLinks, d)
+            if (keys.sumOf(durationOf) <= budgetMs) break
+        }
 
         return Utterance(
             clipKeys = keys,

@@ -66,6 +66,9 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
         address: String,
         loadCache: (String) -> Set<Int>? = { null },
         saveCache: (String, Set<Int>) -> Unit = { _, _ -> },
+        /** Gear calibration for this car, keyed the same way as the PID cache. */
+        loadGears: (String) -> String? = { null },
+        saveGears: (String, String) -> Unit = { _, _ -> },
     ) {
         disconnect()
         val myGen = ++generation
@@ -116,6 +119,9 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 // follows the CAR (swap dongles freely); dongle MAC is the fallback key.
                 vin = Elm327.vin(cmd(Elm327.Pid.VIN, 1500))
                 val cacheKey = vin?.let { "vin:" + it } ?: ("mac:" + address)
+                // Gearing follows the car: restore it before the first sample so gear
+                // calls work from the first corner, not after a minute of re-learning.
+                gearInference.restore(loadGears(cacheKey))
 
                 var supported = loadCache(cacheKey)
                 if (supported.isNullOrEmpty()) {
@@ -167,12 +173,21 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                         batteryVv = Elm327.batteryV(cmd(Elm327.Pid.VOLTAGE))
                         if (hasAmbient) ambientV = Elm327.ambientC(cmd(Elm327.Pid.AMBIENT))
                         if (hasFuel) fuelV = Elm327.fuelLevel01(cmd(Elm327.Pid.FUEL_LEVEL))
+                        // Persist gearing as it improves (~every 2.5 s of polling).
+                        if (gearInference.consumeDirty()) {
+                            runCatching { saveGears(cacheKey, gearInference.serialise()) }
+                        }
                     }
                     delay(120)
                 }
             } catch (_: Exception) {
                 // fall through to disconnect state
             } finally {
+                // Save whatever gearing was learned before the link dropped.
+                runCatching {
+                    val key = vin?.let { "vin:" + it } ?: ("mac:" + address)
+                    if (gearInference.consumeDirty()) saveGears(key, gearInference.serialise())
+                }
                 runCatching { s?.close() }
                 if (socket === s) socket = null
                 if (connecting === s) connecting = null

@@ -27,6 +27,37 @@ class VoicePack(private val context: Context) : AudioSink {
     private val handler = Handler(playbackThread.looper)
     private var focusRequest: android.media.AudioFocusRequest? = null
     @Volatile private var speakingUntil = 0L
+
+    /** Voice level, 0..1. */
+    @Volatile var volume: Float = 1.0f
+        private set
+
+    /**
+     * Stereo balance, -1 = full left … 0 = centre … +1 = full right.
+     *
+     * Android cannot address one physical car speaker over Bluetooth — the head unit
+     * owns the speakers and A2DP carries a plain stereo pair. Panning is the real
+     * lever: hard left puts the voice in the left-hand (UK driver's side) speakers
+     * and silences the right. Whether that lands on the door or the dash depends on
+     * how the car mixes a stereo source; the head unit's own fader can finish the job.
+     */
+    @Volatile var balance: Float = 0.0f
+        private set
+
+    fun setVolume(v: Float) { volume = v.coerceIn(0f, 1f); applyGain() }
+    fun setBalance(b: Float) { balance = b.coerceIn(-1f, 1f); applyGain() }
+
+    /** Per-channel gains from volume + balance, equal-power so centre isn't loud. */
+    private fun channelGains(): Pair<Float, Float> {
+        val l = if (balance <= 0f) 1f else (1f - balance)
+        val r = if (balance >= 0f) 1f else (1f + balance)
+        return (l * volume) to (r * volume)
+    }
+
+    private fun applyGain() {
+        val (l, r) = channelGains()
+        handler.post { runCatching { player?.setVolume(l, r) } }
+    }
     private var player: MediaPlayer? = null
     private var queue = ArrayDeque<String>()          // asset paths remaining in current utterance
     private var keepAlive: AudioTrack? = null
@@ -85,6 +116,8 @@ class VoicePack(private val context: Context) : AudioSink {
             mp.setOnCompletionListener { it.release(); if (player === it) player = null; playNext() }
             mp.setOnErrorListener { p, _, _ -> p.release(); if (player === p) player = null; playNext(); true }
             mp.prepare()
+            val (l, r) = channelGains()
+            mp.setVolume(l, r)
             mp.start()
         } catch (_: Exception) {
             playNext()

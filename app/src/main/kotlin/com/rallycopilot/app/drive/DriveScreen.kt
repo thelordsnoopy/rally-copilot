@@ -69,6 +69,11 @@ private val Amber = Color(0xFFFFB74D)
 private val Green = Color(0xFF2EE06B)
 private val Red = Color(0xFFFF4B4B)
 
+// Per-frame easing factors for the map. Low enough to kill GPS twitch, high enough
+// that the map still tracks the car rather than trailing behind it.
+private const val POSITION_EASE = 0.14f
+private const val BEARING_EASE = 0.09f
+
 private fun severityColour(band: SeverityBand): Color = when (band) {
     SeverityBand.HAIRPIN, SeverityBand.ONE -> Red
     SeverityBand.TWO, SeverityBand.THREE -> Amber
@@ -331,7 +336,11 @@ private fun InstrumentBar(hud: DriveEngine.HudState?, modifier: Modifier) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Chip("GPS", if (hud?.gpsOk == true) Green else Red)
             Chip("OBD", if (hud?.obdConnected == true) Green else InkDim)
-            if (hud?.spirited == true) Chip("SPIRITED", Amber) else Chip("NORMAL", InkDim)
+            // Quiet mode is a deliberate silence, so say so — the driver must never
+            // wonder whether the co-driver has died.
+            if (hud?.pressingOn == false) Chip("QUIET · cameras only", InkDim)
+            else if (hud?.spirited == true) Chip("SPIRITED", Amber)
+            else Chip("CALLING", Green)
         }
         // path confidence
         val conf = hud?.currentNote?.pathConfidence ?: hud?.matched?.confidence ?: 0.0
@@ -406,6 +415,43 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
         }
     }
 
+    // ---- smoothing ----
+    // GPS lands at 5-10 Hz and the matched offset steps with it, so drawing the raw
+    // value makes the whole world twitch. Ease position and heading toward their
+    // targets once per displayed frame instead: the map glides, and a single noisy
+    // fix nudges it rather than snapping it. The easing runs in a frame callback,
+    // never in composition — composition must stay free of side effects.
+    val smoothed = remember { mutableStateOf<LatLon?>(null) }
+    val smoothBearing = remember { mutableStateOf(Float.NaN) }
+    val targetCentre = androidx.compose.runtime.rememberUpdatedState(centre)
+    val targetBearing = androidx.compose.runtime.rememberUpdatedState(
+        matched?.bearingDeg?.toFloat()?.takeIf { !it.isNaN() }
+    )
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        while (true) {
+            androidx.compose.runtime.withFrameMillis {
+                targetCentre.value?.let { t ->
+                    val cur = smoothed.value
+                    smoothed.value = if (cur == null) t else LatLon(
+                        cur.lat + (t.lat - cur.lat) * POSITION_EASE,
+                        cur.lon + (t.lon - cur.lon) * POSITION_EASE,
+                    )
+                }
+                targetBearing.value?.let { t ->
+                    val cur = smoothBearing.value
+                    smoothBearing.value = if (cur.isNaN()) t else {
+                        // Shortest way round the circle, so 350° -> 10° eases through
+                        // north instead of spinning the map the long way.
+                        var delta = (t - cur) % 360f
+                        if (delta > 180f) delta -= 360f
+                        if (delta < -180f) delta += 360f
+                        (cur + delta * BEARING_EASE + 360f) % 360f
+                    }
+                }
+            }
+        }
+    }
+
     Canvas(
         modifier.graphicsLayer {
             // Google-Maps-style perspective tilt, pivoting low so the far road recedes.
@@ -414,8 +460,10 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
             transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.5f, 0.75f)
         }
     ) {
-        val c = centre ?: return@Canvas
-        val m = matched ?: return@Canvas
+        // Draw from the eased values, not the raw fix — see the smoothing above.
+        val c = smoothed.value ?: centre ?: return@Canvas
+        val heading = smoothBearing.value.takeIf { !it.isNaN() }
+            ?: matched?.bearingDeg?.toFloat()?.takeIf { !it.isNaN() } ?: 0f
         val pathEdges = hud?.horizon?.pathEdgeIds?.toHashSet() ?: hashSetOf()
 
         val scale = (size.height / 520f) // px per metre-ish: ~520 m visible vertically
@@ -427,7 +475,7 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
             return Offset(cx + (xy.x * scale).toFloat(), cy - (xy.y * scale).toFloat())
         }
 
-        rotate(degrees = -m.bearingDeg.toFloat(), pivot = Offset(cx, cy)) {
+        rotate(degrees = -heading, pivot = Offset(cx, cy)) {
             // all nearby roads, dim
             for (e in nearby) {
                 if (e.id in pathEdges) continue

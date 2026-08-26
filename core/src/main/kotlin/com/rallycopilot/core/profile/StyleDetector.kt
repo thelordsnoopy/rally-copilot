@@ -50,6 +50,16 @@ class StyleDetector(
         /** Window pace vs your drive-long moving average: 1.05x reads normal, 1.30x committed. */
         val paceRatioNormal: Double = 1.05,
         val paceRatioSpirited: Double = 1.30,
+        /** ---- fast gate (what the co-driver SPEAKS on) ---- */
+        /** Short window the fast gate judges on — responds within a corner or two. */
+        val fastWindowMs: Long = 6_000,
+        /** Fast gate turns on above this score and off below it. Deliberately eager:
+         *  being late to start calling is worse than a few notes on a brisk B-road. */
+        val fastOn: Double = 0.42,
+        val fastOff: Double = 0.28,
+        /** Keep talking this long after the pace drops, so a single slow corner or a
+         *  village on a good road does not chop the co-driver off mid-flow. */
+        val fastHangoverMs: Long = 45_000,
         /** The pace vote joins only after this much MOVING time — the average needs to mean something. */
         val paceWarmupMs: Long = 120_000,
         /** Commitment must hold unbroken this long before the verdict flips to spirited. */
@@ -92,12 +102,30 @@ class StyleDetector(
     private var movingMs = 0L
     /** When the current UNBROKEN committed stretch began; -1 = not committed. */
     private var committedSinceMs = -1L
+    private var pressingOn = false
+    private var pressingLastTrueMs = Long.MIN_VALUE / 2
 
-    /** Whether the current window reads as spirited driving. */
+    /**
+     * The STRICT verdict: sustained, unbroken, quicker-than-your-own-average driving.
+     * This is the one that gates LEARNING — it must never be fooled by a brief pull,
+     * because a polluted profile is permanent.
+     */
     val isSpirited: Boolean get() = spirited
+
+    /**
+     * The FAST verdict: are you pressing on *right now*? Reacts within a corner or
+     * two and hangs on through a village. This is what gates SPEAKING — the co-driver
+     * should start calling the moment the road gets good, long before there is enough
+     * evidence to safely train the model from it.
+     */
+    val isPressingOn: Boolean get() = pressingOn
 
     /** 0..1 blended score for the current window (for the HUD/debug). */
     var score: Double = 0.0
+        private set
+
+    /** 0..1 score over the short fast window. */
+    var fastScore: Double = 0.0
         private set
 
     /** Fraction of the drive so far spent spirited. */
@@ -155,6 +183,21 @@ class StyleDetector(
         if (broke || !committed) committedSinceMs = -1
         else if (committedSinceMs < 0) committedSinceMs = sample.tMs
         spirited = committedSinceMs >= 0 && sample.tMs - committedSinceMs >= params.sustainMs
+
+        // ---- fast gate: what the co-driver actually speaks on ----
+        // No sustain requirement and no pace-vs-average warm-up: this must come alive
+        // as soon as the driving does. Crawling always silences it immediately.
+        val fastSamples = window.filter { it.tMs >= sample.tMs - params.fastWindowMs }
+        fastScore = if (fastSamples.size >= 4) blend(profile, fastSamples) else 0.0
+        val crawling = sample.speedMps < params.breakSpeedMps
+        val fastNow = !crawling && fastScore > (if (pressingOn) params.fastOff else params.fastOn)
+        if (fastNow) pressingLastTrueMs = sample.tMs
+        pressingOn = when {
+            crawling && sample.tMs - pressingLastTrueMs > 10_000 -> false
+            fastNow -> true
+            // Hang on through a village or one slow corner rather than cutting out.
+            else -> sample.tMs - pressingLastTrueMs < params.fastHangoverMs
+        }
 
         if (lastT != 0L) {
             val dt = sample.tMs - lastT

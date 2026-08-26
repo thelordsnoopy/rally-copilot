@@ -159,53 +159,176 @@ object Elm327 {
 }
 
 /**
- * Learns gear ratios from (rpm, speed) samples by 1-D clustering of rpm/speed, then
- * infers current gear. Ratio unit is rpm per m/s — proportional to overall gearing.
+ * Learns the car's gearing from (rpm, speed) samples and infers gears.
+ *
+ * Ratio unit is rpm per m/s — proportional to overall gearing, so a gear's ratio
+ * gives everything else: the speed it tops out at (redline / ratio), the speed
+ * range it covers, and the revs it will land you on at any target speed.
+ *
+ * Everything here self-calibrates from driving and PERSISTS per car (keyed by VIN
+ * upstream), so gear calls work from the first corner of the second drive rather
+ * than re-learning from scratch every time.
+ *
+ * The rev band it aims for is learned too: the driver's own spirited upshift point
+ * defines the top of the usable band, so "the right gear for this corner" means
+ * the driver's own idea of the right gear, not a number baked in here.
  */
-class GearInference {
+class GearInference(private val params: Params = Params()) {
+
+    data class Params(
+        val minRpm: Int = 1100,
+        val minSpeedMps: Double = 3.0,
+        /** Enough samples to trust a fit at all. ~15 s of driving at 4 Hz. */
+        val minSamples: Int = 60,
+        /** Relative gap between neighbouring ratios that separates two gears. */
+        val clusterSplit: Double = 1.12,
+        val idleRpm: Double = 800.0,
+        val redlineDefault: Double = 4800.0,
+        /** Fallback spirited upshift point until the driver's own is observed. */
+        val shiftRpmDefault: Double = 3400.0,
+        /** Corner exit target, as a fraction of the way from idle to the shift point.
+         *  Low enough to be smooth, high enough to pull cleanly without a downshift. */
+        val exitBandFraction: Double = 0.45,
+        /** Never suggest a gear that would be bouncing off the limiter at target speed. */
+        val maxExitFractionOfRedline: Double = 0.85,
+    )
+
+    // Written by the OBD polling thread, read by the engine thread (gear calls) —
+    // every field crossing that boundary is volatile, and the mutable collections
+    // never leave this class. `ratios` is only ever REPLACED, never mutated in place,
+    // so a reader always sees a complete list.
     private val samples = ArrayList<Double>()
-    private var ratios: List<Double> = emptyList()
+    @Volatile private var ratios: List<Double> = emptyList()
+    @Volatile private var observedMaxRpm = 0.0
+    private val upshiftRpms = ArrayDeque<Double>()
+    /** Median upshift rpm, republished whenever [upshiftRpms] changes. */
+    @Volatile private var shiftRpmCache = Double.NaN
+    private var lastGearSeen: Int? = null
+    private var lastRpmSeen: Int? = null
+    @Volatile private var dirty = false
 
     val learnedRatios: List<Double> get() = ratios
+    val gearCount: Int get() = ratios.size
+    /** True once the gearing is known well enough to speak gear calls. */
+    val isCalibrated: Boolean get() = ratios.size >= 3
+
+    /** Estimated redline: the highest rpm actually seen, with a sane floor. */
+    val redlineRpm: Double
+        get() = maxOf(observedMaxRpm, params.redlineDefault * 0.75).coerceAtLeast(3000.0)
+
+    /** The driver's own spirited upshift point (median), or the default until seen. */
+    val shiftRpm: Double
+        get() = shiftRpmCache.takeIf { !it.isNaN() } ?: params.shiftRpmDefault
+
+    private fun republishShiftRpm() {
+        shiftRpmCache = if (upshiftRpms.size >= 3) upshiftRpms.sorted()[upshiftRpms.size / 2]
+        else Double.NaN
+    }
+
+    /** Revs to aim for coming out of a corner — learned from how this driver shifts. */
+    val exitRpm: Double
+        get() = params.idleRpm + params.exitBandFraction * (shiftRpm - params.idleRpm)
+
+    /** Top speed in [gear] (1-based) at the redline, m/s. Null if not learned. */
+    fun topSpeedOf(gear: Int): Double? =
+        ratios.getOrNull(gear - 1)?.let { redlineRpm / it }
+
+    /** Usable speed range of [gear]: from clean pull-away revs to the shift point. */
+    fun speedRangeOf(gear: Int): ClosedFloatingPointRange<Double>? {
+        val r = ratios.getOrNull(gear - 1) ?: return null
+        return (params.idleRpm * 1.4 / r)..(shiftRpm / r)
+    }
+
+    /** Revs this gear would be turning at [speedMps]. */
+    fun rpmAt(gear: Int, speedMps: Double): Double? =
+        ratios.getOrNull(gear - 1)?.let { it * speedMps }
 
     fun addSample(rpm: Int, speedMps: Double) {
-        if (rpm < 1200 || speedMps < 3.0) return // idle/clutch-in noise
+        if (rpm > observedMaxRpm && rpm < 8000) { observedMaxRpm = rpm.toDouble(); dirty = true }
+        if (rpm < params.minRpm || speedMps < params.minSpeedMps) return
         samples += rpm / speedMps
-        if (samples.size % 200 == 0) refit()
+        // Refit eagerly while still learning, then occasionally to track wear/tyres.
+        val n = samples.size
+        if (n == params.minSamples || (n < 400 && n % 40 == 0) || n % 200 == 0) refit()
+        // Track the driver's upshift points: gear up, and remember the revs before it.
+        val g = currentGear(rpm, speedMps)
+        if (g != null && lastGearSeen != null && g == lastGearSeen!! + 1) {
+            lastRpmSeen?.let {
+                if (it > params.idleRpm * 1.5) {
+                    upshiftRpms += it.toDouble()
+                    while (upshiftRpms.size > 15) upshiftRpms.removeFirst()
+                    republishShiftRpm()
+                    dirty = true
+                }
+            }
+        }
+        if (g != null) lastGearSeen = g
+        lastRpmSeen = rpm
     }
 
     fun refit() {
-        if (samples.size < 100) return
+        if (samples.size < params.minSamples) return
         val sorted = samples.sorted()
         // Greedy 1-D clustering: split where the relative jump between neighbours exceeds 12%.
         val clusters = ArrayList<MutableList<Double>>()
         var cur = mutableListOf(sorted.first())
         for (v in sorted.drop(1)) {
-            if (v / cur.last() > 1.12) { clusters += cur; cur = mutableListOf() }
+            if (v / cur.last() > params.clusterSplit) { clusters += cur; cur = mutableListOf() }
             cur += v
         }
         clusters += cur
-        ratios = clusters
-            .filter { it.size >= sorted.size / 25 } // ignore tiny noise clusters
+        val fitted = clusters
+            .filter { it.size >= maxOf(3, sorted.size / 25) } // ignore tiny noise clusters
             .map { it.sorted()[it.size / 2] }
             .sortedDescending() // highest ratio = 1st gear
             .take(8)
+        if (fitted.isNotEmpty() && fitted != ratios) { ratios = fitted; dirty = true }
     }
 
     /** Current gear (1-based), or null if unknown or between gears. */
     fun currentGear(rpm: Int, speedMps: Double): Int? {
-        if (ratios.isEmpty() || rpm < 1200 || speedMps < 3.0) return null
+        if (ratios.isEmpty() || rpm < params.minRpm || speedMps < params.minSpeedMps) return null
         val r = rpm / speedMps
         val idx = ratios.indices.minByOrNull { kotlin.math.abs(ratios[it] - r) } ?: return null
         return if (kotlin.math.abs(ratios[idx] - r) / ratios[idx] < 0.08) idx + 1 else null
     }
 
-    /** Gear you would want at [vTargetMps], picking the gear that puts rpm nearest [idealRpm]. */
-    fun gearForSpeed(vTargetMps: Double, idealRpm: Double = 3500.0): Int? {
-        if (ratios.isEmpty() || vTargetMps < 1.0) return null
-        val idx = ratios.indices.minByOrNull { kotlin.math.abs(ratios[it] * vTargetMps - idealRpm) }
+    /**
+     * The gear to be in through a corner taken at [vTargetMps]: the one landing
+     * nearest the learned corner-exit revs, never one that would sit above
+     * [Params.maxExitFractionOfRedline] of the redline (you'd be shifting mid-corner).
+     */
+    fun gearForSpeed(vTargetMps: Double, idealRpm: Double = exitRpm): Int? {
+        if (!isCalibrated || vTargetMps < 1.0) return null
+        val ceiling = redlineRpm * params.maxExitFractionOfRedline
+        val usable = ratios.indices.filter { ratios[it] * vTargetMps <= ceiling }
+        val pool = usable.ifEmpty { listOf(ratios.indices.last()) } // very fast: top gear
+        val idx = pool.minByOrNull { kotlin.math.abs(ratios[it] * vTargetMps - idealRpm) }
             ?: return null
         return idx + 1
+    }
+
+    // ---- persistence: the calibration follows the car, keyed by VIN upstream ----
+
+    /** True when there is new calibration worth saving. */
+    fun consumeDirty(): Boolean = dirty.also { dirty = false }
+
+    fun serialise(): String = buildString {
+        append(ratios.joinToString(",") { "%.3f".format(it) })
+        append(";").append("%.0f".format(observedMaxRpm))
+        append(";").append(upshiftRpms.joinToString(",") { "%.0f".format(it) })
+    }
+
+    fun restore(s: String?) {
+        if (s.isNullOrBlank()) return
+        val parts = s.split(";")
+        parts.getOrNull(0)?.split(",")?.mapNotNull { it.trim().toDoubleOrNull() }
+            ?.filter { it > 1.0 }?.sortedDescending()
+            ?.let { if (it.isNotEmpty()) ratios = it }
+        parts.getOrNull(1)?.trim()?.toDoubleOrNull()?.let { if (it in 1000.0..8000.0) observedMaxRpm = it }
+        parts.getOrNull(2)?.split(",")?.mapNotNull { it.trim().toDoubleOrNull() }
+            ?.forEach { if (it in 1000.0..8000.0) upshiftRpms += it }
+        republishShiftRpm()
     }
 }
 
