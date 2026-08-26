@@ -775,7 +775,7 @@ fun SettingsScreen(activity: MainActivity) {
         )
 
         // ---- hands-free voice commands ----
-        var voiceCmds by remember { mutableStateOf(db.kvGet("voice_commands") != "off") }
+        var voiceCmds by remember { mutableStateOf(db.kvGet("voice_commands") == "on") }
         Spacer(Modifier.height(10.dp))
         Button(
             onClick = {
@@ -807,15 +807,23 @@ fun SettingsScreen(activity: MainActivity) {
                 "call into the run log so bad calls can be traced. Takes effect on the next drive.",
             color = Color(0xFF667788), fontSize = 11.sp,
         )
+        Text(
+            "Off by default, and worth leaving off if your music matters: listening runs " +
+                "continuously for the whole drive, and on many phones starting the " +
+                "recogniser makes the system pause or dip whatever is playing. That is the " +
+                "most likely cause of music stopping at moments with no corner call.",
+            color = Color(0xFFD8A23A), fontSize = 11.sp,
+            modifier = Modifier.padding(top = 4.dp),
+        )
 
         // ---- what the co-driver does to your music ----
         Spacer(Modifier.height(16.dp))
         Text("YOUR MUSIC", color = Color(0xFF7C8B9A), fontSize = 11.sp,
             letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
-        var focusMode by remember { mutableStateOf(db.kvGet("audio_focus") ?: "duck") }
+        var focusMode by remember { mutableStateOf(db.kvGet("audio_focus") ?: "pause") }
         Row(Modifier.fillMaxWidth().background(Color(0xFF11161D), RoundedCornerShape(12.dp)).padding(4.dp)) {
-            for ((key, label) in listOf("duck" to "DIP IT", "none" to "LEAVE IT ALONE")) {
+            for ((key, label) in listOf("pause" to "PAUSE", "duck" to "DIP", "none" to "LEAVE IT")) {
                 val sel = focusMode == key
                 Button(
                     onClick = { focusMode = key; db.kvPut("audio_focus", key) },
@@ -831,13 +839,21 @@ fun SettingsScreen(activity: MainActivity) {
             }
         }
         Text(
-            if (focusMode == "duck")
-                "Music dips for the second or so a call takes, then comes straight back. " +
-                    "The co-driver no longer holds the audio focus for the whole drive — " +
-                    "that is what was pausing your music from the moment you pressed DRIVE."
-            else "The co-driver never asks for audio focus. Notes play over the top of " +
-                "your music at whatever volume you have set, and nothing else is touched.",
+            when (focusMode) {
+                "pause" -> "Music pauses for the call and resumes straight after, so the " +
+                    "co-driver is heard cleanly against silence."
+                "duck" -> "Music dips and the co-driver talks over the top of it."
+                else -> "The co-driver never asks for audio focus at all. Notes mix over " +
+                    "whatever is playing, and nothing else is touched."
+            },
             color = Color(0xFF667788), fontSize = 11.sp,
+        )
+        Text(
+            "In every mode: if nothing is playing, nothing is touched. The app will never " +
+                "start music that was not already running — handing audio focus back is " +
+                "read as \"resume\" by a paused player, which is what made it start on its own.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+            modifier = Modifier.padding(top = 4.dp),
         )
 
         var keepAlive by remember { mutableStateOf(db.kvGet("bt_keepalive") != "off") }

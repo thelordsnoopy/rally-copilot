@@ -84,6 +84,14 @@ class AppDb private constructor(context: Context) :
                  (SELECT MAX(t_ms) FROM run_fixes WHERE run_id = runs.id), started_at)
                WHERE ended_at IS NULL"""
         )
+        // ...and a run that died having never gone anywhere is not worth keeping at
+        // all. Sweeps up both crashed starts and any 0-mile rows already in the log.
+        writableDatabase.execSQL(
+            """DELETE FROM runs WHERE COALESCE(distance_m, 0) < 100
+               AND id NOT IN (SELECT DISTINCT run_id FROM observations)"""
+        )
+        writableDatabase.execSQL("DELETE FROM run_fixes WHERE run_id NOT IN (SELECT id FROM runs)")
+        writableDatabase.execSQL("DELETE FROM run_events WHERE run_id NOT IN (SELECT id FROM runs)")
         val v = ContentValues().apply {
             put("started_at", System.currentTimeMillis())
             put("conditions", conditions.name)
@@ -104,6 +112,29 @@ class AppDb private constructor(context: Context) :
     }
 
     data class RunRow(val id: Long, val startedAt: Long, val endedAt: Long?, val distanceM: Double, val feedback: String?)
+
+    /**
+     * Throw a run away entirely — fixes, events, observations and all.
+     *
+     * A drive that covered no ground is not a drive: it is a mis-tap, a service
+     * started while parked, or an app opened to check a setting. Keeping those
+     * clutters the run log with "0 min, 0.0 miles" rows and leaves half-finished
+     * rows for the learning pass to reason about.
+     */
+    fun deleteRun(runId: Long) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val a = arrayOf(runId.toString())
+            db.execSQL("DELETE FROM run_fixes WHERE run_id=?", a)
+            db.execSQL("DELETE FROM run_events WHERE run_id=?", a)
+            db.execSQL("DELETE FROM observations WHERE run_id=?", a)
+            db.execSQL("DELETE FROM runs WHERE id=?", a)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
 
     fun runs(limit: Int = 50): List<RunRow> {
         val out = ArrayList<RunRow>()

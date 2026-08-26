@@ -31,14 +31,16 @@ class VoicePack(private val context: Context) : AudioSink {
 
     /** What the co-driver is allowed to do to whatever else is playing. */
     enum class FocusMode {
-        /** Ask the music to dip for the length of a call, then hand it straight back. */
+        /** Pause the music for the call, then let it resume. Clearest call. */
+        PAUSE,
+        /** Ask the music to dip instead, and talk over the top of it. */
         DUCK,
-        /** Never ask for audio focus at all: notes mix over the top of the music. */
+        /** Never ask for audio focus at all: notes mix over whatever is playing. */
         NONE,
     }
 
     @Volatile
-    var focusMode: FocusMode = FocusMode.DUCK
+    var focusMode: FocusMode = FocusMode.PAUSE
 
     /** Voice level, 0..1. */
     @Volatile var volume: Float = 1.0f
@@ -228,18 +230,60 @@ class VoicePack(private val context: Context) : AudioSink {
      * A co-driver wants the music dipped for the second and a half it is talking,
      * and not one moment longer.
      */
-    private fun acquireFocus() {
-        if (focusMode != FocusMode.DUCK || focusHeld) return
+    /**
+     * Is somebody ELSE actually playing music right now?
+     *
+     * This gate exists because abandoning audio focus tells the previous owner it
+     * may resume — and a media app that was sitting paused takes that as "play".
+     * So a co-driver that grabs focus when nothing is playing does not merely
+     * interrupt the music, it STARTS music the driver never asked for. If nothing
+     * is playing there is nothing to pause, so we never ask for focus at all.
+     *
+     * AudioManager.isMusicActive() is no use on its own here: our own keep-alive
+     * stream and our own notes can both make it read true. The playback
+     * configuration list carries each player's usage, so our navigation-guidance
+     * tracks can be told apart from someone's music.
+     */
+    private fun someoneElseIsPlaying(): Boolean {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val req = focusRequest ?: android.media.AudioFocusRequest
-            .Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-            .setAudioAttributes(audioAttrs)
-            .setWillPauseWhenDucked(false)
-            .build().also { focusRequest = it }
+        val configs = runCatching { am.activePlaybackConfigurations }.getOrNull()
+        if (!configs.isNullOrEmpty()) {
+            return configs.any { c ->
+                when (c.audioAttributes.usage) {
+                    AudioAttributes.USAGE_MEDIA,
+                    AudioAttributes.USAGE_GAME,
+                    AudioAttributes.USAGE_UNKNOWN -> true
+                    else -> false
+                }
+            }
+        }
+        // Nothing legible in the list (some devices anonymise it). Fall back to the
+        // blunt check, but only when none of our own audio could be confusing it.
+        if (keepAlive != null || isSpeaking()) return false
+        return runCatching { am.isMusicActive }.getOrDefault(false)
+    }
+
+    @Synchronized
+    private fun acquireFocus() {
+        if (focusMode == FocusMode.NONE || focusHeld) return
+        // Nothing playing => nothing to pause => nothing to accidentally un-pause.
+        if (!someoneElseIsPlaying()) return
+        val gain = if (focusMode == FocusMode.PAUSE) AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+        else AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        // The request is rebuilt when the mode changes: gain type is baked into it.
+        val req = focusRequest?.takeIf { builtForGain == gain }
+            ?: android.media.AudioFocusRequest.Builder(gain)
+                .setAudioAttributes(audioAttrs)
+                .setWillPauseWhenDucked(false)
+                .build().also { focusRequest = it; builtForGain = gain }
         am.requestAudioFocus(req)
         focusHeld = true
     }
 
+    private var builtForGain: Int = -1
+
+    @Synchronized
     private fun releaseFocus() {
         if (!focusHeld) return
         focusHeld = false
@@ -247,6 +291,21 @@ class VoicePack(private val context: Context) : AudioSink {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.abandonAudioFocusRequest(it)
         }
+    }
+
+    /**
+     * Hold the music off for a measurement — the latency chirp has to be heard by
+     * the microphone over the cabin, and a song playing across it is the one thing
+     * guaranteed to make the measurement fail or lie. Same rule as everywhere else:
+     * if nothing is playing, nothing is touched.
+     */
+    fun beginMeasurement() {
+        handler.removeCallbacks(releaseFocusRunnable)
+        acquireFocus()
+    }
+
+    fun endMeasurement() {
+        scheduleFocusRelease(400)
     }
 
     /** Hand the music back once this utterance is done — unless another call has

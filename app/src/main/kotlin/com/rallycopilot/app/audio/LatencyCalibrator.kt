@@ -60,7 +60,10 @@ object LatencyCalibrator {
             // Fast attack, exponential decay — reads as a "zip", and the sharp
             // onset is exactly what makes it easy to time.
             val env = if (t < 0.04) t / 0.04 else Math.exp(-3.0 * (t - 0.04))
-            out[i] = (sin(phase) * env * 0.6 * Short.MAX_VALUE).toInt().toShort()
+            // Near full scale: the chirp has to be heard by the phone's own
+            // microphone from across the cabin, over engine and road noise, and a
+            // measurement that fails is a guessed number in every corner call.
+            out[i] = (sin(phase) * env * 0.95 * Short.MAX_VALUE).toInt().toShort()
         }
         return out
     }
@@ -118,6 +121,7 @@ object LatencyCalibrator {
             .build()
 
         return try {
+            runCatching { track.setVolume(AudioTrack.getMaxVolume()) }
             track.write(tone, 0, tone.size)
             val total = SAMPLE_RATE * (LEAD_SILENCE_MS + LISTEN_MS) / 1000
             val captured = ShortArray(total)

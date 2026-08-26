@@ -293,7 +293,12 @@ class DriveService : Service() {
             calibrateAudio()
             // Hands-free voice starts AFTER the chirp measurement: two owners of the
             // microphone at once and the calibrator hears the recogniser's silence.
-            if (driveActive && db.kvGet("voice_commands") != "off") {
+            // OPT-IN, and off by default. Android's SpeechRecognizer grabs the
+            // microphone and, on a lot of devices, makes the system duck or pause
+            // media every time it starts listening — and this loop restarts it
+            // continuously for the whole drive. That is the shape of "my music keeps
+            // pausing at random", unconnected to any corner call.
+            if (driveActive && db.kvGet("voice_commands") == "on") {
                 voiceCommands = com.rallycopilot.app.audio.VoiceCommands(this@DriveService) { cmd ->
                     onVoiceCommand(cmd)
                 }.also { it.start() }
@@ -304,8 +309,11 @@ class DriveService : Service() {
         voice.setBalance(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f)
         voice.muted = false // a "quiet" from last drive must not silence this one
         // Focus is taken per utterance from here on, never held across the drive.
-        voice.focusMode = if (db.kvGet("audio_focus") == "none") VoicePack.FocusMode.NONE
-        else VoicePack.FocusMode.DUCK
+        voice.focusMode = when (db.kvGet("audio_focus")) {
+            "none" -> VoicePack.FocusMode.NONE
+            "duck" -> VoicePack.FocusMode.DUCK
+            else -> VoicePack.FocusMode.PAUSE
+        }
         if (db.kvGet("bt_keepalive") != "off") voice.startKeepAlive()
         if (isDemo) startDemo(map) else {
             startGps()
@@ -416,7 +424,14 @@ class DriveService : Service() {
             return
         }
         audioCalibration = "measuring..."
-        val r = com.rallycopilot.app.audio.LatencyCalibrator.measure(this, voice.attributes)
+        // Hold the music off for the measurement, then hand it straight back. A song
+        // playing across the chirp is the one thing that reliably breaks it.
+        voice.beginMeasurement()
+        val r = try {
+            com.rallycopilot.app.audio.LatencyCalibrator.measure(this, voice.attributes)
+        } finally {
+            voice.endMeasurement()
+        }
         val ms = r.latencyMs
         if (ms != null) {
             engine.audioLatencyMs = ms
@@ -557,7 +572,11 @@ class DriveService : Service() {
         scope.launch(engineDispatcher) {
             // A corner in progress when the drive ends still counts as a pass.
             radiusAuditor?.closePass(); radiusAuditor = null
-            if (rid >= 0) {
+            if (rid >= 0 && distanceM < MIN_SAVED_DRIVE_M && obs.isNullOrEmpty()) {
+                // Went nowhere: a mis-tap, or the app opened to check a setting.
+                // Not a drive, so do not keep one.
+                db.deleteRun(rid)
+            } else if (rid >= 0) {
                 db.endRun(rid, distanceM)
                 if (obs != null) {
                     // Calibration runs cut everything before the detected onset — the
@@ -628,6 +647,10 @@ class DriveService : Service() {
             "obd" -> com.rallycopilot.core.engine.DriveEngine.SpeedSource.OBD_ONLY
             else -> com.rallycopilot.core.engine.DriveEngine.SpeedSource.AUTO
         }
+
+        /** Under this distance with nothing learned, a run is discarded rather than
+         *  saved — see the note on AppDb.deleteRun. */
+        const val MIN_SAVED_DRIVE_M = 100.0
 
         const val CHANNEL = "drive"
         const val NOTIF_ID = 1
