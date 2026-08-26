@@ -247,8 +247,7 @@ class DriveService : Service() {
             runCatching {
                 // GPS-only: do not touch Bluetooth at all, so the OBD chip stays dark
                 // and there is no ambiguity about where the speed came from.
-                val mac = if (db.kvGet("speed_source") == "gps") null
-                else db.kvGet("obd_mac") ?: obd.findBonded()
+                val mac = resolveObdMac()
                 if (mac != null) {
                     // PID cache keyed by VIN when readable (follows the car), else MAC.
                     obd.connect(
@@ -295,6 +294,40 @@ class DriveService : Service() {
 
     /** One-line description of what the OBD link is doing, for the settings screen. */
     fun obdStatusText(): String = obd.statusText
+
+    /** Current link state, for the drive-screen overlay. */
+    fun obdState(): ObdClient.State = obd.state
+
+    /**
+     * Which dongle to talk to — and, when the answer is "none", WHY. Every branch
+     * here used to fall out as a silent null, so a denied permission, Bluetooth
+     * being switched off and no dongle being paired were indistinguishable from
+     * the app simply not bothering.
+     */
+    private fun resolveObdMac(): String? {
+        if (db.kvGet("speed_source") == "gps") {
+            obd.reportUnavailable("speed source is set to GPS only"); return null
+        }
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            obd.reportUnavailable("Nearby devices permission not granted"); return null
+        }
+        val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+        if (adapter == null) { obd.reportUnavailable("no Bluetooth on this phone"); return null }
+        if (!adapter.isEnabled) { obd.reportUnavailable("Bluetooth is switched off"); return null }
+        db.kvGet("obd_mac")?.let { return it }
+        val found = runCatching { obd.findBonded() }.getOrNull()
+        if (found == null) {
+            val paired = runCatching { adapter.bondedDevices.size }.getOrDefault(0)
+            obd.reportUnavailable(
+                if (paired == 0) "no paired Bluetooth devices - pair the ELM327 first"
+                else "none of your $paired paired devices looks like an OBD dongle - pick it in Settings"
+            )
+        }
+        return found
+    }
 
     /** Live voice level/balance changes from the settings screen. */
     fun setVoiceVolume(v: Float) { if (::voice.isInitialized) voice.setVolume(v) }

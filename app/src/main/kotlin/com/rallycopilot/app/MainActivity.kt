@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import androidx.activity.ComponentActivity
@@ -142,6 +143,58 @@ class MainActivity : ComponentActivity() {
                 updateChecking.value = false
             }
         }
+    }
+
+    /**
+     * A standalone OBD client for testing the dongle from Settings without starting
+     * a drive — sitting in the car sorting out pairing is exactly when you need it,
+     * and "no drive running" is a useless answer to "why won't it connect".
+     */
+    val testObd by lazy { com.rallycopilot.app.obd.ObdClient(lifecycleScope) }
+    val testingObd = androidx.compose.runtime.mutableStateOf(false)
+
+    fun toggleObdTest() {
+        val db = com.rallycopilot.app.data.AppDb.get(this)
+        if (testingObd.value) {
+            testObd.disconnect(); testingObd.value = false; return
+        }
+        testingObd.value = true
+        val mac = when {
+            Build.VERSION.SDK_INT >= 31 &&
+                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED -> {
+                testObd.reportUnavailable("Nearby devices permission not granted"); null
+            }
+            else -> {
+                val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+                when {
+                    adapter == null -> { testObd.reportUnavailable("no Bluetooth on this phone"); null }
+                    !adapter.isEnabled -> { testObd.reportUnavailable("Bluetooth is switched off"); null }
+                    else -> db.kvGet("obd_mac") ?: runCatching { testObd.findBonded() }.getOrNull().also {
+                        if (it == null) testObd.reportUnavailable(
+                            "no paired device looks like an OBD dongle - pick one below"
+                        )
+                    }
+                }
+            }
+        }
+        if (mac == null) { testingObd.value = false; return }
+        testObd.connect(
+            mac,
+            loadCache = { k -> db.kvGet("obd_pids_$k")?.split(",")?.mapNotNull { it.toIntOrNull() }?.toSet() },
+            saveCache = { k, v ->
+                db.kvPut("obd_pids_$k", v.joinToString(","))
+                if (k.startsWith("vin:")) db.kvPut("car_vin", k.removePrefix("vin:"))
+            },
+            loadGears = { k -> db.kvGet("obd_gears_$k") },
+            saveGears = { k, v -> db.kvPut("obd_gears_$k", v) },
+        )
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Never leave a test link open competing with a real drive for the dongle.
+        if (testingObd.value) { testObd.disconnect(); testingObd.value = false }
     }
 
     /** Download the found release, with visible progress. */
@@ -747,17 +800,37 @@ fun SettingsScreen(activity: MainActivity) {
         Text("OBD dongle", color = Color(0xFFB8C4D0))
         // What the link is actually doing right now — connecting, retrying, why it
         // failed. Polled so you can watch it come up while sitting in the car.
-        val obdLive by androidx.compose.runtime.produceState<String?>(initialValue = null) {
+        val testing by activity.testingObd
+        val obdLive by androidx.compose.runtime.produceState<String?>(initialValue = null, testing) {
             while (true) {
+                // A live drive owns the dongle; otherwise report the test link, so
+                // this screen is useful while sitting in the car before setting off.
                 value = activity.driveService?.obdStatusText()
-                kotlinx.coroutines.delay(1000)
+                    ?: if (testing) activity.testObd.statusText else null
+                kotlinx.coroutines.delay(800)
             }
         }
         Text(
-            "Status: " + (obdLive ?: "no drive running — start one to connect"),
+            "Status: " + (obdLive ?: "idle — tap Test connection, or just start a drive"),
             color = if (obdLive?.startsWith("live") == true) Color(0xFF2EE06B) else Color(0xFF8899AA),
             fontSize = 12.sp,
         )
+        Button(
+            onClick = { activity.toggleObdTest() },
+            enabled = activity.driveService == null,
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(10.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (testing) Color(0xFF5A2530) else Color(0xFF232D38),
+                disabledContainerColor = Color(0xFF1A222B),
+            ),
+        ) {
+            Text(
+                if (activity.driveService != null) "connected during the drive"
+                else if (testing) "STOP TEST" else "TEST CONNECTION",
+                fontSize = 13.sp, color = Color(0xFFB8C4D0), fontWeight = FontWeight.Bold,
+            )
+        }
         val selectedMac = remember { mutableStateOf(db.kvGet("obd_mac")) }
         val bonded = remember {
             // BLUETOOTH_CONNECT (API 31+) may be denied — check first instead of

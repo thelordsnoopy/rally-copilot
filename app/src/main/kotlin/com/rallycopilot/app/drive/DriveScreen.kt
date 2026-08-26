@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -44,6 +45,7 @@ import androidx.compose.ui.unit.sp
 import com.rallycopilot.app.MainActivity
 import com.rallycopilot.app.data.AppDb
 import com.rallycopilot.app.data.SqliteMapStore
+import com.rallycopilot.app.obd.ObdClient
 import com.rallycopilot.core.engine.DriveEngine
 import com.rallycopilot.core.geo.Geo
 import com.rallycopilot.core.geo.Polyline
@@ -140,6 +142,43 @@ fun DriveScreen(activity: MainActivity, onExit: () -> Unit) {
                         .padding(horizontal = 14.dp, vertical = 5.dp),
                 )
             }
+            // ---- OBD connection overlay ----
+            // Connecting to a dongle takes seconds and can fail for half a dozen
+            // mundane reasons. Show the attempt while it happens and get out of the
+            // way once it is live; if it can't connect, say why rather than leaving
+            // a dark light to be interpreted.
+            val obd by androidx.compose.runtime.produceState<Pair<ObdClient.State, String>?>(null) {
+                while (true) {
+                    value = activity.driveService?.let { it.obdState() to it.obdStatusText() }
+                    delay(600)
+                }
+            }
+            obd?.let { (state, text) ->
+                if (state != ObdClient.State.LIVE && state != ObdClient.State.OFF) {
+                    val working = state == ObdClient.State.CONNECTING ||
+                        state == ObdClient.State.HANDSHAKING
+                    Row(
+                        Modifier.align(Alignment.TopCenter).padding(top = 52.dp)
+                            .background(Color(0xE60D1218), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Canvas(Modifier.size(8.dp)) {
+                            drawCircle(if (working) Amber else Red)
+                        }
+                        Text(
+                            "  OBD  ", color = InkDim, fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false,
+                        )
+                        Text(
+                            text, color = if (working) Ink else Color(0xFFFFB4B4),
+                            fontSize = 12.sp, maxLines = 2,
+                            modifier = Modifier.widthIn(max = 250.dp),
+                        )
+                    }
+                }
+            }
+
             if (hud?.incidentSuspected == true) {
                 Text(
                     "ARE YOU OK?  tap END if not",

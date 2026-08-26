@@ -36,7 +36,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     val statusText: String
         get() = when (state) {
             State.OFF -> "not in use"
-            State.NO_DEVICE -> "no dongle paired - pair the ELM327 in Bluetooth settings"
+            State.NO_DEVICE -> lastError ?: "no dongle paired - pair the ELM327 in Bluetooth settings"
             State.CONNECTING -> "connecting to dongle..."
             State.HANDSHAKING -> "talking to the car..."
             State.LIVE -> "live" + (vin?.let { " - VIN $it" } ?: "")
@@ -74,6 +74,16 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     /** VIN read over mode 09 at connect, when the ECU offers it. */
     @Volatile var vin: String? = null
         private set
+
+    /**
+     * Record that no attempt will be made, and why. Without this a missing dongle,
+     * a denied permission and Bluetooth simply being off all looked identical:
+     * nothing happened and the status stayed "not in use".
+     */
+    fun reportUnavailable(reason: String) {
+        state = State.NO_DEVICE
+        lastError = reason
+    }
 
     /** Find a likely ELM327 among bonded devices (named OBD/ELM/V-Link etc.). */
     fun findBonded(): String? {
