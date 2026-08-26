@@ -224,3 +224,49 @@ class SpokenCallTests {
         assertFalse(HazardKind.FORD.isAlwaysAnnounced)
     }
 }
+
+class SpeakModeTests {
+    /** The setting only flips one flag, but it is the flag that decides whether a
+     *  whole drive is narrated or silent, so pin both directions down. */
+    @Test
+    fun `alwaysSpeak defaults off so cruising is quiet`() {
+        val e = com.rallycopilot.core.engine.DriveEngine(
+            matcher = com.rallycopilot.core.matcher.MapMatcher(EmptyMap),
+            horizonBuilder = com.rallycopilot.core.horizon.HorizonBuilder(EmptyMap),
+            advisor = com.rallycopilot.core.advisor.Advisor(DriverProfile.COLD_START),
+            audio = SilentSink,
+            runLog = NullRunLog,
+            clock = object : com.rallycopilot.core.engine.Clock {
+                override fun nowMs() = 0L
+            },
+        )
+        assertFalse(e.alwaysSpeak)
+        e.alwaysSpeak = true
+        assertTrue(e.alwaysSpeak)
+    }
+}
+
+private object EmptyMap : com.rallycopilot.core.engine.MapStore {
+    override fun edgesNear(p: com.rallycopilot.core.model.LatLon, radiusM: Double) =
+        emptyList<com.rallycopilot.core.model.Edge>()
+    override fun edge(id: Long): com.rallycopilot.core.model.Edge? = null
+    override fun junction(nodeId: Long): com.rallycopilot.core.model.Junction? = null
+    override fun cornersOn(edgeId: Long) = emptyList<com.rallycopilot.core.model.Corner>()
+    override fun hazardsOn(edgeId: Long) = emptyList<com.rallycopilot.core.model.Hazard>()
+    override fun isEmptyAt(p: com.rallycopilot.core.model.LatLon) = true
+}
+
+private object SilentSink : com.rallycopilot.core.engine.AudioSink {
+    override fun clipDurationMs(key: String) = 500L
+    override fun play(utterance: com.rallycopilot.core.model.Utterance) {}
+    override fun isSpeaking() = false
+    override fun remainingMs() = 0L
+}
+
+private object NullRunLog : com.rallycopilot.core.engine.RunLog {
+    override fun logFix(
+        fix: com.rallycopilot.core.model.Fix, matchedEdgeId: Long?, offsetM: Double?,
+        confidence: Double?, wasPredicted: Boolean,
+    ) {}
+    override fun logEvent(event: com.rallycopilot.core.model.RunEvent) {}
+}

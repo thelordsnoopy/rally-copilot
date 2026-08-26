@@ -71,6 +71,15 @@ class DriveEngine(
 
     val params = Params()
 
+    /**
+     * When true the co-driver calls everything all the time, whatever the style
+     * detector thinks. When false (default) ordinary cruising is QUIET — corner
+     * calls stop and only speed cameras get through. Settable mid-drive from
+     * settings; read on the engine thread every tick.
+     */
+    @Volatile
+    var alwaysSpeak: Boolean = false
+
     /** Everything the HUD needs, updated every tick. */
     data class HudState(
         val matched: MatchedPosition? = null,
@@ -88,7 +97,9 @@ class DriveEngine(
         /** Strict verdict — gates learning. */
         val spirited: Boolean = false,
         val spiritedFraction: Double = 0.0,
-        /** Fast verdict — gates speech. False = quiet mode (cameras only). */
+        /** Will the co-driver actually call corners right now? False = quiet mode
+         *  (cameras only). True either because you are pressing on, or because
+         *  the "call everything" setting is on. */
         val pressingOn: Boolean = false,
         /** Active "was there a hazard?" prompt: auto-answers NO at deadline. */
         val hazardPrompt: HazardPrompt? = null,
@@ -254,7 +265,7 @@ class DriveEngine(
                 incidentSuspected = incident,
                 spirited = styleDetector?.isSpirited ?: false,
                 spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
-                pressingOn = styleDetector?.isPressingOn ?: true,
+                pressingOn = alwaysSpeak || (styleDetector?.isPressingOn ?: true),
                 hazardPrompt = activePrompt,
             )
             return
@@ -363,7 +374,7 @@ class DriveEngine(
             incidentSuspected = incident,
             spirited = spiritedNow && styleDetector != null,
             spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
-            pressingOn = styleDetector?.isPressingOn ?: true,
+            pressingOn = alwaysSpeak || (styleDetector?.isPressingOn ?: true),
             hazardPrompt = activePrompt,
         )
     }
@@ -373,8 +384,8 @@ class DriveEngine(
 
         // QUIET MODE: pottering along, the co-driver shuts up. Speed cameras are the
         // exception and are always called — an alert you only get when pressing on is
-        // an alert you cannot rely on.
-        val quiet = !(styleDetector?.isPressingOn ?: true)
+        // an alert you cannot rely on. Turned off entirely by [alwaysSpeak].
+        val quiet = !alwaysSpeak && !(styleDetector?.isPressingOn ?: true)
 
         // Hazards first: they are short and urgent.
         for (hz in h.hazards) {

@@ -455,6 +455,49 @@ fun SettingsScreen(activity: MainActivity) {
     ) {
         Text("SETTINGS", color = Color.White, fontSize = 24.sp)
 
+        // ---- when does the co-driver talk? ----
+        var speakMode by remember { mutableStateOf(db.kvGet("speak_mode") ?: "smart") }
+        Text("When to call", color = Color(0xFFB8C4D0))
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            for ((key, title, sub) in listOf(
+                Triple("smart", "Only when I'm pressing on",
+                    "cruising stays quiet — speed cameras still called"),
+                Triple("always", "Every drive, all the time",
+                    "corners, hazards and cameras whenever you're moving"),
+            )) {
+                val selected = speakMode == key
+                Button(
+                    onClick = {
+                        speakMode = key
+                        db.kvPut("speak_mode", key)
+                        activity.driveService?.setAlwaysSpeak(key == "always")
+                    },
+                    modifier = Modifier.fillMaxWidth().height(58.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) Color(0xFF2EE06B) else Color(0xFF141C24),
+                    ),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+                ) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text(
+                            title, fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                            color = if (selected) Color.Black else Color(0xFFEAF0F6),
+                        )
+                        Text(
+                            sub, fontSize = 10.sp, maxLines = 1,
+                            color = if (selected) Color(0xCC06080B) else Color(0xFF7C8B9A),
+                        )
+                    }
+                }
+            }
+        }
+        Text(
+            "Speed cameras are always announced either way — an alert you only get " +
+                "sometimes is one you can't rely on.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
         // ---- voice level and where it comes out ----
         var vol by remember { mutableStateOf(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f) }
         var bal by remember { mutableStateOf(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f) }

@@ -181,6 +181,8 @@ class DriveService : Service() {
             knowledge = know,
             slowdown = slowMon,
         )
+        // "always" = call everything whenever driving; default = quiet unless pressing on.
+        engine.alwaysSpeak = db.kvGet("speak_mode") == "always"
 
         // IMU: surface roughness, pothole spikes, mount self-alignment and camber —
         // all tagged to the matched road bucket. No calibration step anywhere: the
@@ -269,6 +271,11 @@ class DriveService : Service() {
                 delay(100)
             }
         }
+    }
+
+    /** Live change of the quiet-mode setting; takes effect on the next tick. */
+    fun setAlwaysSpeak(always: Boolean) {
+        if (::engine.isInitialized) engine.alwaysSpeak = always
     }
 
     /** Live voice level/balance changes from the settings screen. */
