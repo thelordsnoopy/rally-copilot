@@ -43,6 +43,7 @@ for k, t in {
     "narrow_bridge": "narrow bridge", "gate": "gate", "level_crossing": "level crossing",
     "finish": "finish", "warn_temps": "temperatures rising, ease off",
     "warn_battery": "battery voltage low",
+    "warn_ice": "caution, possible ice",
     "gps_lost": "G P S lost", "gps_ok": "G P S restored",
 }.items():
     VOCAB[k] = t

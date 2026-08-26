@@ -24,6 +24,9 @@ object Elm327 {
         const val ACCEL_PEDAL_D = "0149"   // the real pedal signal on the E90 diesel
         const val ENGINE_LOAD = "0104"
         const val COOLANT = "0105"
+        const val MAP_KPA = "010B"
+        const val FUEL_LEVEL = "012F"
+        const val AMBIENT = "0146"
         const val VOLTAGE = "ATRV"
     }
 
@@ -94,6 +97,14 @@ object Elm327 {
     fun coolantC(raw: String): Int? =
         dataBytes(Pid.COOLANT, raw)?.getOrNull(0)?.let { it - 40 }
 
+    fun ambientC(raw: String): Int? =
+        dataBytes(Pid.AMBIENT, raw)?.getOrNull(0)?.let { it - 40 }
+
+    fun mapKpa(raw: String): Int? = dataBytes(Pid.MAP_KPA, raw)?.getOrNull(0)
+
+    fun fuelLevel01(raw: String): Double? =
+        dataBytes(Pid.FUEL_LEVEL, raw)?.getOrNull(0)?.let { it / 255.0 }
+
     /** ATRV → "12.6V" */
     fun batteryV(raw: String): Double? =
         Regex("([0-9]+\\.?[0-9]*)V?").find(clean(raw))?.groupValues?.get(1)?.toDoubleOrNull()
@@ -150,16 +161,19 @@ class GearInference {
     }
 }
 
-/** Coolant / voltage health watch with hysteresis so it warns once, calmly. */
+/** Coolant / voltage / ice health watch with hysteresis so each warns once, calmly. */
 class HealthWatch(
     private val coolantWarnC: Int = 108,
     private val voltageWarnV: Double = 12.0,
+    /** Road frost risk well above freezing — bridges and shade freeze first. */
+    private val iceWarnC: Int = 4,
 ) {
     private var coolantWarned = false
     private var voltageWarned = false
+    private var iceWarned = false
 
     /** Returns a warning clip key when a threshold is newly crossed, else null. */
-    fun check(coolantC: Int?, batteryV: Double?): String? {
+    fun check(coolantC: Int?, batteryV: Double?, ambientC: Int? = null): String? {
         if (coolantC != null) {
             if (coolantC >= coolantWarnC && !coolantWarned) { coolantWarned = true; return "warn_temps" }
             if (coolantC < coolantWarnC - 6) coolantWarned = false
@@ -167,6 +181,10 @@ class HealthWatch(
         if (batteryV != null) {
             if (batteryV < voltageWarnV && !voltageWarned) { voltageWarned = true; return "warn_battery" }
             if (batteryV > voltageWarnV + 0.4) voltageWarned = false
+        }
+        if (ambientC != null) {
+            if (ambientC <= iceWarnC && !iceWarned) { iceWarned = true; return "warn_ice" }
+            if (ambientC > iceWarnC + 2) iceWarned = false
         }
         return null
     }

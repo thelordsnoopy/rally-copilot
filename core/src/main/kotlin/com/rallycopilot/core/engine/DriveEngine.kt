@@ -13,6 +13,7 @@ import com.rallycopilot.core.model.RunEvent
 import com.rallycopilot.core.model.RunEventType
 import com.rallycopilot.core.model.Utterance
 import com.rallycopilot.core.profile.ObservationCollector
+import com.rallycopilot.core.obd.HealthWatch
 import com.rallycopilot.core.profile.StyleDetector
 import com.rallycopilot.core.report.IncidentDetector
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,6 +38,7 @@ class DriveEngine(
     private val collector: ObservationCollector? = null,
     private val incidentDetector: IncidentDetector? = null,
     val styleDetector: StyleDetector? = null,
+    private val healthWatch: HealthWatch? = null,
 ) {
     data class Params(
         val maxAccuracyM: Double = 25.0,
@@ -163,6 +165,15 @@ class DriveEngine(
         if (incident) runLog.logEvent(RunEvent(now, RunEventType.INCIDENT_SUSPECTED))
 
         val gear = vehicle.currentGear()
+
+        // Health watch: coolant, battery, ambient/ice. One calm warning per crossing,
+        // never interrupting a pacenote.
+        healthWatch?.check(vehicle.coolantC(), vehicle.batteryV(), vehicle.ambientC())?.let { key ->
+            if (!audio.isSpeaking()) {
+                audio.play(Utterance(listOf(key), urgent = false, deadlineDistanceM = 0.0, forCornerId = null))
+                runLog.logEvent(RunEvent(now, RunEventType.HEALTH_WARNING, key))
+            }
+        }
 
         if (h == null || !gpsOk) {
             _hud.value = HudState(

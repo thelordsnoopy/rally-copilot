@@ -108,6 +108,7 @@ class DriveService : Service() {
             collector = collector,
             incidentDetector = IncidentDetector(),
             styleDetector = StyleDetector(),
+            healthWatch = com.rallycopilot.core.obd.HealthWatch(),
         )
 
         voice.requestFocus()
@@ -115,7 +116,18 @@ class DriveService : Service() {
         if (isDemo) startDemo(map) else {
             startGps()
             // Bonded-device access needs BLUETOOTH_CONNECT; never let a denial kill the drive.
-            runCatching { obd.findBonded()?.let { obd.connect(it) } }
+            runCatching {
+                // User-selected dongle wins; otherwise guess by name.
+                val mac = db.kvGet("obd_mac") ?: obd.findBonded()
+                if (mac != null) {
+                    // Per-dongle PID cache: no rescan on every connect.
+                    val cached = db.kvGet("obd_pids_" + mac)
+                        ?.split(",")?.mapNotNull { it.toIntOrNull() }?.toSet()
+                    obd.connect(mac, cached) { scanned ->
+                        db.kvPut("obd_pids_" + mac, scanned.joinToString(","))
+                    }
+                }
+            }
         }
 
         // Tick loop at 10 Hz: dead reckoning, trigger checks, HUD state.

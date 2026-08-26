@@ -62,6 +62,10 @@ interface VehicleData {
     fun coolantC(): Int?
     fun batteryV(): Double?
     fun currentGear(): Int?
+    fun ambientC(): Int?
+    /** Intake manifold pressure, kPa — boost readout on a turbo car. */
+    fun mapKpa(): Int?
+    fun fuelLevel01(): Double?
 }
 
 object NullVehicleData : VehicleData {
@@ -71,4 +75,7 @@ object NullVehicleData : VehicleData {
     override fun coolantC(): Int? = null
     override fun batteryV(): Double? = null
     override fun currentGear(): Int? = null
+    override fun ambientC(): Int? = null
+    override fun mapKpa(): Int? = null
+    override fun fuelLevel01(): Double? = null
 }

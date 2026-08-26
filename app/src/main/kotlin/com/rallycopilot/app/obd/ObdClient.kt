@@ -32,6 +32,9 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     @Volatile private var throttleV: Double? = null
     @Volatile private var coolantV: Int? = null
     @Volatile private var batteryVv: Double? = null
+    @Volatile private var ambientV: Int? = null
+    @Volatile private var mapV: Int? = null
+    @Volatile private var fuelV: Double? = null
     @Volatile var connected = false
         private set
 
@@ -44,7 +47,16 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
         }?.address
     }
 
-    fun connect(address: String) {
+    /**
+     * [cachedPids]: supported-PID set remembered for this dongle — skips the scan.
+     * [onPidsScanned]: called with the fresh set when a scan does run, so the caller
+     * can persist it.
+     */
+    fun connect(
+        address: String,
+        cachedPids: Set<Int>? = null,
+        onPidsScanned: (Set<Int>) -> Unit = {},
+    ) {
         disconnect()
         job = scope.launch(Dispatchers.IO) {
             try {
@@ -75,29 +87,47 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
 
                 for (init in Elm327.INIT) { cmd(init); Thread.sleep(80) }
 
-                // Probe supported PIDs. If CAN (ATSP6) got nothing, fall back to auto
-                // protocol detection once — covers pre-CAN cars and odd clones.
-                var supported = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
-                if (supported.isEmpty()) {
-                    cmd(Elm327.FALLBACK_PROTOCOL); Thread.sleep(120)
-                    supported = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                // Supported PIDs: use the remembered set for this dongle if we have one;
+                // otherwise probe once (with protocol fallback) and hand the result back
+                // for persistence.
+                var supported = cachedPids
+                if (supported.isNullOrEmpty()) {
+                    var scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                    if (scanned.isEmpty()) {
+                        cmd(Elm327.FALLBACK_PROTOCOL); Thread.sleep(120)
+                        scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                    }
+                    scanned = scanned + Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60))
+                    if (scanned.isNotEmpty()) onPidsScanned(scanned)
+                    supported = scanned
                 }
-                supported = supported + Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60))
                 // On the E90 320d PID 0x11 is meaningless; 0x49 (accel pedal D) is the
                 // real signal. Pick the best one the ECU actually reports.
                 val pedalPid = Elm327.bestPedalPid(supported)
+                // No pedal PID at all? Engine load is a workable proxy for commitment.
+                val loadFallback = pedalPid == null && 0x04 in supported
+                val hasAmbient = 0x46 in supported
+                val hasMap = 0x0B in supported
+                val hasFuel = 0x2F in supported
                 connected = true
 
                 var slowTick = 0
                 while (isActive && socket === s) {
                     speedKph = Elm327.speedKph(cmd(Elm327.Pid.SPEED))
                     rpmV = Elm327.rpm(cmd(Elm327.Pid.RPM))
-                    throttleV = pedalPid?.let { Elm327.percent01(it, cmd(it)) }
+                    throttleV = when {
+                        pedalPid != null -> Elm327.percent01(pedalPid, cmd(pedalPid))
+                        loadFallback -> Elm327.percent01(Elm327.Pid.ENGINE_LOAD, cmd(Elm327.Pid.ENGINE_LOAD))
+                        else -> null
+                    }
+                    if (hasMap) mapV = Elm327.mapKpa(cmd(Elm327.Pid.MAP_KPA))
                     val r = rpmV; val sp = speedKph
                     if (r != null && sp != null) gearInference.addSample(r, sp / 3.6)
-                    if (slowTick++ % 20 == 0) { // coolant/voltage every ~20 cycles
+                    if (slowTick++ % 20 == 0) { // slow-changing values every ~20 cycles
                         coolantV = Elm327.coolantC(cmd(Elm327.Pid.COOLANT))
                         batteryVv = Elm327.batteryV(cmd(Elm327.Pid.VOLTAGE))
+                        if (hasAmbient) ambientV = Elm327.ambientC(cmd(Elm327.Pid.AMBIENT))
+                        if (hasFuel) fuelV = Elm327.fuelLevel01(cmd(Elm327.Pid.FUEL_LEVEL))
                     }
                     delay(120)
                 }
@@ -128,4 +158,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
         val s = speedKph ?: return null
         return gearInference.currentGear(r, s / 3.6)
     }
+    override fun ambientC(): Int? = ambientV
+    override fun mapKpa(): Int? = mapV
+    override fun fuelLevel01(): Double? = fuelV
 }

@@ -386,14 +386,15 @@ fun SettingsScreen(activity: MainActivity) {
     var verbosity by remember { mutableStateOf(db.kvGet("verbosity") ?: "all") }
     var cap by remember { mutableStateOf(db.kvGet("capG")?.toFloatOrNull() ?: 0f) }
     Column(
-        Modifier.fillMaxSize().background(Color(0xFF0B0F14)).padding(20.dp),
+        Modifier.fillMaxSize().background(Color(0xFF0B0F14))
+            .verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text("SETTINGS", color = Color.White, fontSize = 24.sp)
 
         Text("Verbosity", color = Color(0xFFB8C4D0))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            for ((key, label) in listOf("all" to "Everything", "tight" to "4+ only", "min" to "Cautions")) {
+            for ((key, label) in listOf("all" to "Everything", "tight" to "4+ only", "min" to "Min")) {
                 Button(
                     onClick = { verbosity = key; db.kvPut("verbosity", key) },
                     colors = ButtonDefaults.buttonColors(
@@ -418,10 +419,75 @@ fun SettingsScreen(activity: MainActivity) {
                 inactiveTrackColor = Color(0xFF232D38),
             ),
         )
+        // ---- OBD dongle selection ----
+        Text("OBD dongle", color = Color(0xFFB8C4D0))
+        val selectedMac = remember { mutableStateOf(db.kvGet("obd_mac")) }
+        val bonded = remember {
+            runCatching {
+                android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+                    ?.bondedDevices?.map { (it.name ?: "unknown") to it.address }.orEmpty()
+            }.getOrDefault(emptyList())
+        }
+        if (bonded.isEmpty()) {
+            Text(
+                "No paired Bluetooth devices visible — pair the ELM327 in system Bluetooth " +
+                    "settings first (or grant the Nearby devices permission).",
+                color = Color(0xFF667788), fontSize = 12.sp,
+            )
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            // Auto option
+            Button(
+                onClick = {
+                    selectedMac.value = null
+                    db.writableDatabase.execSQL("DELETE FROM kv WHERE key='obd_mac'")
+                },
+                modifier = Modifier.fillMaxWidth().height(46.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (selectedMac.value == null) Color(0xFF2EE06B) else Color(0xFF141C24),
+                ),
+            ) {
+                Text(
+                    "Auto-detect (by device name)", fontSize = 13.sp,
+                    color = if (selectedMac.value == null) Color.Black else Color(0xFFB8C4D0),
+                )
+            }
+            for ((name, mac) in bonded) {
+                val selected = selectedMac.value == mac
+                Button(
+                    onClick = { selectedMac.value = mac; db.kvPut("obd_mac", mac) },
+                    modifier = Modifier.fillMaxWidth().height(46.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) Color(0xFF2EE06B) else Color(0xFF141C24),
+                    ),
+                ) {
+                    Text(
+                        "$name · $mac", fontSize = 13.sp,
+                        color = if (selected) Color.Black else Color(0xFFB8C4D0),
+                    )
+                }
+            }
+            selectedMac.value?.let { mac ->
+                Button(
+                    onClick = {
+                        db.writableDatabase.execSQL("DELETE FROM kv WHERE key=?", arrayOf("obd_pids_$mac"))
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232D38)),
+                ) { Text("Rescan car PIDs on next connect", fontSize = 12.sp, color = Color(0xFFB8C4D0)) }
+                Text(
+                    if (db.kvGet("obd_pids_$mac") != null)
+                        "PIDs remembered for this car — connects instantly"
+                    else "PIDs will be scanned once on next connect, then remembered",
+                    color = Color(0xFF667788), fontSize = 11.sp,
+                )
+            }
+        }
+
         Text(
             "Suggested speeds are advisory. They come from map geometry that can be wrong, " +
                 "and know nothing about surface, camber, weather or traffic. Your eyes win.",
             color = Color(0xFF667788), fontSize = 12.sp,
         )
+        Spacer(Modifier.height(20.dp))
     }
 }
