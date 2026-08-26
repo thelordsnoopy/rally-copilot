@@ -88,8 +88,35 @@ CREST_MIN_GRADE_CHANGE = 0.08
 CREST_WINDOW_M = 60.0              # measured either side of the summit
 RESAMPLE_M = 5.0
 STRAIGHT_RADIUS_M = 500.0   # above this, treat as straight
-MIN_CORNER_POINTS = 2
 MERGE_GAP_M = 15.0          # merge same-sign corner runs separated by less than this
+
+# Curvature baseline: the half-width, in metres, of the chord used for the
+# circumscribed-circle fit.
+#
+# THIS IS THE MOST IMPORTANT NUMBER IN THE FILE. Curvature must never be measured
+# at the resample step. Resampling to 5 m does not add information: OSM ways are
+# polylines whose real vertices sit 10-100 m apart, so a 5 m resample drops two or
+# three points INSIDE each straight chord. Three consecutive points then either lie
+# exactly on one chord (collinear, infinite radius) or straddle a vertex, where the
+# entire turn angle of that vertex is concentrated into one 10 m triangle and reads
+# as a hairpin. A true 200 m sweeper came out as a comb of "straight, straight,
+# 9 m hairpin, straight" — and because severity was taken from the MINIMUM radius
+# in a run, the artefact won every time.
+#
+# Measuring across a chord wider than the source node spacing averages the turn
+# back over the geometry that actually produced it.
+CURV_BASELINE_M = 20.0
+CURV_BASELINE_MAX_M = 45.0
+# Below this radius the wide fit is re-checked against a short 10 m chord — see
+# the two-scale note in extract_corners. Hairpins are the calls that matter most
+# and the wide baseline alone reads them a few percent gentle.
+TIGHT_REFIT_BELOW_M = 30.0
+# A corner must span at least this much road. Below it there is no evidence a
+# corner exists, only digitisation noise.
+MIN_CORNER_ARC_M = 15.0
+# Severity comes from this percentile of the radii in a run, not the raw minimum:
+# one residual spike must not set the band for the whole corner.
+MIN_RADIUS_PCTL = 0.15
 EARTH_R = 6_371_000.0
 
 
@@ -158,6 +185,15 @@ def circumradius(a, b, c):
     return r, (1 if cross > 0 else -1)
 
 
+def _pctl(sorted_vals, p):
+    if not sorted_vals:
+        return float("inf")
+    i = p * (len(sorted_vals) - 1)
+    lo = sorted_vals[int(i)]
+    hi = sorted_vals[min(int(i) + 1, len(sorted_vals) - 1)]
+    return lo + (hi - lo) * (i - int(i))
+
+
 def extract_corners(latlons, source_node_count):
     """Return corner dicts for one edge geometry (already smoothed+resampled)."""
     if len(latlons) < 3:
@@ -168,28 +204,63 @@ def extract_corners(latlons, source_node_count):
     for i in range(1, len(latlons)):
         cum.append(cum[-1] + haversine(latlons[i - 1], latlons[i]))
 
-    # curvature per interior point
+    # Curvature baseline, in samples. Widened for coarsely-digitised ways: a lane
+    # with a node every 80 m cannot support a fit across a 20 m chord, because
+    # every chord shorter than the node spacing is measuring digitisation, not road.
+    total_len = cum[-1] if cum[-1] > 0 else 1.0
+    spacing = total_len / max(1, source_node_count - 1)
+    baseline_m = min(CURV_BASELINE_MAX_M, max(CURV_BASELINE_M, 1.2 * spacing))
+    k = max(2, int(round(baseline_m / RESAMPLE_M)))
+
+    # Curvature across a chord of +/-k samples. Near the ends the window shortens
+    # symmetrically rather than vanishing — corners sit at edge starts constantly,
+    # because edges are split at junctions and a bend usually follows one.
+    # Two scales. The wide baseline is the honest one for open bends, but it
+    # averages a genuine hairpin against the straights either side and reads it a
+    # few percent gentle. A tight corner can afford a short chord: at R = 12 m a
+    # 10 m chord bulges a full metre, well clear of digitisation error, whereas at
+    # R = 200 m it bulges 3 cm and measures nothing but noise. So: fit wide, and
+    # where that says the corner is tight, re-fit narrow and believe the narrow one.
+    k_tight = max(2, int(round(10.0 / RESAMPLE_M)))
     pts = []  # (offset_m, radius, sign)
-    for i in range(1, len(xy) - 1):
-        r, sign = circumradius(xy[i - 1], xy[i], xy[i + 1])
+    n = len(xy)
+    for i in range(1, n - 1):
+        kk = min(k, i, n - 1 - i)
+        if kk < 2:  # under a 10 m chord there is no signal worth reading
+            continue
+        r, sign = circumradius(xy[i - kk], xy[i], xy[i + kk])
+        if r < TIGHT_REFIT_BELOW_M:
+            kt = min(k_tight, i, n - 1 - i)
+            if kt >= 2:
+                r2, sign2 = circumradius(xy[i - kt], xy[i], xy[i + kt])
+                # Only where the two scales agree on direction — a sign flip means
+                # the short chord has landed on noise, and the wide fit stands.
+                if sign2 == sign and r2 < TIGHT_REFIT_BELOW_M:
+                    r = r2
         pts.append((cum[i], r, sign))
 
     # segment into same-sign sub-threshold runs
     corners = []
     run = []
     def close_run(run):
-        if len(run) < MIN_CORNER_POINTS:
-            return None
         offs = [p[0] for p in run]
+        arc = offs[-1] - offs[0]
+        if arc < MIN_CORNER_ARC_M:
+            return None
         radii = [p[1] for p in run]
         third = max(1, len(radii) // 3)
+        # Severity from a low percentile, not the raw minimum: robust to a single
+        # residual spike, while still reporting the tight part of the corner.
+        min_r = _pctl(sorted(radii), MIN_RADIUS_PCTL)
+        # Apex = where the radius is closest to that representative value.
+        apex_i = min(range(len(radii)), key=lambda j: abs(radii[j] - min_r))
         return {
             "start": offs[0], "end": offs[-1],
-            "apex": offs[radii.index(min(radii))],
-            "min_r": min(radii),
+            "apex": offs[apex_i],
+            "min_r": min_r,
             "entry_r": sum(radii[:third]) / third,
             "exit_r": sum(radii[-third:]) / third,
-            "arc": offs[-1] - offs[0],
+            "arc": arc,
             "dir": "LEFT" if run[0][2] > 0 else "RIGHT",
         }
 

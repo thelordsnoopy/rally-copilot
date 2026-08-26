@@ -85,14 +85,44 @@ not exist.
 1. **Smooth** the way geometry with a cubic B-spline / Chaikin pass, weighted by node
    spacing.
 2. **Resample** to uniform ~5 m spacing.
-3. **Compute curvature** κ at each point via the circumscribed circle of (p−1, p, p+1);
-   radius `R = 1/κ`.
-4. **Segment into corners** — runs of consecutive points where `R` is below the
+3. **Compute curvature** κ at each point via the circumscribed circle of
+   (p−k, p, p+k), where the chord half-width `k × 5 m` is **~20 m, widened toward
+   45 m on coarsely digitised ways** — never the resample step itself.
+
+   > **This is the load-bearing detail, learned the hard way (v0.13).** Measuring
+   > across (p−1, p, p+1) at 5 m spacing does not measure the road, it measures the
+   > digitisation. OSM vertices sit 10–100 m apart, so a 5 m resample drops two or
+   > three points *inside* each straight chord: consecutive triples are either
+   > exactly collinear (infinite radius) or straddle a vertex, where that vertex's
+   > entire turn angle piles into one 10 m triangle and reads as a hairpin. A true
+   > 200 m sweeper came out as "straight, straight, 9 m hairpin, straight". Because
+   > severity was taken from the **minimum** radius in a run, the artefact set the
+   > band every time — 5,918 phantom hairpins shipped in the Stroud region, 79% of
+   > them on residential estate roads. Sagitta is why: across a 10 m chord a 200 m
+   > bend bulges 3 cm, far under OSM's positional error, while a 12 m hairpin bulges
+   > a full metre. So gentle curvature needs a wide chord to exist at all, and tight
+   > curvature can afford a short one — hence the two-scale fit below.
+
+4. **Re-fit tight corners at a short baseline.** Where the wide fit reads below 30 m,
+   re-measure across a 10 m chord and accept it when both scales agree on direction.
+   The wide baseline averages a genuine hairpin against the straights either side and
+   reads it a few percent gentle; hairpins are the calls that matter most.
+
+5. **Severity from a low percentile, never the raw minimum.** `min_r` is the 15th
+   percentile of the radii in a run, so one residual spike cannot set the band for a
+   whole corner. A corner must also span ≥15 m of road: below that there is no
+   evidence a corner exists, only noise.
+6. **Segment into corners** — runs of consecutive points where `R` is below the
    straight-road threshold and the sign of κ is consistent. Merge runs separated by short
    straights; split where the sign flips.
-5. **Score confidence** per corner from original node density and geometry
+7. **Score confidence** per corner from original node density and geometry
    self-consistency. Low-confidence corners get suppressed or softened at runtime rather
    than called with false precision.
+
+`tools/mapbuild/test_corners.py` holds the detector to this: synthetic
+straight→arc→straight roads whose radius is known by construction, from 8 m
+hairpins to 300 m sweepers, at node spacings from 3 m to 60 m. Every case must come
+back within ~10% **and as exactly one corner**. Run it before shipping a map.
 
 Store the result. Never do spline fitting on the phone in real time.
 
