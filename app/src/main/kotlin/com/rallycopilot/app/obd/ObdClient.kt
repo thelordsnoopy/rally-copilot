@@ -32,13 +32,15 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
         private set
     @Volatile var attempts: Int = 0
         private set
+    /** What the handshake is doing right now, so a slow dongle looks slow, not stuck. */
+    @Volatile private var detail: String? = null
     /** Human-readable one-liner: exactly what is happening with the dongle. */
     val statusText: String
         get() = when (state) {
             State.OFF -> "not in use"
             State.NO_DEVICE -> lastError ?: "no dongle paired - pair the ELM327 in Bluetooth settings"
             State.CONNECTING -> "connecting to dongle..."
-            State.HANDSHAKING -> "talking to the car..."
+            State.HANDSHAKING -> "talking to the car" + (detail?.let { " - $it" } ?: "...")
             State.LIVE -> "live" + (vin?.let { " - VIN $it" } ?: "")
             State.NO_DATA -> "dongle connected, but the car isn't answering - " +
                 "check the ignition is on (engine running is safest)"
@@ -48,6 +50,9 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
 
     /** The link came up but the ECU never answered — distinct from an IO failure. */
     private class SilentEcu : Exception("car not answering")
+
+    /** Wall-clock budget for init + VIN + PID scan + probe, including one fallback. */
+    private val SETUP_BUDGET_MS = 30_000L
 
     private val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     @Volatile private var socket: BluetoothSocket? = null
@@ -137,12 +142,35 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 val out = s.outputStream
                 val inp = s.inputStream
 
+                // The whole handshake gets a wall-clock budget. Bluetooth streams cannot
+                // be given read timeouts, so without this a dongle that goes quiet
+                // mid-setup leaves the app sitting on "talking to the car" forever
+                // instead of failing and retrying.
+                val setupDeadline = System.currentTimeMillis() + SETUP_BUDGET_MS
+                // ...but ONLY during setup. The same cmd() runs the polling loop for
+                // the rest of the drive, where a fixed deadline would kill a perfectly
+                // healthy link after thirty seconds.
+                var setupPhase = true
+
                 // One command in flight at a time. CRITICAL: drain stale bytes BEFORE
                 // writing — a response that outlived its deadline (ATZ takes ~1 s on
                 // genuine ELMs) otherwise leaves its tail + '>' in the stream and every
                 // later command reads the PREVIOUS command's answer, forever.
                 fun cmd(c: String, timeoutMs: Long = 900): String {
-                    while (inp.available() > 0) inp.read()
+                    if (setupPhase && System.currentTimeMillis() > setupDeadline) {
+                        throw java.io.IOException("dongle stopped responding during setup")
+                    }
+                    // BOUNDED drain: a chatty clone can hold available() above zero
+                    // indefinitely, and an unbounded drain here hangs the connection
+                    // on "talking to the car" with no way out.
+                    val drainUntil = System.currentTimeMillis() + 250
+                    var drained = 0
+                    while (inp.available() > 0 && drained < 4096 &&
+                        System.currentTimeMillis() < drainUntil
+                    ) {
+                        if (inp.read() < 0) break
+                        drained++
+                    }
                     out.write((c + "\r").toByteArray())
                     out.flush()
                     val sb = StringBuilder()
@@ -160,13 +188,15 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 }
 
                 // ATZ resets the chip and is the slowest command it has.
-                for (init in Elm327.INIT) {
+                for ((i, init) in Elm327.INIT.withIndex()) {
+                    detail = "setup ${i + 1}/${Elm327.INIT.size}"
                     cmd(init, if (init == "ATZ") 2500 else 1200)
                     Thread.sleep(80)
                 }
 
                 // Car identity first: VIN via mode 09 when supported. The PID cache then
                 // follows the CAR (swap dongles freely); dongle MAC is the fallback key.
+                detail = "reading VIN"
                 vin = Elm327.vin(cmd(Elm327.Pid.VIN, 1500))
                 val cacheKey = vin?.let { "vin:" + it } ?: ("mac:" + address)
                 // Gearing follows the car: restore it before the first sample so gear
@@ -175,6 +205,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
 
                 var supported = loadCache(cacheKey)
                 if (supported.isNullOrEmpty()) {
+                    detail = "asking what the car supports"
                     var scanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20, 1500))
                     if (scanned.isEmpty()) {
                         cmd(Elm327.FALLBACK_PROTOCOL, 1200); Thread.sleep(120)
@@ -196,6 +227,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 // "connected" here without checking is how the settings screen ends up
                 // claiming live while no data ever arrives.
                 fun probe(): Boolean {
+                    detail = "reading engine data"
                     val sp = Elm327.speedKph(cmd(Elm327.Pid.SPEED, 1200))
                     val rp = Elm327.rpm(cmd(Elm327.Pid.RPM, 1200))
                     if (sp != null) speedKph = sp
@@ -207,6 +239,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 if (!alive) {
                     // Wrong protocol or a stale cache: drop to auto-detect and rescan
                     // from scratch rather than politely polling a silent bus forever.
+                    detail = "trying protocol auto-detect"
                     cmd(Elm327.FALLBACK_PROTOCOL, 1500); Thread.sleep(200)
                     val rescanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20, 1500)) +
                         Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60, 1500))
@@ -236,6 +269,8 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 connected = true
                 state = State.LIVE
                 lastError = null
+                detail = null
+                setupPhase = false
 
                 var dryCycles = 0
                 var slowTick = 0
