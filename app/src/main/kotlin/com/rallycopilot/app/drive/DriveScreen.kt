@@ -335,10 +335,13 @@ private fun InstrumentBar(hud: DriveEngine.HudState?, modifier: Modifier) {
         // status chips
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             // The speed source is never left implicit: whichever one the number on
-            // the left came from is the one lit green.
+            // the left came from is the one lit green. The OBD light tracks DATA,
+            // not the Bluetooth link — a connected dongle with a silent car is
+            // amber at best, never green.
             val fromObd = hud?.speedFromObd == true
             Chip("GPS", if (hud?.gpsOk != true) Red else if (fromObd) InkDim else Green)
             Chip("OBD", if (fromObd) Green else if (hud?.obdConnected == true) Amber else InkDim)
+            if (hud?.obdSilent == true) Chip("NO CAR DATA", Amber)
             // Quiet mode is a deliberate silence, so say so — the driver must never
             // wonder whether the co-driver has died. Keep labels SHORT: this row
             // shares one line with a 58sp speed readout.

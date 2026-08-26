@@ -66,6 +66,13 @@ interface VehicleData {
     /** Intake manifold pressure, kPa — boost readout on a turbo car. */
     fun mapKpa(): Int?
     fun fuelLevel01(): Double?
+
+    /**
+     * True when a link to the car exists but no data is coming back (ignition off,
+     * ECU asleep, wrong protocol). "Connected" and "working" are not the same thing,
+     * and the HUD must be able to tell them apart.
+     */
+    fun linkSilent(): Boolean = false
 }
 
 object NullVehicleData : VehicleData {

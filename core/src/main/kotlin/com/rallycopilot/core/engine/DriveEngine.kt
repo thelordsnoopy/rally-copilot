@@ -109,6 +109,9 @@ class DriveEngine(
         val obdConnected: Boolean = false,
         /** True when the displayed speed came from the car, false when from GPS. */
         val speedFromObd: Boolean = false,
+        /** Dongle link is up but the car is not answering — worth saying out loud,
+         *  because "connected" and "working" are not the same thing. */
+        val obdSilent: Boolean = false,
         val gear: Int? = null,
         val incidentSuspected: Boolean = false,
         /** Strict verdict — gates learning. */
@@ -278,7 +281,8 @@ class DriveEngine(
         if (h == null || !gpsOk) {
             _hud.value = HudState(
                 matched = lastMatch, horizon = null, speedMps = speed,
-                gpsOk = gpsOk, obdConnected = vehicle.rpm() != null, speedFromObd = usingObdSpeed, gear = gear,
+                gpsOk = gpsOk, obdConnected = vehicle.rpm() != null, speedFromObd = usingObdSpeed,
+                obdSilent = vehicle.linkSilent(), gear = gear,
                 incidentSuspected = incident,
                 spirited = styleDetector?.isSpirited ?: false,
                 spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
@@ -388,6 +392,7 @@ class DriveEngine(
             gpsOk = true,
             obdConnected = vehicle.rpm() != null,
             speedFromObd = usingObdSpeed,
+            obdSilent = vehicle.linkSilent(),
             gear = gear,
             incidentSuspected = incident,
             spirited = spiritedNow && styleDetector != null,

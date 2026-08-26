@@ -23,7 +23,7 @@ import java.util.UUID
 class ObdClient(private val scope: CoroutineScope) : VehicleData {
 
     /** What the OBD link is doing, in words the settings screen can show. */
-    enum class State { OFF, NO_DEVICE, CONNECTING, HANDSHAKING, LIVE, RETRYING, FAILED }
+    enum class State { OFF, NO_DEVICE, CONNECTING, HANDSHAKING, LIVE, NO_DATA, RETRYING, FAILED }
 
     @Volatile var state: State = State.OFF
         private set
@@ -40,9 +40,14 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
             State.CONNECTING -> "connecting to dongle..."
             State.HANDSHAKING -> "talking to the car..."
             State.LIVE -> "live" + (vin?.let { " - VIN $it" } ?: "")
+            State.NO_DATA -> "dongle connected, but the car isn't answering - " +
+                "check the ignition is on (engine running is safest)"
             State.RETRYING -> "retrying (attempt $attempts)" + (lastError?.let { " - last: $it" } ?: "")
             State.FAILED -> lastError ?: "failed"
         }
+
+    /** The link came up but the ECU never answered — distinct from an IO failure. */
+    private class SilentEcu : Exception("car not answering")
 
     private val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     @Volatile private var socket: BluetoothSocket? = null
@@ -105,6 +110,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
           while (isActive && generation == myGen) {
             attempts++
             var s: BluetoothSocket? = null
+            var silentEcu = false
             try {
                 val adapter = BluetoothAdapter.getDefaultAdapter()
                 if (adapter == null) { state = State.NO_DEVICE; lastError = "no Bluetooth adapter"; return@launch }
@@ -174,6 +180,36 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                     }
                     supported = scanned
                 }
+                // Does the car actually ANSWER? A completed handshake only proves the
+                // dongle is talking. The ECU may be asleep, the forced protocol may be
+                // wrong for this car, or a cached PID set may be stale — and declaring
+                // "connected" here without checking is how the settings screen ends up
+                // claiming live while no data ever arrives.
+                fun probe(): Boolean {
+                    val sp = Elm327.speedKph(cmd(Elm327.Pid.SPEED, 1200))
+                    val rp = Elm327.rpm(cmd(Elm327.Pid.RPM, 1200))
+                    if (sp != null) speedKph = sp
+                    if (rp != null) rpmV = rp
+                    return sp != null || rp != null
+                }
+
+                var alive = probe()
+                if (!alive) {
+                    // Wrong protocol or a stale cache: drop to auto-detect and rescan
+                    // from scratch rather than politely polling a silent bus forever.
+                    cmd(Elm327.FALLBACK_PROTOCOL, 1500); Thread.sleep(200)
+                    val rescanned = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20, 1500)) +
+                        Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60, 1500))
+                    if (rescanned.isNotEmpty()) {
+                        supported = rescanned
+                        runCatching { saveCache(cacheKey, rescanned) }
+                    }
+                    alive = probe()
+                }
+                if (!alive) throw SilentEcu()
+
+                // Derived AFTER the probe: a failed probe can rescan and replace the
+                // supported set, and these flags must describe the set we ended up with.
                 // On the E90 320d PID 0x11 is meaningless; 0x49 (accel pedal D) is the
                 // real signal. Pick the best one the ECU actually reports.
                 val pedalPid = Elm327.bestPedalPid(supported)
@@ -186,10 +222,12 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 val hasAmbient = 0x46 in supported
                 val hasMap = 0x0B in supported
                 val hasFuel = 0x2F in supported
+
                 connected = true
                 state = State.LIVE
                 lastError = null
 
+                var dryCycles = 0
                 var slowTick = 0
                 while (isActive && generation == myGen && socket === s) {
                     speedKph = Elm327.speedKph(cmd(Elm327.Pid.SPEED))
@@ -204,6 +242,10 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                     if (hasMap) mapV = Elm327.mapKpa(cmd(Elm327.Pid.MAP_KPA))
                     val r = rpmV; val sp = speedKph
                     if (r != null && sp != null) gearInference.addSample(r, sp / 3.6)
+                    // The link can stay open while the car stops answering (ignition
+                    // off, ECU asleep). Notice, rather than reporting "live" forever.
+                    if (r == null && sp == null) dryCycles++ else dryCycles = 0
+                    if (dryCycles >= 40) throw SilentEcu()
                     if (slowTick++ % 20 == 0) { // slow-changing values every ~20 cycles
                         coolantV = Elm327.coolantC(cmd(Elm327.Pid.COOLANT))
                         batteryVv = Elm327.batteryV(cmd(Elm327.Pid.VOLTAGE))
@@ -217,10 +259,14 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                     delay(120)
                 }
             } catch (e: Exception) {
-                lastError = when (e) {
-                    is java.io.IOException -> e.message?.take(60) ?: "connect failed"
-                    is SecurityException -> "Bluetooth permission denied"
-                    else -> e.message?.take(60) ?: e.javaClass.simpleName
+                if (e is SilentEcu) {
+                    silentEcu = true
+                } else {
+                    lastError = when (e) {
+                        is java.io.IOException -> e.message?.take(60) ?: "connect failed"
+                        is SecurityException -> "Bluetooth permission denied"
+                        else -> e.message?.take(60) ?: e.javaClass.simpleName
+                    }
                 }
             } finally {
                 // Save whatever gearing was learned before the link dropped.
@@ -236,7 +282,10 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
             }
             if (!isActive || generation != myGen) break
             // Back off gently, capped, so a missing dongle costs almost nothing.
-            state = State.RETRYING
+            // A silent ECU keeps its own status: "retrying" would hide the one fact
+            // that actually tells the driver what to do (turn the ignition on).
+            state = if (silentEcu) State.NO_DATA else State.RETRYING
+            if (silentEcu) lastError = null
             delay(when {
                 attempts < 3 -> 3_000L
                 attempts < 6 -> 8_000L
@@ -268,6 +317,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
         val s = speedKph ?: return null
         return gearInference.currentGear(r, s / 3.6)
     }
+    override fun linkSilent(): Boolean = state == State.NO_DATA
     override fun ambientC(): Int? = ambientV
     override fun mapKpa(): Int? = mapV
     override fun fuelLevel01(): Double? = fuelV
