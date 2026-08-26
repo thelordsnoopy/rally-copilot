@@ -27,6 +27,9 @@ class Advisor(
     var camberLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double?)? = null,
     /** Gear suggestion for a target speed (learned from OBD). Null = no gear calls. */
     var gearLookup: ((vTargetMps: Double) -> Int?)? = null,
+    /** Radius audit: what YOUR measured cornering says about this corner's mapped
+     *  radius. Corrections only tighten; single-pass mismatches hedge the call. */
+    var radiusAuditLookup: ((cornerId: Long) -> com.rallycopilot.core.knowledge.RadiusAuditor.Advice?)? = null,
 ) {
     data class Params(
         /** Comfortable but firm braking on the road, m/s². */
@@ -73,11 +76,14 @@ class Advisor(
 
     val params = Params()
 
-    fun vTargetFor(corner: Corner, band: SeverityBand): Double {
+    fun vTargetFor(corner: Corner, band: SeverityBand): Double =
+        vTargetFor(corner.minRadiusM, band)
+
+    fun vTargetFor(radiusM: Double, band: SeverityBand): Double {
         // No conditions multiplier here: dry and wet are separate learned profiles,
         // and the wet profile seeds lower. Multiplying again would double-penalise.
         val aLat = profile.aLatFor(band) * profile.pushFactor
-        val v = sqrt(aLat * corner.minRadiusM)
+        val v = sqrt(aLat * radiusM)
         return v.coerceAtMost(params.userMaxMps)
     }
 
@@ -110,10 +116,17 @@ class Advisor(
             val corner = entry.corner
             val aheadM = entry.distanceAheadM
             val pathConf = entry.pathConfidence
-            val band = severityTable.bandFor(corner.minRadiusM)
+            // Radius audit: your own measured cornering vs the map. The corrected
+            // radius drives the band and the speed maths, but the corner object
+            // keeps the MAP radius — the auditor measures against it next pass,
+            // and correcting the reference would make the correction chase itself.
+            val audit = radiusAuditLookup?.invoke(corner.id)
+            val effectiveRadiusM = corner.minRadiusM * (audit?.radiusFactor?.coerceAtMost(1.0) ?: 1.0)
+            val band = severityTable.bandFor(effectiveRadiusM)
             if (band == SeverityBand.FLAT) continue
 
             val modifiers = ArrayList<Modifier>(3)
+            if (audit?.hedge == true) modifiers += Modifier.MAYBE
             // Low map confidence: keep the honest band and speed, lead with "caution".
             if (corner.confidence < params.softenBelowConfidence) modifiers += Modifier.CAUTION
             if (corner.exitRadiusM < corner.entryRadiusM * params.radiusTrendRatio) modifiers += Modifier.TIGHTENS
@@ -122,7 +135,7 @@ class Advisor(
             val next = raw.corners.getOrNull(i + 1)
             if (next != null && next.distanceAheadM - (aheadM + corner.arcLengthM) < params.intoGapM) modifiers += Modifier.INTO
 
-            var vTarget = vTargetFor(corner, band)
+            var vTarget = vTargetFor(effectiveRadiusM, band)
             // Off by default — see [Params.clampToSpeedLimit].
             if (params.clampToSpeedLimit) {
                 vTarget = minOf(vTarget, limitFor(entry.maxspeedKph, entry.highwayClass))

@@ -48,7 +48,11 @@ object NoteComposer {
     fun cornerKeys(c: HorizonCorner, detail: Detail): List<String> {
         val dir = c.corner.direction.spoken()
         val keys = ArrayList<String>(6)
-        if (Modifier.CAUTION in c.modifiers) keys += "caution"
+        // Doubt is spoken FIRST — "maybe left three" tells the driver how much to
+        // trust the call before the call itself lands. Hedge and caution never
+        // stack: a hedged call is already flagged as uncertain.
+        if (Modifier.MAYBE in c.modifiers) keys += "maybe"
+        else if (Modifier.CAUTION in c.modifiers) keys += "caution"
         keys += when (c.band) {
             SeverityBand.HAIRPIN -> "${dir}_hairpin"
             else -> "${dir}_${c.band.spoken}"

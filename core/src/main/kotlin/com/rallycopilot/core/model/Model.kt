@@ -139,6 +139,9 @@ enum class Modifier(val spoken: String) {
     OFF_CAMBER("off_camber"),
     /** Low map confidence: the geometry may under-claim. Spoken before the call. */
     CAUTION("caution"),
+    /** Hedge: the co-driver is not sure — mid path-confidence, or a single-pass
+     *  radius-audit mismatch. Spoken FIRST, so doubt lands before the call does. */
+    MAYBE("maybe"),
 }
 
 /** A corner projected onto the current predicted path. */
@@ -233,6 +236,10 @@ data class Utterance(
 /** Run-log event types. The negative ones matter as much as the positive ones. */
 enum class RunEventType {
     NOTE_SPOKEN, NOTE_SUPPRESSED_LOW_CONFIDENCE, NOTE_CHAINED, NOTE_COMPRESSED,
+    /** Spoken with a leading "maybe" — mid confidence, hedged rather than dropped. */
+    NOTE_HEDGED,
+    /** Driver said "wrong" — the last call plus its context, for offline tuning. */
+    NOTE_FLAGGED,
     HORIZON_REBUILT, MPP_AMBIGUOUS, MATCH_LOST, GPS_LOST, REGION_MISSING,
     OBSERVATION_RECORDED, OBSERVATION_REJECTED, HAZARD_SPOKEN,
     OBD_CONNECTED, OBD_LOST, HEALTH_WARNING, INCIDENT_SUSPECTED,

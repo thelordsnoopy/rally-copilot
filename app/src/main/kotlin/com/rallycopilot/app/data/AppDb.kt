@@ -23,7 +23,7 @@ import org.json.JSONObject
  * service's write transactions.
  */
 class AppDb private constructor(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "rallycopilot.db", null, 3) {
+    SQLiteOpenHelper(context.applicationContext, "rallycopilot.db", null, 4) {
 
     companion object {
         @Volatile private var instance: AppDb? = null
@@ -46,9 +46,11 @@ class AppDb private constructor(context: Context) :
         db.execSQL("""CREATE TABLE observations(run_id INTEGER, corner_id INTEGER, t_ms INTEGER,
             band TEXT, min_r REAL, v_entry REAL, v_min REAL, v_exit REAL, a_lat REAL,
             map_conf REAL, path_conf REAL, constrained INTEGER, conditions TEXT, throttle REAL,
-            spirited INTEGER DEFAULT 1)""")
+            spirited INTEGER DEFAULT 1, car TEXT DEFAULT 'default')""")
         db.execSQL("CREATE INDEX idx_obs_run ON observations(run_id)")
         db.execSQL("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
+        db.execSQL("""CREATE TABLE corner_audit(corner_id INTEGER PRIMARY KEY,
+            passes INTEGER DEFAULT 0, ratio_ema REAL DEFAULT 1.0)""")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {
@@ -57,7 +59,20 @@ class AppDb private constructor(context: Context) :
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_rf_run_t ON run_fixes(run_id, t_ms)")
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_obs_run ON observations(run_id)")
         }
+        if (old < 4) {
+            db.execSQL("ALTER TABLE observations ADD COLUMN car TEXT DEFAULT 'default'")
+            db.execSQL("""CREATE TABLE IF NOT EXISTS corner_audit(corner_id INTEGER PRIMARY KEY,
+                passes INTEGER DEFAULT 0, ratio_ema REAL DEFAULT 1.0)""")
+        }
     }
+
+    // ---- car identity ----
+    // Profiles, learning cutoffs and observations are keyed by CAR — "vin:<VIN>"
+    // once OBD has read one, "default" before that. One drive in a soft borrowed
+    // car must never drag the learned profile of the real one.
+
+    /** The car the app believes it is in: the last VIN OBD reported, or default. */
+    fun activeCarKey(): String = kvGet("car_vin")?.let { "vin:$it" } ?: "default"
 
     // ---- runs ----
 
@@ -146,12 +161,20 @@ class AppDb private constructor(context: Context) :
 
     // ---- observations ----
 
-    fun saveObservations(rows: List<CornerObservation>) {
+    fun saveObservations(rows: List<CornerObservation>, car: String = activeCarKey()) {
+        // First time a real VIN shows up, the pre-VIN history inherits it: every
+        // "default" row so far was almost certainly driven in this same car.
+        if (car != "default" && kvGet("obs_car_backfill_v1") == null) {
+            writableDatabase.execSQL(
+                "UPDATE observations SET car=? WHERE car='default'", arrayOf(car))
+            kvPut("obs_car_backfill_v1", car)
+        }
         val db = writableDatabase
         db.beginTransaction()
         try {
             for (o in rows) {
                 val v = ContentValues().apply {
+                    put("car", car)
                     put("run_id", o.runId); put("corner_id", o.cornerId); put("t_ms", o.tMs)
                     put("band", o.band.name); put("min_r", o.minRadiusM)
                     put("v_entry", o.vEntryMps); put("v_min", o.vMinMps); put("v_exit", o.vExitMps)
@@ -196,19 +219,22 @@ class AppDb private constructor(context: Context) :
     // numbers straight back. A cutoff timestamp fixes both: history is kept, and
     // learning simply ignores anything recorded before it.
 
-    fun learnCutoffMs(): Long = kvGet("learn_from_ms")?.toLongOrNull() ?: 0L
+    fun learnCutoffMs(car: String = activeCarKey()): Long =
+        kvGet("learn_from_ms_$car")?.toLongOrNull()
+            ?: kvGet("learn_from_ms")?.toLongOrNull() ?: 0L
 
-    /** Start learning afresh from now. Keeps every stored observation. */
-    fun resetLearning(conditions: Conditions) {
-        kvPut("learn_from_ms", System.currentTimeMillis().toString())
-        saveProfile(coldStart(conditions), conditions)
+    /** Start learning afresh from now — for THIS car only. Keeps every observation. */
+    fun resetLearning(conditions: Conditions, car: String = activeCarKey()) {
+        kvPut("learn_from_ms_$car", System.currentTimeMillis().toString())
+        saveProfile(coldStart(conditions), conditions, car)
     }
 
-    /** The observations a profile may be derived from: right conditions, after the cutoff. */
-    fun observationsForLearning(conditions: Conditions): List<CornerObservation> {
-        val cutoff = learnCutoffMs()
-        return readObservations("WHERE conditions=? AND t_ms>=?",
-            arrayOf(conditions.name, cutoff.toString()))
+    /** The observations a profile may be derived from: this car, right conditions,
+     *  after the cutoff. */
+    fun observationsForLearning(conditions: Conditions, car: String = activeCarKey()): List<CornerObservation> {
+        val cutoff = learnCutoffMs(car)
+        return readObservations("WHERE conditions=? AND car=? AND t_ms>=?",
+            arrayOf(conditions.name, car, cutoff.toString()))
     }
 
     /**
@@ -239,14 +265,18 @@ class AppDb private constructor(context: Context) :
     // Dry and wet are SEPARATE learned profiles: wet observations never touch the dry
     // model and vice versa. The wet cold start seeds lower (0.4 g vs 0.5 g).
 
-    private fun profileKey(c: Conditions) = "profile_${c.name}"
+    /** The default car keeps the historical key, so old installs migrate for free;
+     *  a VIN-keyed car reads the historical profile once as a seed, then diverges. */
+    private fun profileKey(c: Conditions, car: String) =
+        if (car == "default") "profile_${c.name}" else "profile_${car}_${c.name}"
 
     private fun coldStart(c: Conditions) =
         if (c == Conditions.WET) DriverProfile(emptyMap(), emptyMap(), seedALat = 0.4 * 9.81)
         else DriverProfile.COLD_START
 
-    fun loadProfile(conditions: Conditions = Conditions.DRY): DriverProfile {
-        val json = kvGet(profileKey(conditions))
+    fun loadProfile(conditions: Conditions = Conditions.DRY, car: String = activeCarKey()): DriverProfile {
+        val json = kvGet(profileKey(conditions, car))
+            ?: kvGet(profileKey(conditions, "default")) // pre-VIN history seeds the car
             ?: kvGet("profile").takeIf { conditions == Conditions.DRY } // legacy migration
             ?: return coldStart(conditions)
         return try {
@@ -268,14 +298,14 @@ class AppDb private constructor(context: Context) :
         }
     }
 
-    fun saveProfile(p: DriverProfile, conditions: Conditions = Conditions.DRY) {
+    fun saveProfile(p: DriverProfile, conditions: Conditions = Conditions.DRY, car: String = activeCarKey()) {
         val o = JSONObject()
         o.put("aLat", JSONObject(p.aLatByBand.mapKeys { it.key.name }))
         o.put("counts", JSONObject(p.sampleCountByBand.mapKeys { it.key.name }))
         o.put("push", p.pushFactor)
         p.capALat?.let { o.put("cap", it) }
         o.put("seed", p.seedALat)
-        kvPut(profileKey(conditions), o.toString())
+        kvPut(profileKey(conditions, car), o.toString())
     }
 
     fun kvGet(key: String): String? =

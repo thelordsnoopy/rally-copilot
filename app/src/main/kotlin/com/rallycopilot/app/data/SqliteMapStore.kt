@@ -28,6 +28,9 @@ import kotlin.math.floor
 class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sqlite") : MapStore {
 
     private val db: SQLiteDatabase
+    /** Copied region file length — moves only when the map data itself changes.
+     *  Used to invalidate stores keyed by (unstable) corner ids. */
+    val fingerprint: Long
     private val edgeCache = HashMap<Long, Edge>()
     private val cornerCache = HashMap<Long, List<Corner>>()
     private val hazardCache = HashMap<Long, List<Hazard>>()
@@ -63,6 +66,7 @@ class SqliteMapStore(context: Context, assetName: String = "regions/stroud30.sql
             copyAsset()
             openValidated()
         }
+        fingerprint = f.length()
     }
 
     @Synchronized

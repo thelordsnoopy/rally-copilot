@@ -39,6 +39,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -264,9 +265,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun startDrive(wet: Boolean, calibration: Boolean, demo: Boolean = false) {
+    fun startDrive(wet: Boolean, calibration: Boolean, demo: Boolean = false, condAuto: Boolean = false) {
         val i = Intent(this, DriveService::class.java)
             .putExtra(DriveService.EXTRA_WET, wet)
+            .putExtra(DriveService.EXTRA_COND_AUTO, condAuto)
             .putExtra(DriveService.EXTRA_CALIBRATION, calibration)
             .putExtra(DriveService.EXTRA_DEMO, demo)
         startForegroundService(i)
@@ -300,15 +302,33 @@ fun AppNav(activity: MainActivity) {
 
 @Composable
 fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
-    // Saveable: the dusk theme flip recreates the activity and must not silently
-    // reset a deliberately-chosen WET back to DRY.
-    var wet by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+    val db = remember { com.rallycopilot.app.data.AppDb.get(activity) }
+    // Persisted in kv (not just saveable): AUTO / DRY / WET should survive an app
+    // restart — a deliberately-chosen WET must never silently reset to DRY.
+    var condMode by androidx.compose.runtime.saveable.rememberSaveable {
+        mutableStateOf(db.kvGet("conditions_mode") ?: "auto")
+    }
+    // What auto WOULD pick, shown as a hint. Best-effort, fetched off the UI thread.
+    var autoHint by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(condMode) {
+        if (condMode == "auto" && autoHint == null) {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val r = com.rallycopilot.app.drive.WeatherCheck.check(51.746, -2.218)
+                autoHint = r?.let { "auto → ${it.conditions.name.lowercase()}: ${it.why}" }
+                    ?: "auto: offline — will use last known"
+            }
+        }
+    }
     val locationGranted by activity.locationGranted
     // Real drives need location before the service starts: on Android 14+ a
     // location-type foreground service CRASHES if started without the grant.
     fun startRealDrive(calibration: Boolean) {
         if (locationGranted) {
-            activity.startDrive(wet, calibration); onNav("drive")
+            activity.startDrive(
+                wet = condMode == "wet", calibration = calibration,
+                condAuto = condMode == "auto",
+            )
+            onNav("drive")
         } else {
             activity.requestPermissions()
         }
@@ -418,14 +438,15 @@ fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
         }
         Spacer(Modifier.height(14.dp))
 
-        // Conditions: segmented dry/wet
+        // Conditions: AUTO (rain check at drive start) / DRY / WET. Auto is a
+        // default, never a lock — the manual choices stay one tap away.
         Row(
             Modifier.fillMaxWidth().background(panel, RoundedCornerShape(12.dp)).padding(4.dp),
         ) {
-            for ((isWet, label) in listOf(false to "DRY", true to "WET")) {
-                val selected = wet == isWet
+            for ((key, label) in listOf("auto" to "AUTO", "dry" to "DRY", "wet" to "WET")) {
+                val selected = condMode == key
                 Button(
-                    onClick = { wet = isWet },
+                    onClick = { condMode = key; db.kvPut("conditions_mode", key) },
                     modifier = Modifier.weight(1f).height(40.dp),
                     shape = RoundedCornerShape(9.dp),
                     colors = ButtonDefaults.buttonColors(
@@ -435,15 +456,20 @@ fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
                 ) {
                     Text(
                         label, fontSize = 13.sp, fontWeight = FontWeight.Bold,
-                        color = if (selected) (if (isWet) Color(0xFF6BB8FF) else ink) else inkDim,
+                        color = if (!selected) inkDim
+                        else if (key == "wet") Color(0xFF6BB8FF) else ink,
                     )
                 }
             }
         }
-        if (wet) {
-            Text(
-                "wet: suggested speeds reduced 20%",
+        when {
+            condMode == "wet" -> Text(
+                "wet: separate wet profile, speeds seeded lower",
                 color = Color(0xFF6BB8FF), fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp, start = 4.dp),
+            )
+            condMode == "auto" && autoHint != null -> Text(
+                autoHint!!, color = inkDim, fontSize = 11.sp,
                 modifier = Modifier.padding(top = 6.dp, start = 4.dp),
             )
         }
@@ -487,6 +513,14 @@ fun ProfileScreen(activity: MainActivity) {
     var profile by remember(cond) { mutableStateOf(db.loadProfile(cond)) }
     Column(Modifier.fillMaxSize().background(Color(0xFF0B0F14)).padding(20.dp)) {
         Text("DRIVER PROFILE", color = Color.White, fontSize = 24.sp)
+        // Profiles follow the CAR: one drive in a soft borrowed car must never
+        // drag this car's learned pace down.
+        val carKey = remember { db.activeCarKey() }
+        Text(
+            if (carKey == "default") "car: default (no VIN seen yet)"
+            else "car: VIN …${carKey.takeLast(6)} — separate profile per car",
+            color = Color(0xFF7C8B9A), fontSize = 11.sp,
+        )
         Row(
             Modifier.padding(vertical = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -723,6 +757,40 @@ fun SettingsScreen(activity: MainActivity) {
         Text(
             "Never competes with the road ahead: if a call comes due the comment is " +
                 "dropped, not queued. Takes effect on the next drive.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+
+        // ---- hands-free voice commands ----
+        var voiceCmds by remember { mutableStateOf(db.kvGet("voice_commands") != "off") }
+        Spacer(Modifier.height(10.dp))
+        Button(
+            onClick = {
+                voiceCmds = !voiceCmds
+                db.kvPut("voice_commands", if (voiceCmds) "on" else "off")
+            },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (voiceCmds) Color(0xFF2EE06B) else Color(0xFF141C24),
+            ),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+        ) {
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    if (voiceCmds) "Hands-free voice: on" else "Hands-free voice: off",
+                    fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                    color = if (voiceCmds) Color.Black else Color(0xFFEAF0F6),
+                )
+                Text(
+                    "\"again\" · \"quiet\" · \"talk\" · \"louder\" · \"quieter\" · \"wrong\"",
+                    fontSize = 10.sp, maxLines = 1,
+                    color = if (voiceCmds) Color(0xCC06080B) else Color(0xFF7C8B9A),
+                )
+            }
+        }
+        Text(
+            "On-device recognition, nothing leaves the phone. \"wrong\" flags the last " +
+                "call into the run log so bad calls can be traced. Takes effect on the next drive.",
             color = Color(0xFF667788), fontSize = 11.sp,
         )
 

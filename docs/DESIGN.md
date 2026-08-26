@@ -706,3 +706,103 @@ road leans car-LEFT = helps left-handers.
 **Effect**: camber EMA stored per 25 m knowledge bucket (≥5 samples before trusted).
 Corners with ≥2° adverse camber gain an OFF CAMBER modifier (spoken + HUD) and a
 speed trim of 3%/degree, floored at 0.85×.
+
+## 14. v1.2 addendum: modes, trust, and the car (agreed 2026-08-26)
+
+### 14.1 Two driving modes
+
+**Free roam (route memory).** Today's MPP guessing, made smarter by your own habits:
+every junction passage logs which continuation you actually took (from-edge →
+to-edge, bucketed by time of day). After two consistent choices the MPP scoring is
+biased hard toward the remembered fork and its confidence decays less; a fork you
+take differently at different times of day keeps both memories. Unknown junctions
+behave exactly as now. No UI — it just gets better on roads you repeat.
+
+**Destination mode.** Pick where you are going and the guessing stops: an offline
+A* route over the region graph replaces the MPP walk, confidence does not decay at
+junctions while you are on-plan, and junction calls become instructions ("junction
+right") the way a co-driver actually navigates. Off-route triggers a silent replan
+from the matched position. Destinations come from:
+- **named places** — shops, pubs, fuel, villages: OSM POI names extracted into the
+  region file at map-build time, searched offline;
+- **saved pins** — long-press on the road-finder canvas or "pin here" on the drive
+  screen; named, listed, reusable.
+
+### 14.2 Trace-learned geometry (Phase: after logs accumulate)
+
+Your recorded drives are a better record of the driven line than hand-placed OSM
+nodes. After ≥3 clean passes over an edge, corner radii are refit from the median
+of your own traces and override the map where trace agreement beats map node
+density. **Gated hard, at user decision:** only fixes with accuracy ≤ 8 m, real
+bearings, speed above walking pace, and no dead-reckoned segments enter the refit;
+a pass with degraded GPS is discarded whole. Calibration is the risk — a refit
+radius feeds braking-point timing directly, so refit output is cross-checked
+against the IMU-implied radius (14.3) before it is trusted, and corrections are
+capped per pass. Never edits the shipped map; lives in the knowledge layer.
+
+### 14.3 Live radius audit ("the map is lying")
+
+The IMU already measures real lateral acceleration; mid-corner, `R = v²/a_lat` is
+the road's real radius. Each qualifying pass through a known corner (GPS accuracy
+good, mount aligned, cornering hard enough to measure) records implied vs mapped
+radius. One wild mismatch → the corner is HEDGED next time (14.4). Two or more
+consistent passes → the corner's effective radius is corrected before banding and
+speed maths. **Corrections only ever tighten** — a map that under-claims severity
+gets fixed, one that over-claims stays as-is; raising suggested speeds from
+inferred data is not a thing this app does. Audit data is keyed to corner ids and
+wiped on map update (ids are not stable across builds).
+
+### 14.4 Hedge, don't suppress
+
+The confidence gate becomes three-state. Confident → plain call. Truly lost
+(ambiguous junction, wrong-road risk) → silent, as now. In between → the call is
+spoken with a leading **"maybe"** — the co-driver telling you exactly how much to
+trust it, instead of silence hiding the information. Geometry doubt (low map
+confidence, single-pass audit mismatch) hedges the same way.
+
+### 14.5 Profiles follow the car
+
+The learned lateral-g profile, sample counts and learning cutoff are keyed by car
+— VIN when OBD reports one, "default" otherwise — the same pattern as the gear
+tables. One drive in a soft borrowed car can no longer drag the E90's profile
+down. Observations are stamped with the car that produced them; a profile reset
+resets one car, not all of them.
+
+### 14.6 Auto wet (still a choice)
+
+Conditions default to AUTO: at drive start Open-Meteo is asked for current and
+recent rain at your location (no key, no account, 3 s budget) — raining now or
+meaningful rain in the last 3 h → WET, else DRY; offline falls back to the last
+auto choice. The home screen shows what auto decided and DRY/WET remain one tap
+away — auto is a default, never a lock. Wet/dry stay fully separate learned
+profiles as before.
+
+### 14.7 Narrows and passing places (map rebuild)
+
+Width is the hazard Cotswold-lane geometry cannot express. Map build extracts
+`width`, `lanes=1`, `passing_place` nodes → a NARROWS hazard called like a
+caution ("narrows"), passing places drawn on the HUD map. Single-lane with no
+passing place in sight is exactly the road you want called before you commit.
+
+### 14.8 Hands-free voice
+
+Offline speech recognition, always listening during a drive (toggleable):
+- **"again"** — repeat the last utterance verbatim;
+- **"quiet" / "talk"** — mute and unmute the co-driver;
+- **"louder" / "quieter"** — volume nudges;
+- **"wrong"** — flag the last call plus its surrounding state into the run log:
+  the labelled-data loop for tuning severity, MPP weights, and 14.2/14.3.
+
+### 14.9 Power
+
+The phone is always on charge in the car (user). No low-power/audio-only mode;
+keep-screen-on stays.
+
+### Build order
+
+- **v0.12** — 14.3 radius audit, 14.4 hedging, 14.5 per-car profiles, 14.6 auto
+  wet, 14.8 voice commands. No map rebuild needed.
+- **v0.13** — map rebuild (POI names, narrows, passing places) + destination
+  mode: router, search, pins, on-plan horizon.
+- **v0.14** — route memory in free roam.
+- **v0.15** — trace-learned geometry, once enough clean logged passes exist.

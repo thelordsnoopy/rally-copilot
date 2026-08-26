@@ -32,6 +32,13 @@ class VoicePack(private val context: Context) : AudioSink {
     @Volatile var volume: Float = 1.0f
         private set
 
+    /** Hands-free "quiet": everything is swallowed until "talk". The keep-alive
+     *  stream keeps running so unmuting doesn't cost a swallowed first syllable. */
+    @Volatile var muted: Boolean = false
+
+    /** The last utterance requested, for the hands-free "again" command. */
+    @Volatile private var lastUtterance: Utterance? = null
+
     /**
      * Stereo balance, -1 = full left … 0 = centre … +1 = full right.
      *
@@ -86,7 +93,16 @@ class VoicePack(private val context: Context) : AudioSink {
     override fun clipDurationMs(key: String): Long =
         durations["normal/$key"] ?: durations["urgent/$key"] ?: 600L
 
-    override fun play(utterance: Utterance) {
+    override fun play(utterance: Utterance) = play(utterance, force = false)
+
+    /**
+     * [force] bypasses mute — used only by the driver's own "again" request:
+     * an answer you explicitly asked for should never be swallowed by the mute
+     * you also asked for.
+     */
+    fun play(utterance: Utterance, force: Boolean) {
+        lastUtterance = utterance
+        if (muted && !force) return
         val set = if (utterance.urgent) "urgent" else "normal"
         val paths = utterance.clipKeys.map { key ->
             val k = "$set/$key"
@@ -99,6 +115,11 @@ class VoicePack(private val context: Context) : AudioSink {
             queue = ArrayDeque(paths)
             playNext()
         }
+    }
+
+    /** Hands-free "again": replay the last thing said, mute or no mute. */
+    fun repeatLast() {
+        lastUtterance?.let { play(it, force = true) }
     }
 
     override fun isSpeaking(): Boolean = System.currentTimeMillis() < speakingUntil

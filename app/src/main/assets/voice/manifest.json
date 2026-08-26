@@ -79,7 +79,8 @@
    "crest": 493,
    "coach_good": 772,
    "coach_more": 844,
-   "coach_hot": 1150
+   "coach_hot": 1150,
+   "maybe": 491
   },
   "urgent": {
    "left_one": 526,
@@ -159,7 +160,8 @@
    "crest": 420,
    "coach_good": 644,
    "coach_more": 709,
-   "coach_hot": 967
+   "coach_hot": 967,
+   "maybe": 432
   }
  }
 }

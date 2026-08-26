@@ -47,12 +47,18 @@ class DriveEngine(
     private val slowdown: SlowdownMonitor? = null,
     /** A word about the corner just taken — spoken only into a straight. */
     private val coach: com.rallycopilot.core.advisor.Coach? = null,
+    /** Compares IMU-measured corner radius against the map (see RadiusAuditor). */
+    private val radiusAuditor: com.rallycopilot.core.knowledge.RadiusAuditor? = null,
 ) {
     data class Params(
         val maxAccuracyM: Double = 25.0,
         val maxJumpMps: Double = 90.0,
-        /** Below this path confidence at a corner, the note is suppressed. */
+        /** At or above this path confidence a corner is called plainly. */
         val speakConfidence: Double = 0.50,
+        /** Between here and [speakConfidence] the call is HEDGED — spoken with a
+         *  leading "maybe" instead of being suppressed. Below this the wrong-road
+         *  risk is real and silence stays the rule. */
+        val hedgeConfidence: Double = 0.30,
         val gpsLostAfterMs: Long = 3000,
         /** Rebuild horizon on edge change or heading change beyond this. */
         val rebuildHeadingDeg: Double = 25.0,
@@ -105,6 +111,11 @@ class DriveEngine(
      */
     @Volatile
     var audioLatencyMs: Long = 220
+
+    /** IMU lateral acceleration magnitude in the CAR frame, m/s², set by the app
+     *  layer once the mount is aligned. Null = no trustworthy measurement. */
+    @Volatile
+    var imuLateralMps2: Double? = null
 
     /** Everything the HUD needs, updated every tick. */
     data class HudState(
@@ -350,6 +361,15 @@ class DriveEngine(
         // No detector wired = no learning. Fail CLOSED: this flag gates the profile.
         val spiritedNow = styleDetector?.isSpirited ?: false
 
+        // ---- radius audit: does the road agree with the map? ----
+        radiusAuditor?.tick(
+            cornerId = insideCorner?.corner?.id,
+            mapRadiusM = insideCorner?.corner?.minRadiusM,
+            speedMps = speed,
+            aLatImuMps2 = imuLateralMps2,
+            gpsAccuracyM = fix?.accuracyM,
+        )
+
         // ---- feed the observation collector (runs behind the car) ----
         collector?.tick(now, speed, vehicle.throttle01(), h.corners, spiritedNow) { aheadOf(it) }
 
@@ -490,6 +510,7 @@ class DriveEngine(
                     com.rallycopilot.core.model.HorizonHazard(hz.hazard, ahead, hz.pathConfidence)
                 )
                 audio.play(Utterance(keys, urgent = true, deadlineDistanceM = ahead, forCornerId = null))
+                lastCall = "hazard=${hz.hazard.kind.name} keys=" + keys.joinToString("+")
                 runLog.logEvent(RunEvent(now, RunEventType.HAZARD_SPOKEN, hz.hazard.kind.name))
                 return
             }
@@ -498,17 +519,26 @@ class DriveEngine(
         // Not pressing on: no corner calls at all. They resume the moment you do.
         if (quiet) return
 
-        // Corners we could speak, nearest first. Low-confidence corners are skipped but
-        // NOT marked spoken — a transient ambiguity must not silence them forever.
-        val speakable = h.corners.filter { c ->
+        // Corners we could speak, nearest first. The confidence gate is three-state:
+        // confident → plain call; mid → HEDGED ("maybe left three") — doubt spoken
+        // instead of silence hiding it; genuinely lost → silent, and NOT marked
+        // spoken, so a transient ambiguity must not silence a corner forever.
+        val speakable = h.corners.mapNotNull { c ->
             val ok = c.corner.id !in spokenCorners && aheadOf(c) > 0 &&
                 c.band.ordinal <= maxSpokenBandOrdinal
-            if (ok && c.pathConfidence < params.speakConfidence) {
-                if (suppressionLogged.add(c.corner.id)) {
-                    runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
+            when {
+                !ok -> null
+                c.pathConfidence >= params.speakConfidence -> c
+                c.pathConfidence >= params.hedgeConfidence ->
+                    if (com.rallycopilot.core.model.Modifier.MAYBE in c.modifiers) c
+                    else c.copy(modifiers = listOf(com.rallycopilot.core.model.Modifier.MAYBE) + c.modifiers)
+                else -> {
+                    if (suppressionLogged.add(c.corner.id)) {
+                        runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
+                    }
+                    null
                 }
-                false
-            } else ok
+            }
         }
         if (speakable.isEmpty()) return
 
@@ -576,7 +606,29 @@ class DriveEngine(
         )
         chain.forEach { spokenCorners[it.corner.id] = now }
         audio.play(utterance)
+        lastCall = "corners=" + chain.joinToString(",") { it.corner.id.toString() } +
+            " keys=" + utterance.clipKeys.joinToString("+") +
+            " speed=" + "%.1f".format(speed)
         runLog.logEvent(RunEvent(now, RunEventType.NOTE_SPOKEN, chain.joinToString(",") { it.corner.id.toString() }))
+        if (chain.any { com.rallycopilot.core.model.Modifier.MAYBE in it.modifiers }) {
+            runLog.logEvent(RunEvent(now, RunEventType.NOTE_HEDGED,
+                chain.filter { com.rallycopilot.core.model.Modifier.MAYBE in it.modifiers }
+                    .joinToString(",") { it.corner.id.toString() }))
+        }
+    }
+
+    private var lastCall: String? = null
+
+    /**
+     * The driver said "wrong". Stamp the last thing the co-driver said, plus where
+     * and how fast the car is NOW, into the run log — the labelled example that
+     * post-drive tuning (severity table, MPP weights, radius audit) feeds on.
+     */
+    fun flagLastCall() {
+        val info = lastCall ?: return
+        val m = lastMatch
+        runLog.logEvent(RunEvent(clock.nowMs(), RunEventType.NOTE_FLAGGED,
+            info + " at=" + (m?.let { "${it.edgeId}:${it.offsetM.toInt()}" } ?: "?")))
     }
 
     /** Metres consumed while the utterance plays, incl. BT latency — end-anchored timing. */

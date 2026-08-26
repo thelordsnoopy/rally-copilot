@@ -84,11 +84,16 @@ class DriveService : Service() {
         private set
     var conditions: Conditions = Conditions.DRY
         private set
+    /** Why the conditions are what they are ("raining now", "manual"), for the UI. */
+    @Volatile var conditionsWhy: String = "manual"
+        private set
     var map: SqliteMapStore? = null
         private set
     private var knowledge: KnowledgeDb? = null
     private var imu: ImuMonitor? = null
     private var slowdownMonitor: com.rallycopilot.core.knowledge.SlowdownMonitor? = null
+    private var radiusAuditor: com.rallycopilot.core.knowledge.RadiusAuditor? = null
+    private var voiceCommands: com.rallycopilot.app.audio.VoiceCommands? = null
     @Volatile private var distanceM = 0.0
     private var lastFix: Fix? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -131,6 +136,8 @@ class DriveService : Service() {
 
         driveActive = true
         conditions = if (intent.getBooleanExtra(EXTRA_WET, false)) Conditions.WET else Conditions.DRY
+        conditionsWhy = "manual"
+        conditionsAuto = intent.getBooleanExtra(EXTRA_COND_AUTO, false)
         isCalibration = intent.getBooleanExtra(EXTRA_CALIBRATION, false)
         // Fresh per-run state: a reused service instance must not inherit the previous
         // run's distance or a stale lastFix (one giant haversine jump).
@@ -147,8 +154,33 @@ class DriveService : Service() {
         return START_NOT_STICKY
     }
 
+    @Volatile private var conditionsAuto = false
+
+    /**
+     * Auto wet/dry: ask Open-Meteo about rain at (roughly) here. Must run BEFORE
+     * the profile load — wet and dry are separate learned models. Offline falls
+     * back to whatever auto decided last time; auto is a default, never a lock.
+     */
+    private fun resolveAutoConditions() {
+        val loc = runCatching {
+            val task = LocationServices.getFusedLocationProviderClient(this).lastLocation
+            com.google.android.gms.tasks.Tasks.await(task, 2, java.util.concurrent.TimeUnit.SECONDS)
+        }.getOrNull()
+        val r = WeatherCheck.check(loc?.latitude ?: 51.746, loc?.longitude ?: -2.218)
+        if (r != null) {
+            conditions = r.conditions
+            conditionsWhy = "auto: " + r.why
+            db.kvPut("last_auto_conditions", r.conditions.name)
+        } else {
+            conditions = db.kvGet("last_auto_conditions")
+                ?.let { runCatching { Conditions.valueOf(it) }.getOrNull() } ?: Conditions.DRY
+            conditionsWhy = "auto: offline, using last known"
+        }
+    }
+
     private fun initDrive() {
         if (!driveActive) return
+        if (conditionsAuto) resolveAutoConditions()
         val map = SqliteMapStore(this)
         this.map = map
         val know = KnowledgeDb(db)
@@ -167,6 +199,13 @@ class DriveService : Service() {
         // Gear calls from the learned ratio table, aiming at the exit revs learned
         // from how THIS driver actually shifts (see GearInference.exitRpm).
         advisor.gearLookup = { v -> if (obd.connected) obd.gearInference.gearForSpeed(v) else null }
+        // Radius audit: your measured cornering vs the map's radius, per corner.
+        // Wiped automatically when the map data changes (corner ids are unstable).
+        val auditor = com.rallycopilot.core.knowledge.RadiusAuditor(
+            com.rallycopilot.app.data.AuditDb(db, map.fingerprint)
+        )
+        radiusAuditor = auditor
+        advisor.radiusAuditLookup = { id -> auditor.adviceFor(id) }
         engine = DriveEngine(
             matcher = MapMatcher(map),
             horizonBuilder = HorizonBuilder(map, know),
@@ -182,6 +221,7 @@ class DriveService : Service() {
             knowledge = know,
             slowdown = slowMon,
             coach = if (db.kvGet("coaching") != "off") com.rallycopilot.core.advisor.Coach() else null,
+            radiusAuditor = auditor,
         )
         // "always" = call everything whenever driving; default = quiet unless pressing on.
         engine.alwaysSpeak = db.kvGet("speak_mode") == "always"
@@ -223,6 +263,14 @@ class DriveService : Service() {
                     lastSpeed = hudNow.speedMps; lastSpeedT = now
                 }
                 mount.tick(accel, grav, currentDvdt)
+                // Car-frame lateral acceleration for the radius audit: the component
+                // of accel along car-LEFT (up × forward). Null until the mount is
+                // aligned — an unaligned axis would feed the audit garbage radii.
+                engine.imuLateralMps2 = mount.forward?.let { fwd ->
+                    val up = grav.unit() * -1.0
+                    val left = up.cross(fwd).unit()
+                    kotlin.math.abs(accel.dot(left)).takeIf { it.isFinite() }
+                }
                 val deg = camber.tick(accel, grav, hudNow.speedMps)
                 // Persist camber at ~1 Hz against the current bucket, normalised to the
                 // edge's FORWARD frame — the same crown leans the other way when the
@@ -241,10 +289,20 @@ class DriveService : Service() {
         // Audio latency: use the remembered measurement immediately, then re-measure
         // in the background (head unit, codec and phone can all change between drives).
         db.kvGet("audio_latency_ms")?.toLongOrNull()?.let { engine.audioLatencyMs = it }
-        scope.launch(Dispatchers.IO) { calibrateAudio() }
+        scope.launch(Dispatchers.IO) {
+            calibrateAudio()
+            // Hands-free voice starts AFTER the chirp measurement: two owners of the
+            // microphone at once and the calibrator hears the recogniser's silence.
+            if (driveActive && db.kvGet("voice_commands") != "off") {
+                voiceCommands = com.rallycopilot.app.audio.VoiceCommands(this@DriveService) { cmd ->
+                    onVoiceCommand(cmd)
+                }.also { it.start() }
+            }
+        }
 
         voice.setVolume(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f)
         voice.setBalance(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f)
+        voice.muted = false // a "quiet" from last drive must not silence this one
         voice.requestFocus()
         voice.startKeepAlive()
         if (isDemo) startDemo(map) else {
@@ -367,6 +425,28 @@ class DriveService : Service() {
         }
     }
 
+    /** Hands-free commands. Every one is harmless to miss or to false-trigger. */
+    private fun onVoiceCommand(cmd: com.rallycopilot.app.audio.VoiceCommands.Command) {
+        if (!driveActive || !::voice.isInitialized) return
+        when (cmd) {
+            com.rallycopilot.app.audio.VoiceCommands.Command.AGAIN -> voice.repeatLast()
+            com.rallycopilot.app.audio.VoiceCommands.Command.QUIET -> voice.muted = true
+            com.rallycopilot.app.audio.VoiceCommands.Command.TALK -> voice.muted = false
+            com.rallycopilot.app.audio.VoiceCommands.Command.LOUDER -> nudgeVolume(+0.15f)
+            com.rallycopilot.app.audio.VoiceCommands.Command.QUIETER -> nudgeVolume(-0.15f)
+            com.rallycopilot.app.audio.VoiceCommands.Command.WRONG ->
+                scope.launch(engineDispatcher) {
+                    if (driveActive && ::engine.isInitialized) engine.flagLastCall()
+                }
+        }
+    }
+
+    private fun nudgeVolume(delta: Float) {
+        val v = (voice.volume + delta).coerceIn(0.1f, 1.0f)
+        voice.setVolume(v)
+        db.kvPut("voice_volume", v.toString())
+    }
+
     /** Live voice level/balance changes from the settings screen. */
     fun setVoiceVolume(v: Float) { if (::voice.isInitialized) voice.setVolume(v) }
     fun setVoiceBalance(b: Float) { if (::voice.isInitialized) voice.setBalance(b) }
@@ -464,6 +544,7 @@ class DriveService : Service() {
         locationCallback?.let { fused?.removeLocationUpdates(it) }
         locationCallback = null
         imu?.stop(); imu = null
+        voiceCommands?.stop(); voiceCommands = null
         obd.disconnect()
         voice.release()
         wakeLock?.let { runCatching { it.release() } }; wakeLock = null
@@ -472,6 +553,8 @@ class DriveService : Service() {
         // observations this is real work and has no place on a button's onClick.
         val obs = collector?.observations
         scope.launch(engineDispatcher) {
+            // A corner in progress when the drive ends still counts as a pass.
+            radiusAuditor?.closePass(); radiusAuditor = null
             if (rid >= 0) {
                 db.endRun(rid, distanceM)
                 if (obs != null) {
@@ -548,6 +631,7 @@ class DriveService : Service() {
         const val NOTIF_ID = 1
         const val ACTION_STOP = "com.rallycopilot.STOP"
         const val EXTRA_WET = "wet"
+        const val EXTRA_COND_AUTO = "cond_auto"
         const val EXTRA_CALIBRATION = "calibration"
         const val EXTRA_DEMO = "demo"
 
