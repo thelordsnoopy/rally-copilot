@@ -41,7 +41,6 @@ for d in ("left", "right"):
 for k, t in {
     "tightens": "tightens", "opens": "opens", "long": "long", "into": "into",
     "off_camber": "off camber",
-    "care": "care",
     "caution": "caution", "brake": "brake", "junction": "junction",
     "crossing": "crossing", "ford": "ford", "cattle_grid": "cattle grid",
     "narrow_bridge": "narrow bridge", "gate": "gate", "level_crossing": "level crossing",

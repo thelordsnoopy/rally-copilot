@@ -421,6 +421,13 @@ private fun Chip(label: String, colour: Color) {
     }
 }
 
+/** How far around the car the map view loads road geometry. */
+private const val MAP_RADIUS_M = 900.0
+
+/** Re-load that geometry every this many metres travelled, so a long edge cannot
+ *  outrun the data. Must stay comfortably below [MAP_RADIUS_M]. */
+private const val MAP_REFETCH_M = 250.0
+
 /**
  * Real road geometry, heading-up, following the car. All nearby roads dim; the
  * predicted path bright with severity-coloured corner sections. No tiles — this is
@@ -439,10 +446,18 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
     hud?.matched?.let { lastGood = it }
 
     val matched = hud?.matched ?: lastGood
-    // The 9-cell spatial query loads hundreds of edges with geometry unpacking —
-    // that is IO work keyed on the matched edge, not something to run (or even
-    // start) inside composition.
-    androidx.compose.runtime.LaunchedEffect(store, matched?.edgeId) {
+    // The cell query loads hundreds of edges with geometry unpacking — that is IO
+    // work, not something to run (or even start) inside composition.
+    //
+    // Re-fetch on DISTANCE TRAVELLED, not only on a change of edge. Keying this on
+    // edgeId alone is why the map emptied out at the top of Whiteshill: edges are
+    // split at junctions, so a country lane between two junctions runs well over a
+    // kilometre (1,375 m right there), and the roads were fetched once, around
+    // wherever the car happened to JOIN that edge. Drive more than the query radius
+    // along it and everything ahead was simply never loaded — the map ran out
+    // before the road did.
+    val fetchKey = matched?.let { it.edgeId to (it.offsetM / MAP_REFETCH_M).toInt() }
+    androidx.compose.runtime.LaunchedEffect(store, fetchKey) {
         val s = store ?: return@LaunchedEffect
         val m = matched ?: return@LaunchedEffect
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -450,7 +465,7 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
             if (e != null) {
                 val cum = Polyline.cumulative(e.geometry)
                 val c = Polyline.pointAt(e.geometry, cum, m.offsetM)
-                val near = s.edgesNear(c, 700.0)
+                val near = s.edgesNear(c, MAP_RADIUS_M)
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                     centre = c; nearby = near
                 }

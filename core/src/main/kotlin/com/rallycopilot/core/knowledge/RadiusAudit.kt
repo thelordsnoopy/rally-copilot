@@ -60,8 +60,11 @@ class RadiusAuditor(
         val correctionFloor: Double = 0.5,
     )
 
-    /** What the advisor should do about a corner, derived from stored audit state. */
-    data class Advice(val radiusFactor: Double, val hedge: Boolean)
+    /**
+     * What the advisor should do about a corner: multiply the mapped radius by this.
+     * Always ≤ 1 — the audit tightens corners or says nothing at all.
+     */
+    data class Advice(val radiusFactor: Double)
 
     private var currentCornerId: Long = -1
     private var currentMapRadiusM: Double = 0.0
@@ -119,21 +122,21 @@ class RadiusAuditor(
         store.put(CornerAudit(id, (prev?.passes ?: 0) + 1, ema))
     }
 
-    /** What the stored evidence says the advisor should do. Null = trust the map. */
+    /**
+     * What the stored evidence says the advisor should do. Null = trust the map.
+     *
+     * Only ever acts on repeated evidence that the road is TIGHTER than mapped.
+     * A corner that measures gentler than the map claims is left exactly as it is:
+     * partly because a driven line is always wider than the road's centreline, so
+     * "gentler" is the expected reading rather than news, and partly because
+     * raising a suggested speed from inferred sensor data is not a thing this app
+     * does. Single-pass disagreements no longer say anything aloud — a co-driver is
+     * either sure or quiet.
+     */
     fun adviceFor(cornerId: Long): Advice? {
         val a = store.get(cornerId) ?: return null
         if (a.passes >= params.minPassesToCorrect && a.ratioEma < params.correctBelow) {
-            // Consistent evidence the road is tighter than mapped: correct it.
-            // No hedge — at this point the measurement is more trusted than the map.
-            return Advice(
-                radiusFactor = a.ratioEma.coerceAtLeast(params.correctionFloor),
-                hedge = false,
-            )
-        }
-        if (a.ratioEma < params.hedgeBelow || a.ratioEma > params.hedgeAbove) {
-            // Disagreement without enough passes to act on it (or in the direction we
-            // refuse to act on): say so out loud, change nothing.
-            return Advice(radiusFactor = 1.0, hedge = true)
+            return Advice(a.ratioEma.coerceAtLeast(params.correctionFloor))
         }
         return null
     }

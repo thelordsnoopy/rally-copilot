@@ -24,6 +24,17 @@ object Geo {
         return 2 * EARTH_RADIUS_M * atan2(sqrt(s), sqrt(1 - s))
     }
 
+    /**
+     * Squared distance in metres², flat-earth, for range tests only. Compare against
+     * radius² and skip both the square root and the haversine — this runs over every
+     * geometry point of a couple of thousand edges when the map view reloads.
+     */
+    fun approxSquareMetres(a: LatLon, b: LatLon): Double {
+        val x = (b.lon - a.lon).toRad() * EARTH_RADIUS_M * cos(a.lat.toRad())
+        val y = (b.lat - a.lat).toRad() * EARTH_RADIUS_M
+        return x * x + y * y
+    }
+
     /** Local flat projection: metres east/north of [origin]. */
     fun toXY(p: LatLon, origin: LatLon): XY {
         val x = (p.lon - origin.lon).toRad() * EARTH_RADIUS_M * cos(origin.lat.toRad())

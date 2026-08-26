@@ -25,6 +25,17 @@ object NoteComposer {
         val gear: Boolean = false,
         val dangerModifiers: Boolean = true,
         val shapeModifiers: Boolean = true,
+        /**
+         * "into" — the word that says two corners are one continuous piece of road
+         * with no straight between them.
+         *
+         * Kept separate from the other shape words because it is not decoration: it
+         * changes what the driver is being told. It used to ride with "long" in the
+         * shape tier and was therefore the third thing thrown overboard whenever a
+         * burst ran over budget, so precisely the joined-up corners that most need
+         * the word were the ones that lost it.
+         */
+        val linkWords: Boolean = true,
     )
 
     /** Round a link distance to the spoken vocabulary. */
@@ -48,11 +59,7 @@ object NoteComposer {
     fun cornerKeys(c: HorizonCorner, detail: Detail): List<String> {
         val dir = c.corner.direction.spoken()
         val keys = ArrayList<String>(6)
-        // Doubt is spoken FIRST — "care left three" tells the driver how much to
-        // trust the call before the call itself lands. Hedge and caution never
-        // stack: a hedged call is already flagged as uncertain.
-        if (Modifier.CARE in c.modifiers) keys += "care"
-        else if (Modifier.CAUTION in c.modifiers) keys += "caution"
+        if (Modifier.CAUTION in c.modifiers) keys += "caution"
         keys += when (c.band) {
             SeverityBand.HAIRPIN -> "${dir}_hairpin"
             else -> "${dir}_${c.band.spoken}"
@@ -63,7 +70,7 @@ object NoteComposer {
         }
         if (detail.speed) speedKey(c.vTargetMps)?.let { keys += it }
         if (detail.gear) c.gear?.let { keys += "gear_$it" }
-        if (detail.shapeModifiers && Modifier.INTO in c.modifiers) keys += Modifier.INTO.spoken
+        if (detail.linkWords && Modifier.INTO in c.modifiers) keys += Modifier.INTO.spoken
         return keys
     }
 
@@ -114,7 +121,9 @@ object NoteComposer {
             false to detail.copy(gear = false),
             false to detail.copy(gear = false, shapeModifiers = false),
             false to detail.copy(gear = false, shapeModifiers = false, speed = false),
-            false to Detail(speed = false, gear = false, dangerModifiers = false, shapeModifiers = false),
+            // Last resort: the corner calls and the word joining them, nothing else.
+            false to Detail(speed = false, gear = false, dangerModifiers = false,
+                shapeModifiers = false, linkWords = true),
         )
         var keys = assemble(ladder.first().first, ladder.first().second)
         for ((withLinks, d) in ladder) {

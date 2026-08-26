@@ -66,6 +66,16 @@ class DriveEngine(
         val burstBudgetMs: Long = 4000,
         /** Chain corners whose utterances would overlap within this gap. */
         val chainGapM: Double = 60.0,
+        /**
+         * Most corners a single call may describe.
+         *
+         * A real co-driver gives you the corner you are arriving at and, at most,
+         * the one immediately after it. Chaining was previously unbounded, so a
+         * wiggly lane could open with five corners in one breath — which nobody can
+         * hold, and which pushes the compression ladder so far that "into" (the word
+         * that says the corners are joined) gets dropped to make room.
+         */
+        val maxChain: Int = 2,
         /** Bluetooth A2DP output delay to the car. SBC to a car head unit measures
          *  150-250 ms; this is the figure the end-anchored timing works back from. */
         val a2dpLatencyMs: Long = 220,
@@ -519,26 +529,19 @@ class DriveEngine(
         // Not pressing on: no corner calls at all. They resume the moment you do.
         if (quiet) return
 
-        // Corners we could speak, nearest first. The confidence gate is three-state:
-        // confident → plain call; mid → HEDGED ("care left three") — doubt spoken
-        // instead of silence hiding it; genuinely lost → silent, and NOT marked
-        // spoken, so a transient ambiguity must not silence a corner forever.
-        val speakable = h.corners.mapNotNull { c ->
+        // Corners we could speak, nearest first. Confident enough → plain call;
+        // otherwise silent, and NOT marked spoken, so a transient ambiguity does not
+        // silence a corner forever. A co-driver is either sure or quiet — there is no
+        // third, hedging voice, which is why the "care" prefix was dropped.
+        val speakable = h.corners.filter { c ->
             val ok = c.corner.id !in spokenCorners && aheadOf(c) > 0 &&
                 c.band.ordinal <= maxSpokenBandOrdinal
-            when {
-                !ok -> null
-                c.pathConfidence >= params.speakConfidence -> c
-                c.pathConfidence >= params.hedgeConfidence ->
-                    if (com.rallycopilot.core.model.Modifier.CARE in c.modifiers) c
-                    else c.copy(modifiers = listOf(com.rallycopilot.core.model.Modifier.CARE) + c.modifiers)
-                else -> {
-                    if (suppressionLogged.add(c.corner.id)) {
-                        runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
-                    }
-                    null
+            if (ok && c.pathConfidence < params.speakConfidence) {
+                if (suppressionLogged.add(c.corner.id)) {
+                    runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
                 }
-            }
+                false
+            } else ok
         }
         if (speakable.isEmpty()) return
 
@@ -559,6 +562,7 @@ class DriveEngine(
         val gaps = ArrayList<Double?>()
         var tail: HorizonCorner? = null
         for (c in speakable) {
+            if (chain.size >= params.maxChain) break
             if (c.distanceAheadM > due.distanceAheadM) {
                 // Past the due corner: keep chaining only while gaps genuinely overlap.
                 val t = tail ?: break
@@ -610,11 +614,6 @@ class DriveEngine(
             " keys=" + utterance.clipKeys.joinToString("+") +
             " speed=" + "%.1f".format(speed)
         runLog.logEvent(RunEvent(now, RunEventType.NOTE_SPOKEN, chain.joinToString(",") { it.corner.id.toString() }))
-        if (chain.any { com.rallycopilot.core.model.Modifier.CARE in it.modifiers }) {
-            runLog.logEvent(RunEvent(now, RunEventType.NOTE_HEDGED,
-                chain.filter { com.rallycopilot.core.model.Modifier.CARE in it.modifiers }
-                    .joinToString(",") { it.corner.id.toString() }))
-        }
     }
 
     private var lastCall: String? = null

@@ -18,7 +18,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** v0.12: the "map is lying" detector, and hedged calls. */
+/** The "map is lying" detector: repeated measurement can tighten a corner, never loosen it. */
 
 private class MemAuditStore : AuditStore {
     val map = HashMap<Long, CornerAudit>()
@@ -49,13 +49,12 @@ class RadiusAuditorTests {
     }
 
     @Test
-    fun `one wild mismatch hedges but does not correct`() {
+    fun `one pass is never enough to move a corner`() {
         val a = RadiusAuditor(MemAuditStore())
-        // Implied R = 15²/9 = 25 m; map claims 50 m — the road is much tighter.
+        // Implied R = 15²/9 = 25 m; map claims 50 m — the road looks much tighter,
+        // but a single measurement does not get to rewrite the map.
         pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0)
-        val advice = a.adviceFor(1)!!
-        assertTrue("hedge on a single pass", advice.hedge)
-        assertEquals("no correction from one pass", 1.0, advice.radiusFactor, 1e-9)
+        assertNull("no correction from one pass", a.adviceFor(1))
     }
 
     @Test
@@ -64,20 +63,19 @@ class RadiusAuditorTests {
         pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0)
         pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0)
         val advice = a.adviceFor(1)!!
-        assertFalse("measurement now trusted, no hedge", advice.hedge)
         assertEquals(0.5, advice.radiusFactor, 0.02) // 25/50, floored at 0.5
         assertTrue("corrections only tighten", advice.radiusFactor < 1.0)
     }
 
     @Test
-    fun `a road gentler than mapped is hedged, never sped up`() {
+    fun `a road gentler than mapped is left alone, never sped up`() {
         val a = RadiusAuditor(MemAuditStore())
         // Implied R = 30²/4.5 = 200 m; map claims 60 m — over-called, not dangerous.
         pass(a, 1, rMap = 60.0, v = 30.0, aLat = 4.5)
         pass(a, 1, rMap = 60.0, v = 30.0, aLat = 4.5)
-        val advice = a.adviceFor(1)!!
-        assertTrue("say the doubt out loud", advice.hedge)
-        assertEquals("but NEVER raise the radius", 1.0, advice.radiusFactor, 1e-9)
+        // A driven line is always wider than the centreline, so this is the normal
+        // reading, not news — and raising a suggested speed from it is never done.
+        assertNull("gentler-than-mapped changes nothing", a.adviceFor(1))
     }
 
     @Test
@@ -134,29 +132,39 @@ class HedgedCallTests {
     }
 
     @Test
-    fun `single-pass mismatch speaks care before the call`() {
+    fun `a single pass leaves the call completely untouched`() {
         val store = MemAuditStore()
         store.put(CornerAudit(7, passes = 1, ratioEma = 0.5))
         val auditor = RadiusAuditor(store)
-        val advisor = Advisor(DriverProfile.COLD_START).apply {
+        val plain = Advisor(DriverProfile.COLD_START)
+        val audited = Advisor(DriverProfile.COLD_START).apply {
             radiusAuditLookup = { auditor.adviceFor(it) }
         }
-        val hc = advisor.annotate(raw(corner(7, 90.0) to 300.0), 25.0, 0L).corners.single()
-        assertTrue(Modifier.CARE in hc.modifiers)
-        val keys = NoteComposer.cornerKeys(hc, NoteComposer.Detail())
-        assertEquals("doubt lands first", "care", keys.first())
+        val before = plain.annotate(raw(corner(7, 90.0) to 300.0), 25.0, 0L).corners.single()
+        val after = audited.annotate(raw(corner(7, 90.0) to 300.0), 25.0, 0L).corners.single()
+        assertEquals(before.band, after.band)
+        assertEquals(before.vTargetMps, after.vTargetMps, 1e-9)
+        val keys = NoteComposer.cornerKeys(after, NoteComposer.Detail())
+        assertEquals("nothing hedging is ever spoken", "left_four", keys.first())
     }
 
+    /**
+     * "into" says two corners are one continuous piece of road. It used to sit in
+     * the shape tier and was the third thing dropped when a burst ran long, so the
+     * joined-up corners that most need the word were the ones that lost it.
+     */
     @Test
-    fun `care and caution never stack`() {
+    fun `into survives compression down to the bare calls`() {
         val hc = HorizonCorner(
-            corner = corner(1, 30.0), distanceAheadM = 200.0, pathConfidence = 0.4,
+            corner = corner(1, 30.0), distanceAheadM = 200.0, pathConfidence = 0.9,
             band = SeverityBand.TWO,
-            modifiers = listOf(Modifier.CARE, Modifier.CAUTION),
+            modifiers = listOf(Modifier.INTO, Modifier.LONG, Modifier.TIGHTENS),
             vTargetMps = 15.0, brakingPointM = 150.0, triggerDistanceM = 120.0,
         )
-        val keys = NoteComposer.cornerKeys(hc, NoteComposer.Detail())
-        assertEquals(1, keys.count { it == "care" || it == "caution" })
-        assertEquals("care", keys.first())
+        val bare = NoteComposer.Detail(
+            speed = false, gear = false, dangerModifiers = false, shapeModifiers = false)
+        val keys = NoteComposer.cornerKeys(hc, bare)
+        assertTrue("into must survive", "into" in keys)
+        assertFalse("but long must not", "long" in keys)
     }
 }
