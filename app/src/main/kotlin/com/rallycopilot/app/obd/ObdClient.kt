@@ -74,13 +74,25 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 }
 
                 for (init in Elm327.INIT) { cmd(init); Thread.sleep(80) }
+
+                // Probe supported PIDs. If CAN (ATSP6) got nothing, fall back to auto
+                // protocol detection once — covers pre-CAN cars and odd clones.
+                var supported = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                if (supported.isEmpty()) {
+                    cmd(Elm327.FALLBACK_PROTOCOL); Thread.sleep(120)
+                    supported = Elm327.supportedPids(0x00, cmd(Elm327.Pid.SUPPORTED_01_20))
+                }
+                supported = supported + Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60))
+                // On the E90 320d PID 0x11 is meaningless; 0x49 (accel pedal D) is the
+                // real signal. Pick the best one the ECU actually reports.
+                val pedalPid = Elm327.bestPedalPid(supported)
                 connected = true
 
                 var slowTick = 0
                 while (isActive && socket === s) {
                     speedKph = Elm327.speedKph(cmd(Elm327.Pid.SPEED))
                     rpmV = Elm327.rpm(cmd(Elm327.Pid.RPM))
-                    throttleV = Elm327.throttle01(cmd(Elm327.Pid.THROTTLE))
+                    throttleV = pedalPid?.let { Elm327.percent01(it, cmd(it)) }
                     val r = rpmV; val sp = speedKph
                     if (r != null && sp != null) gearInference.addSample(r, sp / 3.6)
                     if (slowTick++ % 20 == 0) { // coolant/voltage every ~20 cycles

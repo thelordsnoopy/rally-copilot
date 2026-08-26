@@ -13,6 +13,7 @@ import com.rallycopilot.core.model.RunEvent
 import com.rallycopilot.core.model.RunEventType
 import com.rallycopilot.core.model.Utterance
 import com.rallycopilot.core.profile.ObservationCollector
+import com.rallycopilot.core.profile.StyleDetector
 import com.rallycopilot.core.report.IncidentDetector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,6 +36,7 @@ class DriveEngine(
     private val vehicle: VehicleData = NullVehicleData,
     private val collector: ObservationCollector? = null,
     private val incidentDetector: IncidentDetector? = null,
+    val styleDetector: StyleDetector? = null,
 ) {
     data class Params(
         val maxAccuracyM: Double = 25.0,
@@ -68,6 +70,9 @@ class DriveEngine(
         val obdConnected: Boolean = false,
         val gear: Int? = null,
         val incidentSuspected: Boolean = false,
+        /** Style detector verdict: is this spirited driving right now? */
+        val spirited: Boolean = false,
+        val spiritedFraction: Double = 0.0,
     )
 
     private val _hud = MutableStateFlow(HudState())
@@ -164,14 +169,31 @@ class DriveEngine(
                 matched = lastMatch, horizon = null, speedMps = speed,
                 gpsOk = gpsOk, obdConnected = vehicle.rpm() != null, gear = gear,
                 incidentSuspected = incident,
+                spirited = styleDetector?.isSpirited ?: false,
+                spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
             )
             return
         }
 
         fun aheadOf(c: HorizonCorner) = c.distanceAheadM - progressM
 
+        // ---- style detection: is this spirited driving? ----
+        val insideCorner = h.corners.firstOrNull { c ->
+            val a = aheadOf(c)
+            a < 0 && a > -c.corner.arcLengthM
+        }
+        styleDetector?.tick(
+            StyleDetector.Sample(
+                tMs = now, speedMps = speed,
+                rpm = vehicle.rpm(), pedal01 = vehicle.throttle01(), gear = gear,
+                aLatMps2 = insideCorner?.let { (speed * speed) / it.corner.minRadiusM },
+            ),
+            advisorProfile(),
+        )
+        val spiritedNow = styleDetector?.isSpirited ?: true
+
         // ---- feed the observation collector (runs behind the car) ----
-        collector?.tick(now, speed, vehicle.throttle01(), h.corners) { aheadOf(it) }
+        collector?.tick(now, speed, vehicle.throttle01(), h.corners, spiritedNow) { aheadOf(it) }
 
         // ---- decide what to speak ----
         maybeSpeak(h, speed, now, ::aheadOf)
@@ -188,6 +210,8 @@ class DriveEngine(
             obdConnected = vehicle.rpm() != null,
             gear = gear,
             incidentSuspected = incident,
+            spirited = spiritedNow && styleDetector != null,
+            spiritedFraction = styleDetector?.spiritedFraction ?: 0.0,
         )
     }
 
@@ -258,6 +282,8 @@ class DriveEngine(
 
     /** OBD wheel speed preferred over GPS speed when available (faster, steadier). */
     private fun fusedSpeed(gpsSpeed: Double): Double = vehicle.obdSpeedMps() ?: gpsSpeed
+
+    private fun advisorProfile() = advisor.profile
 
     /** Where the matched offset lands in the current horizon's progress space. */
     private fun anchoredProgressOn(h: Horizon, m: MatchedPosition): Double? {

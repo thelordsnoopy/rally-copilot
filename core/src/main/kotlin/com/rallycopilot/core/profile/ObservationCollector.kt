@@ -20,7 +20,10 @@ class ObservationCollector(
         var throttleSum: Double = 0.0,
         var throttleN: Int = 0,
         var sawStopAfter: Boolean = false,
+        var wasSpirited: Boolean = true,
     )
+
+    private var spiritedNow: Boolean = true
 
     private val active = ArrayList<Tracking>()
     private val done = ArrayList<CornerObservation>()
@@ -30,19 +33,22 @@ class ObservationCollector(
     /**
      * Feed the collector each engine tick.
      * [distanceAheadOf] maps a horizon corner to its current distance-ahead (negative = behind us).
+     * [spiritedNow] is the style detector's current verdict; it stamps each observation.
      */
     fun tick(
         tMs: Long,
         speedMps: Double,
         throttle01: Double?,
         horizonCorners: List<HorizonCorner>,
+        spiritedNow: Boolean = true,
         distanceAheadOf: (HorizonCorner) -> Double,
     ) {
+        this.spiritedNow = spiritedNow
         // Start tracking corners we are about to enter.
         for (hc in horizonCorners) {
             val ahead = distanceAheadOf(hc)
             if (ahead in 0.0..15.0 && active.none { it.hc.corner.id == hc.corner.id }) {
-                active += Tracking(hc, vEntry = speedMps)
+                active += Tracking(hc, vEntry = speedMps, wasSpirited = spiritedNow)
             }
         }
         // Update and close out corners we are inside / past.
@@ -86,6 +92,7 @@ class ObservationCollector(
             wasConstrained = constrained(t, throttleMean),
             conditions = conditions,
             throttleMean = throttleMean,
+            spirited = t.wasSpirited || spiritedNow, // spirited at entry or exit counts
         )
     }
 

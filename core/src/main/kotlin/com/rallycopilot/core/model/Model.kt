@@ -187,6 +187,9 @@ data class CornerObservation(
     val conditions: Conditions,
     /** Mean throttle through the corner 0..1, if OBD connected. Sharper constraint detection. */
     val throttleMean: Double? = null,
+    /** Was the style detector reading SPIRITED when this corner was driven? Only
+     *  spirited corners train the model — normal driving must never drag it down. */
+    val spirited: Boolean = true,
 )
 
 enum class FeedbackAnswer { EASY, GOOD, HARD }

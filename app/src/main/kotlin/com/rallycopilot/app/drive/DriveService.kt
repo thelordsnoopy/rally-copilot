@@ -28,6 +28,7 @@ import com.rallycopilot.core.model.Conditions
 import com.rallycopilot.core.model.Fix
 import com.rallycopilot.core.profile.Learning
 import com.rallycopilot.core.profile.ObservationCollector
+import com.rallycopilot.core.profile.StyleDetector
 import com.rallycopilot.core.report.IncidentDetector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -106,6 +107,7 @@ class DriveService : Service() {
             vehicle = obd,
             collector = collector,
             incidentDetector = IncidentDetector(),
+            styleDetector = StyleDetector(),
         )
 
         voice.requestFocus()

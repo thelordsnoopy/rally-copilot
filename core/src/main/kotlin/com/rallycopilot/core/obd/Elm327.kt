@@ -6,16 +6,58 @@ package com.rallycopilot.core.obd
  */
 object Elm327 {
 
-    // Init sequence for a cold ELM327.
-    val INIT = listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0")
+    /**
+     * Init for a cold ELM327. ATSP6 = ISO 15765-4 CAN 11-bit/500k — the protocol a
+     * 2006 BMW E90 actually speaks; the client falls back to ATSP0 (auto) if the
+     * first PID probe returns nothing. ATAT1/ATST32 keep polling snappy.
+     */
+    val INIT = listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATST32", "ATSP6")
+    const val FALLBACK_PROTOCOL = "ATSP0"
 
     object Pid {
+        const val SUPPORTED_01_20 = "0100"
+        const val SUPPORTED_41_60 = "0140"
         const val SPEED = "010D"
         const val RPM = "010C"
-        const val THROTTLE = "0111"
+        const val THROTTLE = "0111"        // often meaningless on diesels
+        const val REL_THROTTLE = "0145"
+        const val ACCEL_PEDAL_D = "0149"   // the real pedal signal on the E90 diesel
+        const val ENGINE_LOAD = "0104"
         const val COOLANT = "0105"
         const val VOLTAGE = "ATRV"
     }
+
+    /**
+     * Parse a supported-PIDs bitmask response (0100/0120/0140…). Returns the set of
+     * supported PID numbers within that range, e.g. 0x0C, 0x0D for a 0100 query.
+     */
+    fun supportedPids(basePid: Int, raw: String): Set<Int> {
+        val pidHex = "01%02X".format(basePid)
+        val d = dataBytes(pidHex, raw) ?: return emptySet()
+        if (d.size < 4) return emptySet()
+        val out = HashSet<Int>()
+        for (byteIdx in 0 until 4) {
+            for (bit in 0 until 8) {
+                if (d[byteIdx] and (0x80 shr bit) != 0) out += basePid + byteIdx * 8 + bit + 1
+            }
+        }
+        return out
+    }
+
+    /**
+     * Choose the best pedal/throttle PID this ECU supports: accelerator pedal D
+     * beats relative throttle beats absolute throttle. Null if none.
+     */
+    fun bestPedalPid(supported: Set<Int>): String? = when {
+        0x49 in supported -> Pid.ACCEL_PEDAL_D
+        0x45 in supported -> Pid.REL_THROTTLE
+        0x11 in supported -> Pid.THROTTLE
+        else -> null
+    }
+
+    /** Generic single-byte percentage PID (0x11, 0x45, 0x49, 0x04): A / 255. */
+    fun percent01(pid: String, raw: String): Double? =
+        dataBytes(pid, raw)?.getOrNull(0)?.let { it / 255.0 }
 
     /** Strip ELM chatter: echoes, prompts, whitespace. */
     fun clean(raw: String): String =

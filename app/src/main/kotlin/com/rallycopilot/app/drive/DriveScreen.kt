@@ -3,6 +3,7 @@ package com.rallycopilot.app.drive
 import android.content.pm.ActivityInfo
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -272,17 +273,37 @@ private fun InstrumentBar(hud: DriveEngine.HudState?, modifier: Modifier) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        // speed
+        // Speed, BIG, colour-coded against the current corner's target:
+        // green = on the money, amber = close, red = far off.
+        val speed = hud?.speedMps ?: 0.0
+        val target = hud?.currentNote?.vTargetMps
+        val delta = if (target != null && target > 0) speed - target else null
+        val speedColour = when {
+            delta == null -> Ink
+            kotlin.math.abs(delta) <= maxOf(1.34, target!! * 0.08) -> Green
+            kotlin.math.abs(delta) <= maxOf(3.6, target * 0.15) -> Amber
+            else -> Red
+        }
         Row(verticalAlignment = Alignment.Bottom) {
-            val mph = ((hud?.speedMps ?: 0.0) * 2.23694).toInt()
-            Text("$mph", color = Ink, fontSize = 44.sp, fontWeight = FontWeight.Black, lineHeight = 44.sp)
-            Text(" mph", color = InkDim, fontSize = 14.sp, modifier = Modifier.padding(bottom = 6.dp))
+            Text(
+                "${(speed * 2.23694).toInt()}",
+                color = speedColour, fontSize = 58.sp, fontWeight = FontWeight.Black, lineHeight = 58.sp,
+            )
+            Column(Modifier.padding(start = 4.dp, bottom = 4.dp)) {
+                if (delta != null && kotlin.math.abs(delta) > maxOf(1.34, target!! * 0.08)) {
+                    Text(
+                        if (delta > 0) "▼ slow" else "▲ ok to push",
+                        color = speedColour, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                    )
+                }
+                Text("mph", color = InkDim, fontSize = 13.sp)
+            }
         }
         // status chips
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Chip("GPS", if (hud?.gpsOk == true) Green else Red)
             Chip("OBD", if (hud?.obdConnected == true) Green else InkDim)
-            Chip("MAP", if (hud?.horizon != null) Green else Amber)
+            if (hud?.spirited == true) Chip("SPIRITED", Amber) else Chip("NORMAL", InkDim)
         }
         // path confidence
         val conf = hud?.currentNote?.pathConfidence ?: hud?.matched?.confidence ?: 0.0
@@ -422,19 +443,87 @@ private fun RoadMap(activity: MainActivity, hud: DriveEngine.HudState?, modifier
     }
 }
 
-/** How hard did that feel? Hard = it was pushing me -> back off. */
+/**
+ * Post-drive sheet. The style detector already classified the drive; this shows its
+ * verdict, lets the user correct it, optionally asks how the pace felt, and always
+ * offers a no-questions exit. Every path through here ends the drive cleanly.
+ */
 @Composable
 fun FeedbackSheet(activity: MainActivity, onDone: () -> Unit) {
     val db = remember { AppDb(activity) }
+    // Capture everything we need BEFORE stopping the drive.
+    val svc = activity.driveService
+    val runId = remember { svc?.runId ?: -1 }
+    val cond = remember { svc?.conditions ?: com.rallycopilot.core.model.Conditions.DRY }
+    val spiritedFraction = remember {
+        runCatching { svc?.engine?.hud?.value?.spiritedFraction }.getOrNull() ?: 0.0
+    }
+    val detectedSpirited = spiritedFraction > 0.20
+    var stopped by remember { mutableStateOf(false) }
+
+    fun endDrive() {
+        if (!stopped) { stopped = true; activity.stopDrive() }
+    }
+
+    fun relearn() {
+        val history = db.allObservations().filter { it.conditions == cond }
+        db.saveProfile(Learning.applySession(db.loadProfile(cond), history), cond)
+    }
+
     Column(
-        Modifier.fillMaxSize().background(Bg).padding(28.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        Modifier.fillMaxSize().background(Bg)
+            .verticalScroll(androidx.compose.foundation.rememberScrollState())
+            .padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(Modifier.height(8.dp))
-        Text("How hard was that?", color = Ink, fontSize = 26.sp, fontWeight = FontWeight.Bold)
-        Text("Hard = it was pushing you → it backs off", color = InkDim, fontSize = 13.sp)
         Spacer(Modifier.height(4.dp))
+        Text("Drive finished", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+
+        // ---- what the model detected ----
+        Column(
+            Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(12.dp)).padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                if (detectedSpirited) "Detected: SPIRITED driving"
+                else "Detected: normal driving",
+                color = if (detectedSpirited) Amber else Ink,
+                fontSize = 17.sp, fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "${(spiritedFraction * 100).toInt()}% of the drive read as pressing on · " +
+                    if (detectedSpirited) "spirited corners will train your profile"
+                    else "calibration untouched — normal pace never lowers your model",
+                color = InkDim, fontSize = 12.sp, lineHeight = 15.sp,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        endDrive()
+                        if (runId >= 0) { db.overrideRunStyle(runId, false); relearn() }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232D38)),
+                    shape = RoundedCornerShape(8.dp),
+                ) { Text("it was normal", fontSize = 12.sp, color = InkDim) }
+                Button(
+                    onClick = {
+                        endDrive()
+                        if (runId >= 0) { db.overrideRunStyle(runId, true); relearn() }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF232D38)),
+                    shape = RoundedCornerShape(8.dp),
+                ) { Text("it was spirited", fontSize = 12.sp, color = Amber) }
+            }
+        }
+
+        // ---- how did the pace advice feel? ----
+        Text(
+            if (detectedSpirited) "How did the suggested speeds feel?"
+            else "How did it feel? (only affects pace if you were pushing)",
+            color = InkDim, fontSize = 13.sp,
+        )
         for ((answer, label, sub, colour) in listOf(
             Quad(FeedbackAnswer.EASY, "EASY", "I had margin — push more", Color(0xFF2266AA)),
             Quad(FeedbackAnswer.GOOD, "GOOD", "about right", Green),
@@ -442,25 +531,33 @@ fun FeedbackSheet(activity: MainActivity, onDone: () -> Unit) {
         )) {
             Button(
                 onClick = {
-                    val svc = activity.driveService
-                    val runId = svc?.runId ?: -1
-                    val cond = svc?.conditions ?: com.rallycopilot.core.model.Conditions.DRY
-                    activity.stopDrive()
+                    endDrive()
                     if (runId >= 0) db.setFeedback(runId, answer.name)
-                    // Feedback lands on the profile for the conditions just driven.
-                    db.saveProfile(Learning.applyFeedback(db.loadProfile(cond), answer), cond)
+                    // Push-factor feedback only means something if you were actually pushing.
+                    if (detectedSpirited) {
+                        db.saveProfile(Learning.applyFeedback(db.loadProfile(cond), answer), cond)
+                    }
                     onDone()
                 },
-                modifier = Modifier.fillMaxWidth().height(74.dp),
+                modifier = Modifier.fillMaxWidth().height(62.dp),
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = colour),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(label, fontSize = 21.sp, color = Color.Black, fontWeight = FontWeight.Black)
-                    Text(sub, fontSize = 12.sp, color = Color(0xCC06080B))
+                    Text(label, fontSize = 19.sp, color = Color.Black, fontWeight = FontWeight.Black)
+                    Text(sub, fontSize = 11.sp, color = Color(0xCC06080B))
                 }
             }
         }
+
+        // ---- no questions, just leave ----
+        Button(
+            onClick = { endDrive(); onDone() },
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF11161D)),
+        ) { Text("skip — just exit", fontSize = 14.sp, color = InkDim) }
+        Spacer(Modifier.height(8.dp))
     }
 }
 

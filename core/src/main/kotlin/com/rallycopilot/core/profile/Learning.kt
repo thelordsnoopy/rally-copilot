@@ -35,9 +35,11 @@ object Learning {
 
     val params = Params()
 
-    /** Filter to observations worth learning from. */
+    /** Filter to observations worth learning from: unconstrained, confident, and
+     *  driven SPIRITED — a normal-pace corner says nothing about your limits. */
     fun usable(obs: List<CornerObservation>): List<CornerObservation> = obs.filter {
         !it.wasConstrained &&
+            it.spirited &&
             it.mapConfidence >= params.minMapConfidence &&
             it.pathConfidence >= params.minPathConfidence &&
             it.aLatObserved.isFinite() && it.aLatObserved > 0.5 // discard parked/crawling noise

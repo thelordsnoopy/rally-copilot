@@ -18,7 +18,7 @@ import org.json.JSONObject
  * Plain SQLite by design — fewer build-time moving parts than Room, and the
  * write pattern (append-only logs) doesn't need an ORM.
  */
-class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", null, 1) {
+class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", null, 2) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""CREATE TABLE runs(id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER,
@@ -31,11 +31,14 @@ class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", nul
         db.execSQL("CREATE TABLE run_events(run_id INTEGER, t_ms INTEGER, type TEXT, payload TEXT)")
         db.execSQL("""CREATE TABLE observations(run_id INTEGER, corner_id INTEGER, t_ms INTEGER,
             band TEXT, min_r REAL, v_entry REAL, v_min REAL, v_exit REAL, a_lat REAL,
-            map_conf REAL, path_conf REAL, constrained INTEGER, conditions TEXT, throttle REAL)""")
+            map_conf REAL, path_conf REAL, constrained INTEGER, conditions TEXT, throttle REAL,
+            spirited INTEGER DEFAULT 1)""")
         db.execSQL("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {}
+    override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {
+        if (old < 2) db.execSQL("ALTER TABLE observations ADD COLUMN spirited INTEGER DEFAULT 1")
+    }
 
     // ---- runs ----
 
@@ -130,6 +133,7 @@ class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", nul
                     put("path_conf", o.pathConfidence); put("constrained", if (o.wasConstrained) 1 else 0)
                     put("conditions", o.conditions.name)
                     o.throttleMean?.let { put("throttle", it) }
+                    put("spirited", if (o.spirited) 1 else 0)
                 }
                 db.insert("observations", null, v)
             }
@@ -150,6 +154,7 @@ class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", nul
                 pathConfidence = c.getDouble(10), wasConstrained = c.getInt(11) == 1,
                 conditions = Conditions.valueOf(c.getString(12)),
                 throttleMean = if (c.isNull(13)) null else c.getDouble(13),
+                spirited = c.getInt(14) == 1,
             )
         }
         return out
@@ -157,6 +162,15 @@ class AppDb(context: Context) : SQLiteOpenHelper(context, "rallycopilot.db", nul
 
     fun observationsFor(runId: Long): List<CornerObservation> =
         allObservations().filter { it.runId == runId }
+
+    /** User override from the post-drive sheet: reclassify a whole run's style, then
+     *  the caller re-derives the profile from history so the correction takes effect. */
+    fun overrideRunStyle(runId: Long, spirited: Boolean) {
+        writableDatabase.execSQL(
+            "UPDATE observations SET spirited=? WHERE run_id=?",
+            arrayOf(if (spirited) 1 else 0, runId),
+        )
+    }
 
     // ---- profiles (stored as JSON in kv; always re-derivable from observations) ----
     // Dry and wet are SEPARATE learned profiles: wet observations never touch the dry
