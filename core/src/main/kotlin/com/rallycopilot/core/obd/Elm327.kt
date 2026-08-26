@@ -11,8 +11,58 @@ object Elm327 {
      * 2006 BMW E90 actually speaks; the client falls back to ATSP0 (auto) if the
      * first PID probe returns nothing. ATAT1/ATST32 keep polling snappy.
      */
-    val INIT = listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATST32", "ATSP6")
+    val INIT = listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATAT1")
     const val FALLBACK_PROTOCOL = "ATSP0"
+
+    /** Snappy per-request timeout, set only AFTER a protocol is known to work. */
+    const val FAST_TIMING = "ATST32"
+    /** Generous per-request timeout, for use while hunting for the protocol. */
+    const val SLOW_TIMING = "ATSTFF"
+
+    /**
+     * Protocols to try, in order, when we do not already know what the car speaks.
+     * Auto-detect goes first because the ELM's own search handles most cars; the
+     * explicit entries exist because a clone that fumbles auto-detect will often
+     * connect happily when told exactly what to use.
+     *
+     * The timeout matters enormously: an ELM327 protocol search can take five to
+     * ten seconds (the 5-baud ISO inits are slow by specification), so giving the
+     * first request after a protocol change a short deadline guarantees a false
+     * "the car isn't answering".
+     */
+    data class Protocol(val cmd: String, val label: String, val probeMs: Long)
+
+    val PROTOCOL_SWEEP = listOf(
+        Protocol("ATSP0", "auto-detect", 15_000),
+        Protocol("ATSP6", "CAN 11-bit 500k", 6_000),
+        Protocol("ATSP7", "CAN 29-bit 500k", 6_000),
+        Protocol("ATSP8", "CAN 11-bit 250k", 6_000),
+        Protocol("ATSP9", "CAN 29-bit 250k", 6_000),
+        Protocol("ATSP5", "KWP2000 fast", 10_000),
+        Protocol("ATSP4", "KWP2000 5-baud", 12_000),
+        Protocol("ATSP3", "ISO 9141-2", 12_000),
+        Protocol("ATSP1", "J1850 PWM", 8_000),
+        Protocol("ATSP2", "J1850 VPW", 8_000),
+    )
+
+    /**
+     * The ELM's own complaint, if the reply is one. These strings are the single
+     * most useful diagnostic the hardware produces and were previously discarded.
+     */
+    fun elmError(raw: String): String? {
+        val c = clean(raw).uppercase()
+        return when {
+            "UNABLE TO CONNECT" in c -> "UNABLE TO CONNECT (no protocol matched the car)"
+            "CAN ERROR" in c -> "CAN ERROR (bus wiring or wrong CAN speed)"
+            "BUS INIT" in c && "ERROR" in c -> "BUS INIT ERROR"
+            "BUS ERROR" in c -> "BUS ERROR"
+            "BUS BUSY" in c -> "BUS BUSY"
+            "STOPPED" in c -> "STOPPED"
+            "NO DATA" in c -> "NO DATA (car heard the request, did not answer)"
+            c.trim() == "?" -> "dongle did not understand the command"
+            else -> null
+        }
+    }
 
     object Pid {
         const val SUPPORTED_01_20 = "0100"

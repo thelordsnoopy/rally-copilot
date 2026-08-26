@@ -263,6 +263,10 @@ class DriveService : Service() {
                         // Gear calibration follows the car, same key as the PID cache.
                         loadGears = { key -> db.kvGet("obd_gears_" + key) },
                         saveGears = { key, data -> db.kvPut("obd_gears_" + key, data) },
+                        // Remember which protocol the car answered on, so the sweep
+                        // is paid for once rather than on every connect.
+                        loadProto = { key -> db.kvGet("obd_proto_" + key) },
+                        saveProto = { key, cmd -> db.kvPut("obd_proto_" + key, cmd) },
                     )
                 }
             }
@@ -297,6 +301,9 @@ class DriveService : Service() {
 
     /** Current link state, for the drive-screen overlay. */
     fun obdState(): ObdClient.State = obd.state
+
+    /** Raw dongle conversation, for diagnosing a car that will not answer. */
+    fun obdLog(): List<String> = obd.diagnosticLog()
 
     /**
      * Which dongle to talk to — and, when the answer is "none", WHY. Every branch

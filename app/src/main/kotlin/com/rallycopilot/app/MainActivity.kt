@@ -188,6 +188,8 @@ class MainActivity : ComponentActivity() {
             },
             loadGears = { k -> db.kvGet("obd_gears_$k") },
             saveGears = { k, v -> db.kvPut("obd_gears_$k", v) },
+            loadProto = { k -> db.kvGet("obd_proto_$k") },
+            saveProto = { k, c -> db.kvPut("obd_proto_$k", c) },
         )
     }
 
@@ -815,6 +817,17 @@ fun SettingsScreen(activity: MainActivity) {
             color = if (obdLive?.startsWith("live") == true) Color(0xFF2EE06B) else Color(0xFF8899AA),
             fontSize = 12.sp,
         )
+        // The raw exchange with the dongle. When a car refuses to answer, the
+        // ELM's own replies ("UNABLE TO CONNECT", "NO DATA", "CAN ERROR") are the
+        // only thing that says which of a dozen causes it is.
+        var showLog by remember { mutableStateOf(false) }
+        val obdLog by androidx.compose.runtime.produceState(initialValue = emptyList<String>(), showLog, testing) {
+            while (true) {
+                value = if (!showLog) emptyList()
+                else activity.driveService?.obdLog() ?: activity.testObd.diagnosticLog()
+                kotlinx.coroutines.delay(1000)
+            }
+        }
         Button(
             onClick = { activity.toggleObdTest() },
             enabled = activity.driveService == null,
@@ -831,6 +844,37 @@ fun SettingsScreen(activity: MainActivity) {
                 fontSize = 13.sp, color = Color(0xFFB8C4D0), fontWeight = FontWeight.Bold,
             )
         }
+        Button(
+            onClick = { showLog = !showLog },
+            modifier = Modifier.fillMaxWidth().height(40.dp),
+            shape = RoundedCornerShape(10.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF141C24)),
+        ) {
+            Text(
+                if (showLog) "hide dongle log" else "show dongle log",
+                fontSize = 12.sp, color = Color(0xFF8899AA),
+            )
+        }
+        if (showLog) {
+            Column(
+                Modifier.fillMaxWidth().background(Color(0xFF0A0E13), RoundedCornerShape(8.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                if (obdLog.isEmpty()) {
+                    Text("nothing yet - start a drive or tap Test connection",
+                        color = Color(0xFF667788), fontSize = 11.sp)
+                }
+                for (line in obdLog.takeLast(24)) {
+                    Text(
+                        line, fontSize = 10.sp, maxLines = 2,
+                        color = if ("error" in line.lowercase() || "UNABLE" in line ||
+                            "NO DATA" in line) Color(0xFFFF8A8A) else Color(0xFF8899AA),
+                    )
+                }
+            }
+        }
+
         val selectedMac = remember { mutableStateOf(db.kvGet("obd_mac")) }
         val bonded = remember {
             // BLUETOOTH_CONNECT (API 31+) may be denied — check first instead of
