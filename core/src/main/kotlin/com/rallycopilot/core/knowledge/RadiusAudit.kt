@@ -6,7 +6,7 @@ package com.rallycopilot.core.knowledge
  * Mid-corner, the IMU's lateral acceleration and the live speed imply the road's
  * REAL radius: R = v² / aLat. Each qualifying pass through a known corner compares
  * that against the mapped radius. A single wild mismatch makes the corner a HEDGED
- * call next time ("maybe left three"); two or more consistent passes correct the
+ * call next time ("care left three"); two or more consistent passes correct the
  * corner's effective radius before banding and speed maths.
  *
  * Corrections only ever TIGHTEN. A map that under-claims severity gets fixed; one

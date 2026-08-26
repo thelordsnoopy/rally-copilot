@@ -56,7 +56,7 @@ class DriveEngine(
         /** At or above this path confidence a corner is called plainly. */
         val speakConfidence: Double = 0.50,
         /** Between here and [speakConfidence] the call is HEDGED — spoken with a
-         *  leading "maybe" instead of being suppressed. Below this the wrong-road
+         *  leading "care" instead of being suppressed. Below this the wrong-road
          *  risk is real and silence stays the rule. */
         val hedgeConfidence: Double = 0.30,
         val gpsLostAfterMs: Long = 3000,
@@ -520,7 +520,7 @@ class DriveEngine(
         if (quiet) return
 
         // Corners we could speak, nearest first. The confidence gate is three-state:
-        // confident → plain call; mid → HEDGED ("maybe left three") — doubt spoken
+        // confident → plain call; mid → HEDGED ("care left three") — doubt spoken
         // instead of silence hiding it; genuinely lost → silent, and NOT marked
         // spoken, so a transient ambiguity must not silence a corner forever.
         val speakable = h.corners.mapNotNull { c ->
@@ -530,8 +530,8 @@ class DriveEngine(
                 !ok -> null
                 c.pathConfidence >= params.speakConfidence -> c
                 c.pathConfidence >= params.hedgeConfidence ->
-                    if (com.rallycopilot.core.model.Modifier.MAYBE in c.modifiers) c
-                    else c.copy(modifiers = listOf(com.rallycopilot.core.model.Modifier.MAYBE) + c.modifiers)
+                    if (com.rallycopilot.core.model.Modifier.CARE in c.modifiers) c
+                    else c.copy(modifiers = listOf(com.rallycopilot.core.model.Modifier.CARE) + c.modifiers)
                 else -> {
                     if (suppressionLogged.add(c.corner.id)) {
                         runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
@@ -610,9 +610,9 @@ class DriveEngine(
             " keys=" + utterance.clipKeys.joinToString("+") +
             " speed=" + "%.1f".format(speed)
         runLog.logEvent(RunEvent(now, RunEventType.NOTE_SPOKEN, chain.joinToString(",") { it.corner.id.toString() }))
-        if (chain.any { com.rallycopilot.core.model.Modifier.MAYBE in it.modifiers }) {
+        if (chain.any { com.rallycopilot.core.model.Modifier.CARE in it.modifiers }) {
             runLog.logEvent(RunEvent(now, RunEventType.NOTE_HEDGED,
-                chain.filter { com.rallycopilot.core.model.Modifier.MAYBE in it.modifiers }
+                chain.filter { com.rallycopilot.core.model.Modifier.CARE in it.modifiers }
                     .joinToString(",") { it.corner.id.toString() }))
         }
     }

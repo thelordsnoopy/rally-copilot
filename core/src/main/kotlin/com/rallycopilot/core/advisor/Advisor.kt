@@ -126,7 +126,7 @@ class Advisor(
             if (band == SeverityBand.FLAT) continue
 
             val modifiers = ArrayList<Modifier>(3)
-            if (audit?.hedge == true) modifiers += Modifier.MAYBE
+            if (audit?.hedge == true) modifiers += Modifier.CARE
             // Low map confidence: keep the honest band and speed, lead with "caution".
             if (corner.confidence < params.softenBelowConfidence) modifiers += Modifier.CAUTION
             if (corner.exitRadiusM < corner.entryRadiusM * params.radiusTrendRatio) modifiers += Modifier.TIGHTENS

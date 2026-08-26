@@ -134,7 +134,7 @@ class HedgedCallTests {
     }
 
     @Test
-    fun `single-pass mismatch speaks maybe before the call`() {
+    fun `single-pass mismatch speaks care before the call`() {
         val store = MemAuditStore()
         store.put(CornerAudit(7, passes = 1, ratioEma = 0.5))
         val auditor = RadiusAuditor(store)
@@ -142,21 +142,21 @@ class HedgedCallTests {
             radiusAuditLookup = { auditor.adviceFor(it) }
         }
         val hc = advisor.annotate(raw(corner(7, 90.0) to 300.0), 25.0, 0L).corners.single()
-        assertTrue(Modifier.MAYBE in hc.modifiers)
+        assertTrue(Modifier.CARE in hc.modifiers)
         val keys = NoteComposer.cornerKeys(hc, NoteComposer.Detail())
-        assertEquals("doubt lands first", "maybe", keys.first())
+        assertEquals("doubt lands first", "care", keys.first())
     }
 
     @Test
-    fun `maybe and caution never stack`() {
+    fun `care and caution never stack`() {
         val hc = HorizonCorner(
             corner = corner(1, 30.0), distanceAheadM = 200.0, pathConfidence = 0.4,
             band = SeverityBand.TWO,
-            modifiers = listOf(Modifier.MAYBE, Modifier.CAUTION),
+            modifiers = listOf(Modifier.CARE, Modifier.CAUTION),
             vTargetMps = 15.0, brakingPointM = 150.0, triggerDistanceM = 120.0,
         )
         val keys = NoteComposer.cornerKeys(hc, NoteComposer.Detail())
-        assertEquals(1, keys.count { it == "maybe" || it == "caution" })
-        assertEquals("maybe", keys.first())
+        assertEquals(1, keys.count { it == "care" || it == "caution" })
+        assertEquals("care", keys.first())
     }
 }

@@ -141,7 +141,7 @@ enum class Modifier(val spoken: String) {
     CAUTION("caution"),
     /** Hedge: the co-driver is not sure — mid path-confidence, or a single-pass
      *  radius-audit mismatch. Spoken FIRST, so doubt lands before the call does. */
-    MAYBE("maybe"),
+    CARE("care"),
 }
 
 /** A corner projected onto the current predicted path. */
@@ -236,7 +236,7 @@ data class Utterance(
 /** Run-log event types. The negative ones matter as much as the positive ones. */
 enum class RunEventType {
     NOTE_SPOKEN, NOTE_SUPPRESSED_LOW_CONFIDENCE, NOTE_CHAINED, NOTE_COMPRESSED,
-    /** Spoken with a leading "maybe" — mid confidence, hedged rather than dropped. */
+    /** Spoken with a leading "care" — mid confidence, hedged rather than dropped. */
     NOTE_HEDGED,
     /** Driver said "wrong" — the last call plus its context, for offline tuning. */
     NOTE_FLAGGED,
