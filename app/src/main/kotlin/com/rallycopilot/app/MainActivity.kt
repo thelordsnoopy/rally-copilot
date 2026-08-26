@@ -94,14 +94,22 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    /** Set when a newer release has been downloaded and is ready to install. */
+    /** A newer release that exists. Nothing downloaded yet. */
+    val updateFound = androidx.compose.runtime.mutableStateOf<com.rallycopilot.app.update.Updater.Release?>(null)
+    /** Set once the APK is downloaded and ready to install. */
     val updateReady = androidx.compose.runtime.mutableStateOf<com.rallycopilot.app.update.Updater.Available?>(null)
 
-    /** Human-readable outcome of the last manual check, for the settings screen. */
+    /** Human-readable outcome of the last check, for the settings screen. */
     val updateStatus = androidx.compose.runtime.mutableStateOf<String?>(null)
     val updateChecking = androidx.compose.runtime.mutableStateOf(false)
+    val updateDownloading = androidx.compose.runtime.mutableStateOf(false)
+    val updateProgress = androidx.compose.runtime.mutableStateOf(0)
 
     /**
+     * Checking is one small API request and returns in about a second. It never
+     * downloads — that is a separate, explicit step, so this can be called freely
+     * at launch without spending mobile data or blocking the button.
+     *
      * [manual] checks report their outcome; the silent check at launch does not,
      * because "couldn't reach GitHub" is not worth interrupting a drive over.
      */
@@ -110,22 +118,53 @@ class MainActivity : ComponentActivity() {
         updateChecking.value = true
         if (manual) updateStatus.value = "checking…"
         lifecycleScope.launch {
-            val result = com.rallycopilot.app.update.Updater.checkNow(
-                this@MainActivity, BuildConfig.VERSION_NAME
-            )
-            when (result) {
-                is com.rallycopilot.app.update.Updater.Result.Update -> {
-                    updateReady.value = result.available
-                    updateStatus.value = "v${result.available.version} downloaded — tap to install"
+            try {
+                when (val result = com.rallycopilot.app.update.Updater.checkNow(BuildConfig.VERSION_NAME)) {
+                    is com.rallycopilot.app.update.Updater.Result.Update -> {
+                        updateFound.value = result.release
+                        // Already fetched on an earlier run? Go straight to install.
+                        updateReady.value = com.rallycopilot.app.update.Updater
+                            .cached(this@MainActivity, result.release)
+                        updateStatus.value = if (updateReady.value != null)
+                            "v${result.release.version} ready to install"
+                        else "v${result.release.version} available (${result.release.sizeMb})"
+                    }
+                    is com.rallycopilot.app.update.Updater.Result.UpToDate -> {
+                        updateFound.value = null
+                        updateReady.value = null
+                        if (manual) updateStatus.value = "up to date (v${result.version})"
+                    }
+                    is com.rallycopilot.app.update.Updater.Result.Failed ->
+                        if (manual) updateStatus.value = "couldn't check: ${result.reason}"
                 }
-                is com.rallycopilot.app.update.Updater.Result.UpToDate -> {
-                    updateReady.value = null
-                    if (manual) updateStatus.value = "up to date (v${result.version})"
-                }
-                is com.rallycopilot.app.update.Updater.Result.Failed ->
-                    if (manual) updateStatus.value = "couldn't check: ${result.reason}"
+            } finally {
+                // Always clear the flag: a stuck flag disables the button forever.
+                updateChecking.value = false
             }
-            updateChecking.value = false
+        }
+    }
+
+    /** Download the found release, with visible progress. */
+    fun downloadUpdate() {
+        val release = updateFound.value ?: return
+        if (updateDownloading.value) return
+        updateDownloading.value = true
+        updateProgress.value = 0
+        updateStatus.value = "downloading v${release.version}…"
+        lifecycleScope.launch {
+            try {
+                val outcome = com.rallycopilot.app.update.Updater.download(
+                    this@MainActivity, release,
+                ) { pct -> updateProgress.value = pct }
+                outcome.onSuccess {
+                    updateReady.value = it
+                    updateStatus.value = "v${it.version} ready to install"
+                }.onFailure {
+                    updateStatus.value = "download failed: ${it.message}"
+                }
+            } finally {
+                updateDownloading.value = false
+            }
         }
     }
 
@@ -234,20 +273,41 @@ fun HomeScreen(activity: MainActivity, onNav: (String) -> Unit) {
         )
         Spacer(Modifier.height(26.dp))
 
-        // OTA update banner: appears only when a newer release is downloaded and ready.
-        activity.updateReady.value?.let { update ->
+        // OTA update banner. Downloading is an explicit tap, never automatic —
+        // silently pulling 40 MB over mobile data on every launch is not on.
+        val upReady by activity.updateReady
+        val upFound by activity.updateFound
+        val upDownloading by activity.updateDownloading
+        val upPct by activity.updateProgress
+        if (upReady != null || upFound != null) {
             Button(
-                onClick = { com.rallycopilot.app.update.Updater.install(activity, update) },
+                onClick = {
+                    val r = upReady
+                    if (r != null) com.rallycopilot.app.update.Updater.install(activity, r)
+                    else activity.downloadUpdate()
+                },
+                enabled = !upDownloading,
                 modifier = Modifier.fillMaxWidth().height(56.dp),
                 shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6BB8FF)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF6BB8FF),
+                    disabledContainerColor = Color(0xFF3A5A75),
+                ),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        "UPDATE v${update.version} READY — TAP TO INSTALL",
-                        fontSize = 14.sp, color = Color(0xFF06080B), fontWeight = FontWeight.Black,
+                        when {
+                            upDownloading -> "DOWNLOADING… $upPct%"
+                            upReady != null -> "UPDATE v${upReady!!.version} READY — TAP TO INSTALL"
+                            else -> "UPDATE v${upFound!!.version} — TAP TO DOWNLOAD (${upFound!!.sizeMb})"
+                        },
+                        fontSize = 13.sp, color = Color(0xFF06080B), fontWeight = FontWeight.Black,
+                        maxLines = 1, softWrap = false,
                     )
-                    Text("downloaded · one tap · data survives", fontSize = 10.sp, color = Color(0xCC06080B))
+                    Text(
+                        if (upReady != null) "one tap · your data survives" else "over Wi-Fi if you can",
+                        fontSize = 10.sp, color = Color(0xCC06080B),
+                    )
                 }
             }
             Spacer(Modifier.height(10.dp))
@@ -481,34 +541,43 @@ fun SettingsScreen(activity: MainActivity) {
 
         // ---- updates ----
         val checking by activity.updateChecking
+        val downloading by activity.updateDownloading
+        val pct by activity.updateProgress
         val status by activity.updateStatus
+        val found by activity.updateFound
         val ready by activity.updateReady
         Text("App version ${BuildConfig.VERSION_NAME}", color = Color(0xFFB8C4D0))
+        val highlight = ready != null || found != null
         Button(
             onClick = {
-                if (ready != null) com.rallycopilot.app.update.Updater.install(activity, ready!!)
-                else activity.checkForUpdates(manual = true)
+                when {
+                    ready != null -> com.rallycopilot.app.update.Updater.install(activity, ready!!)
+                    found != null -> activity.downloadUpdate()
+                    else -> activity.checkForUpdates(manual = true)
+                }
             },
-            enabled = !checking,
+            enabled = !checking && !downloading,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (ready != null) Color(0xFF6BB8FF) else Color(0xFF232D38),
+                containerColor = if (highlight) Color(0xFF6BB8FF) else Color(0xFF232D38),
                 disabledContainerColor = Color(0xFF1A222B),
             ),
         ) {
             Text(
                 when {
+                    downloading -> "DOWNLOADING… $pct%"
                     checking -> "CHECKING…"
                     ready != null -> "INSTALL v${ready!!.version}"
+                    found != null -> "DOWNLOAD v${found!!.version} (${found!!.sizeMb})"
                     else -> "CHECK FOR UPDATES"
                 },
-                fontSize = 14.sp, fontWeight = FontWeight.Bold,
-                color = if (ready != null) Color(0xFF06080B) else Color(0xFFEAF0F6),
+                fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false,
+                color = if (highlight) Color(0xFF06080B) else Color(0xFFEAF0F6),
             )
         }
         status?.let {
-            Text(it, color = if (ready != null) Color(0xFF6BB8FF) else Color(0xFF667788), fontSize = 12.sp)
+            Text(it, color = if (highlight) Color(0xFF6BB8FF) else Color(0xFF667788), fontSize = 12.sp)
         }
 
         // ---- when does the co-driver talk? ----
