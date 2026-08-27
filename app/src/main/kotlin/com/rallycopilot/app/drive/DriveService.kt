@@ -417,6 +417,7 @@ class DriveService : Service() {
 
         voice.setVolume(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f)
         voice.boostDb = db.kvGet("voice_boost")?.toIntOrNull() ?: 6
+        voice.setOutputAsMedia(db.kvGet("voice_channel") == "media")
         voice.setBalance(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f)
         voice.muted = false // a "quiet" from last drive must not silence this one
         // Focus is taken per utterance from here on, never held across the drive.
@@ -616,6 +617,21 @@ class DriveService : Service() {
     /** Live voice level/balance changes from the settings screen. */
     fun setVoiceVolume(v: Float) { if (::voice.isInitialized) voice.setVolume(v) }
     fun setVoiceBoost(db_: Int) { if (::voice.isInitialized) voice.boostDb = db_ }
+    fun setVoiceChannel(media: Boolean) {
+        if (::voice.isInitialized) voice.setOutputAsMedia(media)
+    }
+
+    /** What the audio path is actually doing, for the settings screen. */
+    fun voiceAudioNote(): String {
+        if (!::voice.isInitialized) return "start a drive to check"
+        val ch = if (voice.outputAsMedia) "media channel" else "navigation channel"
+        val boost = when (voice.boostEngaged) {
+            true -> "+${voice.boostDb} dB boost active"
+            false -> "boost REFUSED by this phone"
+            null -> "boost not tried yet"
+        }
+        return "$ch, $boost"
+    }
     fun setVoiceBalance(b: Float) { if (::voice.isInitialized) voice.setBalance(b) }
 
     /** Play a sample so the driver can set level and balance with the engine running. */

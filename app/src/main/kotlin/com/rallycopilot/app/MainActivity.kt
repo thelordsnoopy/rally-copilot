@@ -1000,6 +1000,51 @@ fun SettingsScreen(activity: MainActivity) {
                 "is now shouting, turn this down first.",
             color = Color(0xFF667788), fontSize = 11.sp,
         )
+
+        // ---- which channel the voice travels on ----
+        var mediaChannel by remember { mutableStateOf(db.kvGet("voice_channel") == "media") }
+        Text("Voice channel", color = Color(0xFFB8C4D0))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for ((isMedia, label) in listOf(false to "Navigation", true to "Media")) {
+                val selected = mediaChannel == isMedia
+                Button(
+                    onClick = {
+                        mediaChannel = isMedia
+                        db.kvPut("voice_channel", if (isMedia) "media" else "nav")
+                        activity.driveService?.setVoiceChannel(isMedia)
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) Color(0xFF2EE06B) else Color(0xFF141C24),
+                    ),
+                ) {
+                    Text(
+                        label, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                        color = if (selected) Color.Black else Color(0xFFB8C4D0),
+                    )
+                }
+            }
+        }
+        val audioNote by androidx.compose.runtime.produceState(initialValue = "start a drive to check") {
+            while (true) {
+                value = activity.driveService?.voiceAudioNote() ?: "start a drive to check"
+                kotlinx.coroutines.delay(1500)
+            }
+        }
+        Text(
+            "Now: $audioNote",
+            color = if (audioNote.contains("REFUSED")) Color(0xFFFF8A8A) else Color(0xFF8899AA),
+            fontSize = 12.sp,
+        )
+        Text(
+            "Phones and car stereos often hold navigation audio BELOW music on purpose, " +
+                "so a satnav can't drown the radio — which is the opposite of what you " +
+                "want here, and it happens after the app has already sent the sound at " +
+                "full scale. Media puts the voice in the same mix as the music, at the " +
+                "same level. Music still dips if you have ducking on: that follows the " +
+                "focus request, not this setting. Try Media if the calls are still quiet.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
         Spacer(Modifier.height(10.dp))
         Text("Voice volume: ${(vol * 100).toInt()}%", color = Color(0xFFB8C4D0))
         Slider(

@@ -106,10 +106,52 @@ class VoicePack(private val context: Context) : AudioSink {
      *  travel it too, or it would be measuring a different path. */
     val attributes: AudioAttributes get() = audioAttrs
 
-    private val audioAttrs = AudioAttributes.Builder()
-        .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+    /**
+     * Which channel the voice travels on.
+     *
+     * NAVIGATION is semantically correct — this IS turn-by-turn guidance — and it
+     * is what makes well-behaved players duck. But phones and head units are free
+     * to give navigation its own mix, and plenty give it a quieter one: Samsung
+     * handsets and many car stereos deliberately hold guidance below media so a
+     * satnav cannot drown the music. That is the opposite of what a co-driver is
+     * for, and it is invisible from inside the app — the clips leave here at full
+     * scale either way.
+     *
+     * MEDIA puts the voice in exactly the same mix as the music, at the same level.
+     * Ducking still works, because ducking follows the audio-focus request, not the
+     * usage tag.
+     */
+    @Volatile var outputAsMedia: Boolean = false
+        private set
+
+    /** True/false once a boost has been attempted; null before that. Some devices
+     *  refuse the effect outright, and a boost that never engaged looks identical
+     *  to one that did nothing. */
+    @Volatile var boostEngaged: Boolean? = null
+        private set
+
+    private fun buildAttrs(media: Boolean): AudioAttributes = AudioAttributes.Builder()
+        .setUsage(
+            if (media) AudioAttributes.USAGE_MEDIA
+            else AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+        )
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
+
+    @Volatile private var audioAttrs = buildAttrs(false)
+
+    /**
+     * Switch channel. Everything built from the attributes has to be rebuilt: the
+     * keep-alive stream carries them, and the focus request bakes them in.
+     */
+    fun setOutputAsMedia(media: Boolean) {
+        if (media == outputAsMedia) return
+        outputAsMedia = media
+        audioAttrs = buildAttrs(media)
+        focusRequest = null
+        builtForGain = -1
+        if (keepAlive != null) { stopKeepAlive(); startKeepAlive() }
+    }
 
     init {
         val manifest = context.assets.open("voice/manifest.json").bufferedReader().readText()
@@ -186,12 +228,15 @@ class VoicePack(private val context: Context) : AudioSink {
             val (l, r) = channelGains()
             mp.setVolume(l, r)
             // Best effort: some devices refuse the effect; the call still plays.
-            if (boostDb > 0) boost = runCatching {
-                android.media.audiofx.LoudnessEnhancer(mp.audioSessionId).apply {
-                    setTargetGain(boostDb * 100) // millibels
-                    enabled = true
-                }
-            }.getOrNull()
+            if (boostDb > 0) {
+                boost = runCatching {
+                    android.media.audiofx.LoudnessEnhancer(mp.audioSessionId).apply {
+                        setTargetGain(boostDb * 100) // millibels
+                        enabled = true
+                    }
+                }.getOrNull()
+                boostEngaged = boost?.let { runCatching { it.enabled }.getOrDefault(false) } ?: false
+            }
             mp.start()
         } catch (_: Exception) {
             playNext()
