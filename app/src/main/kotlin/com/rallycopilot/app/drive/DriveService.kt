@@ -370,9 +370,9 @@ class DriveService : Service() {
         voice.muted = false // a "quiet" from last drive must not silence this one
         // Focus is taken per utterance from here on, never held across the drive.
         voice.focusMode = when (db.kvGet("audio_focus")) {
-            "none" -> VoicePack.FocusMode.NONE
             "duck" -> VoicePack.FocusMode.DUCK
-            else -> VoicePack.FocusMode.PAUSE
+            "pause" -> VoicePack.FocusMode.PAUSE
+            else -> VoicePack.FocusMode.NONE
         }
         if (db.kvGet("bt_keepalive") != "off") voice.startKeepAlive()
         if (isDemo) startDemo(map) else {

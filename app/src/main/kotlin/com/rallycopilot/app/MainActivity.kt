@@ -121,13 +121,38 @@ class MainActivity : ComponentActivity() {
      * [manual] checks report their outcome; the silent check at launch does not,
      * because "couldn't reach GitHub" is not worth interrupting a drive over.
      */
+    /** Is there a network at all? Right after a reboot, often not yet. */
+    private fun hasNetwork(): Boolean = runCatching {
+        val cm = getSystemService(android.net.ConnectivityManager::class.java)
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork ?: return false)
+        caps != null && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }.getOrDefault(false)
+
     fun checkForUpdates(manual: Boolean = false) {
-        if (updateChecking.value) return
+        // A MANUAL check always runs, even if one is supposedly already in flight.
+        // The in-flight guard plus a request that never returns is what made this
+        // button a dead control: it renders "CHECKING…", disables itself, and every
+        // retry is swallowed by the guard — surviving a force-stop, because the
+        // hang reproduces on the very next launch.
+        if (updateChecking.value && !manual) return
+        // A launch check with no network must not raise the flag at all: the button
+        // renders "CHECKING…" and disables itself from that flag alone, so anything
+        // that leaves it set turns the updater into a dead control.
+        if (!manual && !hasNetwork()) return
         updateChecking.value = true
         if (manual) updateStatus.value = "checking…"
         lifecycleScope.launch {
             try {
-                when (val result = com.rallycopilot.app.update.Updater.checkNow(BuildConfig.VERSION_NAME)) {
+                // HARD ceiling on the whole check. HttpURLConnection's connect and
+                // read timeouts do NOT bound DNS resolution, and a phone that has
+                // just rebooted — network still negotiating — can sit in the lookup
+                // far longer than the 8 s the socket was given. That is how the
+                // button ended up stuck on "CHECKING…" after a restart, with no way
+                // back short of force-quitting the app.
+                val result = kotlinx.coroutines.withTimeoutOrNull(15_000) {
+                    com.rallycopilot.app.update.Updater.checkNow(BuildConfig.VERSION_NAME)
+                } ?: com.rallycopilot.app.update.Updater.Result.Failed("timed out")
+                when (result) {
                     is com.rallycopilot.app.update.Updater.Result.Update -> {
                         updateFound.value = result.release
                         // Already fetched on an earlier run? Go straight to install.
@@ -269,7 +294,19 @@ class MainActivity : ComponentActivity() {
                 bound = true
             }
         }
+        // Try again on the way back in. The check at launch is skipped when there is
+        // no network yet — which is the norm on a phone that has only just booted —
+        // so without this, an update could sit unnoticed until someone thought to
+        // press the button. Rate-limited so it is not run on every screen change.
+        if (updateFound.value == null && updateReady.value == null &&
+            System.currentTimeMillis() - lastUpdateCheckMs > 30 * 60_000
+        ) {
+            lastUpdateCheckMs = System.currentTimeMillis()
+            checkForUpdates()
+        }
     }
+
+    private var lastUpdateCheckMs = 0L
 
     fun startDrive(wet: Boolean, calibration: Boolean, demo: Boolean = false, condAuto: Boolean = false) {
         // The Settings "Test connection" link MUST be closed before the drive opens
@@ -674,7 +711,9 @@ fun SettingsScreen(activity: MainActivity) {
                     else -> activity.checkForUpdates(manual = true)
                 }
             },
-            enabled = !checking && !downloading,
+            // Never disabled by `checking` alone — a check that never comes back
+            // must still be retryable without force-quitting the app.
+            enabled = !downloading,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(
@@ -868,9 +907,9 @@ fun SettingsScreen(activity: MainActivity) {
         Text("YOUR MUSIC", color = Color(0xFF7C8B9A), fontSize = 11.sp,
             letterSpacing = 2.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
-        var focusMode by remember { mutableStateOf(db.kvGet("audio_focus") ?: "pause") }
+        var focusMode by remember { mutableStateOf(db.kvGet("audio_focus") ?: "none") }
         Row(Modifier.fillMaxWidth().background(Color(0xFF11161D), RoundedCornerShape(12.dp)).padding(4.dp)) {
-            for ((key, label) in listOf("pause" to "PAUSE", "duck" to "DIP", "none" to "LEAVE IT")) {
+            for ((key, label) in listOf("none" to "LEAVE IT", "duck" to "DIP", "pause" to "PAUSE")) {
                 val sel = focusMode == key
                 Button(
                     onClick = { focusMode = key; db.kvPut("audio_focus", key) },
@@ -887,11 +926,11 @@ fun SettingsScreen(activity: MainActivity) {
         }
         Text(
             when (focusMode) {
-                "pause" -> "Music pauses for the call and resumes straight after, so the " +
-                    "co-driver is heard cleanly against silence."
-                "duck" -> "Music dips and the co-driver talks over the top of it."
-                else -> "The co-driver never asks for audio focus at all. Notes mix over " +
-                    "whatever is playing, and nothing else is touched."
+                "pause" -> "Music pauses for the call and resumes straight after."
+                "duck" -> "Music dips while the co-driver talks over the top of it."
+                else -> "Default. The co-driver never asks for audio focus at all — it " +
+                    "just talks over your music, like a passenger would. Nothing else " +
+                    "is paused, dipped or resumed."
             },
             color = Color(0xFF667788), fontSize = 11.sp,
         )

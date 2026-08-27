@@ -29,18 +29,25 @@ class VoicePack(private val context: Context) : AudioSink {
     @Volatile private var focusHeld = false
     @Volatile private var speakingUntil = 0L
 
-    /** What the co-driver is allowed to do to whatever else is playing. */
+    /**
+     * What the co-driver is allowed to do to whatever else is playing.
+     *
+     * NONE is the default at the user's request: a co-driver in a real car simply
+     * talks over the stereo, and every alternative touches somebody else's playback
+     * — which is how this app spent several versions pausing, ducking and even
+     * starting music that was never playing.
+     */
     enum class FocusMode {
-        /** Pause the music for the call, then let it resume. Clearest call. */
-        PAUSE,
-        /** Ask the music to dip instead, and talk over the top of it. */
-        DUCK,
         /** Never ask for audio focus at all: notes mix over whatever is playing. */
         NONE,
+        /** Ask the music to dip, and talk over the top of it. */
+        DUCK,
+        /** Pause the music for the call, then let it resume. */
+        PAUSE,
     }
 
     @Volatile
-    var focusMode: FocusMode = FocusMode.PAUSE
+    var focusMode: FocusMode = FocusMode.NONE
 
     /** Voice level, 0..1. */
     @Volatile var volume: Float = 1.0f
