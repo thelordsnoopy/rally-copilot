@@ -8,10 +8,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
-import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
 /**
  * Measures how long the car actually takes to make a sound.
@@ -35,8 +32,6 @@ object LatencyCalibrator {
     private const val CHIRP_MS = 130
     private const val LEAD_SILENCE_MS = 250     // noise floor is measured in here
     private const val LISTEN_MS = 1_400
-    private const val F_START = 2_200.0
-    private const val F_END = 3_600.0
     /** Sanity bounds. Anything outside these is a bad measurement, not a fast car. */
     private const val MIN_PLAUSIBLE_MS = 30L
     private const val MAX_PLAUSIBLE_MS = 900L
@@ -49,28 +44,34 @@ object LatencyCalibrator {
     )
 
     /** The "cool noise": a short rising sweep with a fast attack and soft tail. */
-    fun chirp(): ShortArray {
-        val n = SAMPLE_RATE * CHIRP_MS / 1000
-        val out = ShortArray(n)
-        var phase = 0.0
-        for (i in 0 until n) {
-            val t = i.toDouble() / n
-            val f = F_START + (F_END - F_START) * t
-            phase += 2 * PI * f / SAMPLE_RATE
-            // Fast attack, exponential decay — reads as a "zip", and the sharp
-            // onset is exactly what makes it easy to time.
-            val env = if (t < 0.04) t / 0.04 else Math.exp(-3.0 * (t - 0.04))
-            // Near full scale: the chirp has to be heard by the phone's own
-            // microphone from across the cabin, over engine and road noise, and a
-            // measurement that fails is a guessed number in every corner call.
-            out[i] = (sin(phase) * env * 0.95 * Short.MAX_VALUE).toInt().toShort()
-        }
-        return out
-    }
+    fun chirp(): ShortArray = com.rallycopilot.core.audio.ChirpDetect.chirp(SAMPLE_RATE, CHIRP_MS)
 
     fun hasMic(context: Context): Boolean =
         context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Measure up to [attempts] times and take the MEDIAN of whatever succeeded.
+     *
+     * One shot at drive start can land on a pothole, a passing lorry or the door
+     * shutting. Three cheap looks and a median is far harder to fool than a single
+     * reading, and this number is subtracted from every braking point of the drive.
+     */
+    fun measureBest(context: Context, attrs: AudioAttributes, attempts: Int = 3): Result {
+        val good = ArrayList<Long>(attempts)
+        var last: Result? = null
+        repeat(attempts) {
+            val r = measure(context, attrs)
+            last = r
+            r.latencyMs?.let { good += it }
+            // A clear win early is enough; do not keep chirping at the driver.
+            if (good.size >= 2 && good.max() - good.min() <= 40) return@repeat
+        }
+        if (good.isEmpty()) return last ?: Result(null, "measurement failed")
+        good.sort()
+        val median = good[good.size / 2]
+        return Result(median, "measured $median ms (best of ${good.size})", last?.noiseLevel ?: 0.0)
+    }
 
     /**
      * Blocking measurement — call off the main thread. Returns null latency (with a
@@ -157,52 +158,18 @@ object LatencyCalibrator {
         }
     }
 
-    /**
-     * Find the chirp by its energy in the 2-4 kHz band. A matched filter would be
-     * more elegant, but a band-limited envelope is cheap, and the chirp's sharp
-     * attack makes onset detection reliable even over a running engine.
-     */
     private fun analyse(buf: ShortArray, valid: Int, playAtSample: Int): Result {
-        val block = SAMPLE_RATE / 400          // 2.5 ms blocks
-        if (valid < playAtSample + block * 8) return Result(null, "recording too short")
-
-        // Band-pass by simple differencing (kills low-frequency engine rumble) and
-        // measure energy per block.
-        val blocks = (valid - 1) / block
-        val energy = DoubleArray(blocks)
-        for (b in 0 until blocks) {
-            var sum = 0.0
-            val start = b * block + 1
-            for (i in start until start + block) {
-                val d = (buf[i] - buf[i - 1]).toDouble()   // high-pass
-                sum += d * d
-            }
-            energy[b] = sum / block
-        }
-
-        val floorBlocks = playAtSample / block
-        if (floorBlocks < 4) return Result(null, "no quiet period to compare against")
-        val floorSorted = energy.copyOfRange(0, floorBlocks).sortedArray()
-        val noiseFloor = floorSorted[floorSorted.size / 2].coerceAtLeast(1.0)
-        val peak = energy.copyOfRange(floorBlocks, blocks).maxOrNull() ?: 0.0
-        val noiseLevel = (Math.sqrt(noiseFloor) / Short.MAX_VALUE * 12).coerceIn(0.0, 1.0)
-
-        // Need the chirp to stand clearly above the cabin. Six times the noise floor
-        // in energy terms is about 8 dB — modest, but enough to be unambiguous.
-        if (peak < noiseFloor * 6.0) {
-            return Result(null, "couldn't hear the chirp — is the volume up?", noiseLevel)
-        }
-        val threshold = maxOf(noiseFloor * 6.0, peak * 0.25)
-        var onset = -1
-        for (b in floorBlocks until blocks) {
-            if (energy[b] >= threshold) { onset = b; break }
-        }
-        if (onset < 0) return Result(null, "chirp not found in the recording", noiseLevel)
-
-        val ms = ((onset * block - playAtSample).toDouble() / SAMPLE_RATE * 1000).roundToInt().toLong()
+        // Detection lives in :core so it can be tested against real cabin noise —
+        // see ChirpTests. The old broadband version worked parked and failed twice
+        // on the move, which meant corner timing ran on a remembered number.
+        val d = com.rallycopilot.core.audio.ChirpDetect.detect(buf, valid, playAtSample, SAMPLE_RATE)
+        val onset = d.onsetSamples
+            ?: return Result(null, d.reason, d.noiseLevel)
+        val ms = (onset.toDouble() / SAMPLE_RATE * 1000).roundToInt().toLong()
         if (ms < MIN_PLAUSIBLE_MS || ms > MAX_PLAUSIBLE_MS) {
-            return Result(null, "measured ${ms} ms, which is out of range — ignoring", noiseLevel)
+            return Result(null, "measured ${ms} ms, which is out of range — ignoring", d.noiseLevel)
         }
-        return Result(ms, "measured ${ms} ms", noiseLevel)
+        return Result(ms, "measured ${ms} ms", d.noiseLevel)
     }
+
 }

@@ -551,7 +551,7 @@ class DriveService : Service() {
         // playing across the chirp is the one thing that reliably breaks it.
         voice.beginMeasurement()
         val r = try {
-            com.rallycopilot.app.audio.LatencyCalibrator.measure(this, voice.attributes)
+            com.rallycopilot.app.audio.LatencyCalibrator.measureBest(this, voice.attributes)
         } finally {
             voice.endMeasurement()
         }
