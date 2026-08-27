@@ -101,6 +101,27 @@ def main():
         print(f"  ticks with an EMPTY horizon: {100 * nohorizon / len(states):.0f}%")
         print()
 
+    imu2 = k.get("imu", [])
+    verd = [r.get("slipVerdict") for r in imu2 if r.get("slipVerdict")]
+    if verd:
+        print("=== IS THE CAR GOING WHERE IT IS POINTING? ===")
+        counts = collections.Counter(verd)
+        for v, n in counts.most_common():
+            print(f"  {v:11} {n:6d} samples ({100 * n / len(verd):4.1f}%)")
+        sliding = [r for r in imu2 if r.get("sliding")]
+        print(f"  sliding on {len(sliding)} samples ({100 * len(sliding) / len(imu2):.1f}%)")
+        ratios = sorted(r["slipRatio"] for r in imu2
+                        if r.get("slipRatio") and r.get("slipVerdict") not in (None, "UNKNOWN"))
+        if ratios:
+            print(f"  yaw/course ratio while cornering: p10 {ratios[len(ratios) // 10]:.2f} "
+                  f"median {ratios[len(ratios) // 2]:.2f} p90 {ratios[int(len(ratios) * .9)]:.2f} "
+                  f"(1.0 = gripping)")
+        dr = [r["drivenR"] for r in imu2 if r.get("drivenR")]
+        if dr:
+            d = sorted(dr)
+            print(f"  driven radius measured on {len(dr)} samples, median {d[len(d) // 2]:.0f} m")
+        print()
+
     print("=== WHAT WAS SAID ===")
     notes = k.get("note", [])
     print(f"  {len(notes)} calls")

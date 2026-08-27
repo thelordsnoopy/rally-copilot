@@ -21,6 +21,13 @@ class ImuMonitor(
     private val onBump: () -> Unit,
     /** Raw phone-frame vectors for mount alignment and camber, ~50 Hz. */
     private val onSample: (accel: com.rallycopilot.core.imu.Vec3, gravity: com.rallycopilot.core.imu.Vec3) -> Unit = { _, _ -> },
+    /**
+     * Yaw rate about the VERTICAL axis, rad/s, positive anticlockwise seen from
+     * above. Derived from the gyroscope's component along gravity, so it needs no
+     * mount alignment: swivelling the phone about the vertical axis — which is
+     * exactly what a loose cradle does — leaves this component untouched.
+     */
+    private val onYawRate: (radPerSec: Double) -> Unit = { },
 ) : SensorEventListener {
 
     private val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -40,6 +47,9 @@ class ImuMonitor(
         sm.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)?.let {
             sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
+        sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)?.let {
+            sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
     }
 
     fun stop() = sm.unregisterListener(this)
@@ -49,6 +59,18 @@ class ImuMonitor(
             Sensor.TYPE_GRAVITY -> {
                 gravity[0] = e.values[0]; gravity[1] = e.values[1]; gravity[2] = e.values[2]
                 haveGravity = true
+            }
+            Sensor.TYPE_GYROSCOPE -> {
+                if (!haveGravity) return
+                val gMag = sqrt(
+                    (gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]).toDouble()
+                )
+                if (gMag < 1e-3) return
+                // Gravity points DOWN, so the component along it is negated to give
+                // rotation about UP: positive = turning left.
+                val yaw = -(e.values[0] * gravity[0] + e.values[1] * gravity[1] +
+                    e.values[2] * gravity[2]) / gMag
+                onYawRate(yaw)
             }
             Sensor.TYPE_LINEAR_ACCELERATION -> {
                 if (!haveGravity) return

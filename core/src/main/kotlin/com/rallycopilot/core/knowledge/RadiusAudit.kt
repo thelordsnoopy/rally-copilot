@@ -70,6 +70,7 @@ class RadiusAuditor(
     private var currentMapRadiusM: Double = 0.0
     private var bestALat: Double = 0.0
     private var speedAtBest: Double = 0.0
+    private var tightestDrivenM: Double = Double.MAX_VALUE
 
     /**
      * Feed every engine tick. [cornerId]/[mapRadiusM] describe the corner the car is
@@ -85,6 +86,17 @@ class RadiusAuditor(
         speedMps: Double,
         aLatImuMps2: Double?,
         gpsAccuracyM: Double?,
+        /**
+         * The radius the car actually drove, from speed and GNSS course rate.
+         *
+         * Preferred over the lateral-g route when available, because it needs no
+         * mount alignment — and mount alignment has never once completed on this
+         * phone. It measures the PATH rather than the road, so a driver straightening
+         * a bend reads wider than the map; that only ever produces ratios above 1,
+         * which this auditor refuses to act on anyway. What it catches is the case
+         * that matters: a map claiming 200 m where the car cannot get round above 70.
+         */
+        drivenRadiusM: Double? = null,
     ) {
         if (cornerId != currentCornerId) {
             closePass()
@@ -92,11 +104,16 @@ class RadiusAuditor(
             currentMapRadiusM = mapRadiusM ?: 0.0
         }
         if (cornerId == null) return
-        // Gates: every sample must qualify on its own; the pass keeps only the
-        // hardest-cornering qualifying moment (peak aLat ↔ closest to the apex).
-        if (aLatImuMps2 == null || !aLatImuMps2.isFinite()) return
         if (gpsAccuracyM == null || gpsAccuracyM > params.maxGpsAccuracyM) return
         if (speedMps < params.minSpeedMps) return
+        // Route one: the path the car actually described. No mount needed.
+        if (drivenRadiusM != null && drivenRadiusM.isFinite() && drivenRadiusM > 1.0) {
+            if (drivenRadiusM < tightestDrivenM) tightestDrivenM = drivenRadiusM
+            return
+        }
+        // Route two: lateral g. Keeps only the hardest-cornering qualifying moment
+        // (peak aLat ↔ closest to the apex).
+        if (aLatImuMps2 == null || !aLatImuMps2.isFinite()) return
         if (aLatImuMps2 < params.minALatMps2) return
         if (aLatImuMps2 > bestALat) {
             bestALat = aLatImuMps2
@@ -110,11 +127,17 @@ class RadiusAuditor(
         val rMap = currentMapRadiusM
         val aLat = bestALat
         val v = speedAtBest
+        val driven = tightestDrivenM
         currentCornerId = -1
         bestALat = 0.0
         speedAtBest = 0.0
-        if (id < 0 || rMap <= 0.0 || aLat < params.minALatMps2) return
-        val rImplied = (v * v) / aLat
+        tightestDrivenM = Double.MAX_VALUE
+        if (id < 0 || rMap <= 0.0) return
+        val rImplied = when {
+            driven < Double.MAX_VALUE -> driven
+            aLat >= params.minALatMps2 -> (v * v) / aLat
+            else -> return
+        }
         val ratio = (rImplied / rMap).coerceIn(params.minRatio, params.maxRatio)
         val prev = store.get(id)
         val ema = if (prev == null) ratio

@@ -95,6 +95,11 @@ class DriveService : Service() {
     private var radiusAuditor: com.rallycopilot.core.knowledge.RadiusAuditor? = null
     private var blackBox: com.rallycopilot.app.debug.BlackBox? = null
     private var voiceCommands: com.rallycopilot.app.audio.VoiceCommands? = null
+    /** Is the car going where it is pointing? Gyro vs GNSS course. */
+    val slip = com.rallycopilot.core.imu.SlipEstimator()
+    @Volatile private var yawRateRadS = 0.0
+    @Volatile private var courseRateRadS = 0.0
+
     /** Phone-in-mount wobble, degrees — the DriveScreen warns above 8. */
     @Volatile var mountWobbleDeg: Double = 0.0
         private set
@@ -278,6 +283,13 @@ class DriveService : Service() {
                     }
                 }
             },
+            onYawRate = { rad ->
+                yawRateRadS = rad
+                val hud = engine.hud.value
+                val st = slip.tick(System.currentTimeMillis(), rad, courseRateRadS, hud.speedMps)
+                engine.slipping = st.sliding
+                engine.drivenRadiusM = slip.drivenRadiusM(hud.speedMps)
+            },
             onBump = {
                 slowMon.reportBump(System.currentTimeMillis())
                 blackBox?.log("bump", mapOf(
@@ -339,6 +351,12 @@ class DriveService : Service() {
                         "coherence" to mount.coherence,
                         "fx" to fwd?.x, "fy" to fwd?.y, "fz" to fwd?.z,
                         "camberDeg" to deg,
+                        "yawRate" to slip.state.yawRateRadS,
+                        "courseRate" to slip.state.courseRateRadS,
+                        "slipRatio" to slip.state.ratio,
+                        "slipVerdict" to slip.state.verdict.name,
+                        "sliding" to slip.state.sliding,
+                        "drivenR" to slip.drivenRadiusM(hudNow.speedMps),
                         "aLat" to engine.imuLateralMps2,
                         "speed" to hudNow.speedMps,
                         "edge" to hudNow.matched?.edgeId, "off" to hudNow.matched?.offsetM,
@@ -670,6 +688,21 @@ class DriveService : Service() {
                             com.rallycopilot.core.model.LatLon(prev.lat, prev.lon),
                             com.rallycopilot.core.model.LatLon(fix.lat, fix.lon),
                         )
+                        // How fast the VELOCITY VECTOR is turning, from successive
+                        // GNSS bearings. Paired against the gyro's body yaw rate,
+                        // the difference is sideslip — the car not going where it
+                        // is pointing. Bearing is only meaningful while moving, and
+                        // is NaN when the fix has none.
+                        val dt = (fix.tMs - prev.tMs) / 1000.0
+                        if (dt in 0.05..2.0 && fix.speedMps > 3.0 &&
+                            !fix.bearingDeg.isNaN() && !prev.bearingDeg.isNaN()
+                        ) {
+                            var d = fix.bearingDeg - prev.bearingDeg
+                            while (d > 180) d -= 360
+                            while (d < -180) d += 360
+                            // Bearing grows clockwise; yaw is positive anticlockwise.
+                            courseRateRadS = -Math.toRadians(d) / dt
+                        }
                     }
                     lastFix = fix
                     scope.launch(engineDispatcher) { if (driveActive) engine.onFix(fix) }
@@ -721,12 +754,13 @@ class DriveService : Service() {
                     "aLat" to o.aLatObserved, "g" to o.aLatObserved / 9.81,
                     "mapConf" to o.mapConfidence, "pathConf" to o.pathConfidence,
                     "constrained" to o.wasConstrained, "spirited" to o.spirited,
-                    "confirmed" to o.confirmed,
+                    "confirmed" to o.confirmed, "slid" to o.slid,
                     "throttle" to o.throttleMean,
                     "rejectedBecause" to when {
                         o.wasConstrained -> "constrained"
                         !o.spirited -> "not spirited"
                         o.mapConfidence < 0.6 -> "map confidence %.2f < 0.60".format(o.mapConfidence)
+                        o.slid -> "the car was sliding — not evidence of grip"
                         !o.confirmed -> "never matched onto the corner's own edge"
                         o.aLatObserved <= 0.5 -> "lateral g too low"
                         else -> null

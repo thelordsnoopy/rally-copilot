@@ -46,6 +46,8 @@ object Learning {
             // calling a corner on a road you are not on. It has no business deciding
             // what a corner you demonstrably drove is allowed to teach.
             it.confirmed &&
+            // A slide is not evidence of grip — see CornerObservation.slid.
+            !it.slid &&
             it.aLatObserved.isFinite() && it.aLatObserved > 0.5 // discard parked/crawling noise
     }
 

@@ -23,7 +23,7 @@ import org.json.JSONObject
  * service's write transactions.
  */
 class AppDb private constructor(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "rallycopilot.db", null, 5) {
+    SQLiteOpenHelper(context.applicationContext, "rallycopilot.db", null, 6) {
 
     companion object {
         @Volatile private var instance: AppDb? = null
@@ -47,7 +47,7 @@ class AppDb private constructor(context: Context) :
             band TEXT, min_r REAL, v_entry REAL, v_min REAL, v_exit REAL, a_lat REAL,
             map_conf REAL, path_conf REAL, constrained INTEGER, conditions TEXT, throttle REAL,
             spirited INTEGER DEFAULT 1, car TEXT DEFAULT 'default',
-            confirmed INTEGER DEFAULT 1)""")
+            confirmed INTEGER DEFAULT 1, slid INTEGER DEFAULT 0)""")
         db.execSQL("CREATE INDEX idx_obs_run ON observations(run_id)")
         db.execSQL("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
         db.execSQL("""CREATE TABLE corner_audit(corner_id INTEGER PRIMARY KEY,
@@ -72,6 +72,10 @@ class AppDb private constructor(context: Context) :
             // Rows recorded before confirmation existed were gated on path
             // confidence instead, so they were already at least that trustworthy.
             db.execSQL("ALTER TABLE observations ADD COLUMN confirmed INTEGER DEFAULT 1")
+        }
+        if (old < 6) {
+            // Nothing before this could detect a slide, so nothing is marked as one.
+            db.execSQL("ALTER TABLE observations ADD COLUMN slid INTEGER DEFAULT 0")
         }
     }
 
@@ -224,6 +228,7 @@ class AppDb private constructor(context: Context) :
                     o.throttleMean?.let { put("throttle", it) }
                     put("spirited", if (o.spirited) 1 else 0)
                     put("confirmed", if (o.confirmed) 1 else 0)
+                    put("slid", if (o.slid) 1 else 0)
                 }
                 db.insert("observations", null, v)
             }
@@ -246,6 +251,7 @@ class AppDb private constructor(context: Context) :
                 throttleMean = if (c.isNull(13)) null else c.getDouble(13),
                 spirited = c.getInt(14) == 1,
                 confirmed = c.getColumnIndex("confirmed").let { i -> i < 0 || c.getInt(i) == 1 },
+                slid = c.getColumnIndex("slid").let { i -> i >= 0 && c.getInt(i) == 1 },
             )
         }
         return out

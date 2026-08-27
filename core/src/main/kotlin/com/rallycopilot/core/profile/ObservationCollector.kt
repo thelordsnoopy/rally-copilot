@@ -62,6 +62,8 @@ class ObservationCollector(
         var detached: Boolean = false,
         /** The matcher put us on this corner's own edge while we were driving it. */
         var confirmed: Boolean = false,
+        /** The car was sliding at some point through this corner. */
+        var slid: Boolean = false,
     )
 
     private var spiritedNow: Boolean = false
@@ -117,6 +119,8 @@ class ObservationCollector(
         spiritedNow: Boolean = false,
         /** The edge the matcher currently has the car on, for confirmation. */
         matchedEdgeId: Long? = null,
+        /** The car is not going where it is pointing right now. */
+        slipping: Boolean = false,
         distanceAheadOf: (HorizonCorner) -> Double,
     ) {
         this.spiritedNow = spiritedNow
@@ -147,6 +151,7 @@ class ObservationCollector(
             if (stillInside) {
                 // Proof we are on this corner's road, not one the horizon guessed.
                 if (matchedEdgeId != null && matchedEdgeId == t.hc.corner.edgeId) t.confirmed = true
+                if (slipping) t.slid = true
                 if (speedMps < t.vMin) t.vMin = speedMps
                 if (throttle01 != null) { t.throttleSum += throttle01; t.throttleN++ }
             } else {
@@ -185,6 +190,7 @@ class ObservationCollector(
             // Spirited at entry, at exit, or self-evidently from the cornering load.
             spirited = t.wasSpirited || spiritedNow || aLat >= DECISIVE_A_LAT,
             confirmed = t.confirmed,
+            slid = t.slid,
         )
     }
 

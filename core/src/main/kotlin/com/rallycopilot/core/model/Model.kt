@@ -230,6 +230,18 @@ data class CornerObservation(
      * matcher, all discarded because the app had not been sure in advance.
      */
     val confirmed: Boolean = true,
+    /**
+     * The car was sliding through this corner — body rotation and path curvature
+     * disagreed (see SlipEstimator).
+     *
+     * `aLatObserved` is computed as v²/R against the MAP's radius, which silently
+     * assumes the car followed the road's curve. A car that is understeering wide
+     * or rotating did not, so the number is not a measurement of grip and must not
+     * become one. With no absolute ceiling on the learning loop by the user's
+     * decision, a slide teaching the model that a corner is quick is exactly the
+     * drift the remaining guardrails exist to prevent.
+     */
+    val slid: Boolean = false,
 )
 
 enum class FeedbackAnswer { EASY, GOOD, HARD }

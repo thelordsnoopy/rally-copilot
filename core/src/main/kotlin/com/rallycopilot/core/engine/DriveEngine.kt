@@ -125,6 +125,14 @@ class DriveEngine(
     @Volatile
     var imuLateralMps2: Double? = null
 
+    /** The car is not going where it is pointing (see SlipEstimator). */
+    @Volatile
+    var slipping: Boolean = false
+
+    /** Radius the car ACTUALLY drove, from speed and GNSS course rate. Map-free. */
+    @Volatile
+    var drivenRadiusM: Double? = null
+
     /** Everything the HUD needs, updated every tick. */
     data class HudState(
         val matched: MatchedPosition? = null,
@@ -399,11 +407,13 @@ class DriveEngine(
             speedMps = speed,
             aLatImuMps2 = imuLateralMps2,
             gpsAccuracyM = fix?.accuracyM,
+            // Only while gripping: a slide describes a path that is not the road's.
+            drivenRadiusM = if (slipping) null else drivenRadiusM,
         )
 
         // ---- feed the observation collector (runs behind the car) ----
         collector?.tick(now, speed, vehicle.throttle01(), h.corners, spiritedNow,
-            matchedEdgeId = lastMatch?.edgeId) { aheadOf(it) }
+            matchedEdgeId = lastMatch?.edgeId, slipping = slipping) { aheadOf(it) }
 
         // ---- personal knowledge: unexplained slowdowns become hazard evidence ----
         recentSpeeds += now to speed
@@ -464,6 +474,7 @@ class DriveEngine(
                 "fuel" to vehicle.fuelLevel01(), "obdSilent" to vehicle.linkSilent(),
                 // motion
                 "aLatImu" to imuLateralMps2,
+                "slipping" to slipping, "drivenR" to drivenRadiusM,
                 "aLatGeom" to insideCorner?.let { (speed * speed) / it.corner.minRadiusM },
                 "insideCorner" to insideCorner?.corner?.id,
                 // what the co-driver thinks
