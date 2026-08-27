@@ -90,6 +90,13 @@ def main():
                   f"(available on {100 * len(alat) / len(states):.0f}% of ticks)")
         else:
             print("  IMU lateral never available — mount alignment never completed")
+        imu = k.get("imu", [])
+        wob = [r["wobbleDeg"] for r in imu if r.get("wobbleDeg") is not None]
+        if wob:
+            w = sorted(wob)
+            print(f"  mount wobble: median {w[len(w) // 2]:.1f} deg, p90 {w[int(len(w) * .9)]:.1f} deg "
+                  f"(rigid mount ~2-5; above 8 the phone is moving in its holder "
+                  f"and alignment/camber/audit are all disabled)")
         nohorizon = sum(1 for s in states if not s.get("horizonCorners"))
         print(f"  ticks with an EMPTY horizon: {100 * nohorizon / len(states):.0f}%")
         print()

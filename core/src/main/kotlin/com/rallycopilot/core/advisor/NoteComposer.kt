@@ -26,6 +26,18 @@ object NoteComposer {
         val dangerModifiers: Boolean = true,
         val shapeModifiers: Boolean = true,
         /**
+         * When set, the target speed is spoken only for these corner ids. Null =
+         * every corner (when [speed] is on).
+         *
+         * The speed decision used to be one flag for a whole chain, so one corner
+         * needing "sixty" dragged a speed onto its neighbour too — the first traced
+         * drive said "right six, NINETY-FIVE" at 70 mph on a B-road, a physically
+         * derived number for a corner nobody needed telling about, spoken purely
+         * because the corner after it wanted "sixty". Slower to say, and advice
+         * nobody should hear.
+         */
+        val speedCornerIds: Set<Long>? = null,
+        /**
          * "into" — the word that says two corners are one continuous piece of road
          * with no straight between them.
          *
@@ -68,7 +80,9 @@ object NoteComposer {
         if (detail.dangerModifiers) {
             for (m in c.modifiers) if (m in DANGER) keys += m.spoken
         }
-        if (detail.speed) speedKey(c.vTargetMps)?.let { keys += it }
+        if (detail.speed && detail.speedCornerIds?.contains(c.corner.id) != false) {
+            speedKey(c.vTargetMps)?.let { keys += it }
+        }
         if (detail.gear) c.gear?.let { keys += "gear_$it" }
         if (detail.linkWords && Modifier.INTO in c.modifiers) keys += Modifier.INTO.spoken
         return keys

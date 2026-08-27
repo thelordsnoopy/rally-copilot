@@ -95,6 +95,9 @@ class DriveService : Service() {
     private var radiusAuditor: com.rallycopilot.core.knowledge.RadiusAuditor? = null
     private var blackBox: com.rallycopilot.app.debug.BlackBox? = null
     private var voiceCommands: com.rallycopilot.app.audio.VoiceCommands? = null
+    /** Phone-in-mount wobble, degrees — the DriveScreen warns above 8. */
+    @Volatile var mountWobbleDeg: Double = 0.0
+        private set
     @Volatile private var distanceM = 0.0
     private var lastFix: Fix? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -321,6 +324,7 @@ class DriveService : Service() {
                 val deg = camber.tick(accel, grav, hudNow.speedMps)
                 // Black box: the raw IMU stream, thinned to ~10 Hz. Full sensor rate
                 // is 50-100 Hz and would be most of the file for little extra truth.
+                mountWobbleDeg = mount.wobbleDeg
                 if (now - lastImuLogT > 100) {
                     lastImuLogT = now
                     val fwd = mount.forward
@@ -329,6 +333,8 @@ class DriveService : Service() {
                         "gx" to grav.x, "gy" to grav.y, "gz" to grav.z,
                         "dvdt" to currentDvdt,
                         "aligned" to mount.isAligned,
+                        "wobbleDeg" to mount.wobbleDeg,
+                        "stable" to mount.isStable,
                         "alignEvents" to mount.eventCount,
                         "coherence" to mount.coherence,
                         "fx" to fwd?.x, "fy" to fwd?.y, "fz" to fwd?.z,
@@ -392,6 +398,7 @@ class DriveService : Service() {
         }
 
         voice.setVolume(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f)
+        voice.boostDb = db.kvGet("voice_boost")?.toIntOrNull() ?: 6
         voice.setBalance(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f)
         voice.muted = false // a "quiet" from last drive must not silence this one
         // Focus is taken per utterance from here on, never held across the drive.
@@ -590,6 +597,7 @@ class DriveService : Service() {
 
     /** Live voice level/balance changes from the settings screen. */
     fun setVoiceVolume(v: Float) { if (::voice.isInitialized) voice.setVolume(v) }
+    fun setVoiceBoost(db_: Int) { if (::voice.isInitialized) voice.boostDb = db_ }
     fun setVoiceBalance(b: Float) { if (::voice.isInitialized) voice.setBalance(b) }
 
     /** Play a sample so the driver can set level and balance with the engine running. */

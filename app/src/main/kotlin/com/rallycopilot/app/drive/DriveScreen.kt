@@ -387,6 +387,9 @@ private fun InstrumentBar(hud: DriveEngine.HudState?, modifier: Modifier) {
             if (hud?.pressingOn == false) Chip("QUIET", InkDim)
             else if (hud?.spirited == true) Chip("SPIRITED", Amber)
             else Chip("CALLING", Green)
+            // The phone moving in its holder, not the car moving: alignment, camber
+            // and the radius audit are all blind until the mount is wedged tight.
+            if ((DriveService.instance?.mountWobbleDeg ?: 0.0) >= 8.0) Chip("LOOSE MOUNT", Amber)
         }
         // path confidence
         val conf = hud?.currentNote?.pathConfidence ?: hud?.matched?.confidence ?: 0.0

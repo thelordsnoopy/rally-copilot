@@ -679,15 +679,20 @@ class DriveEngine(
         // Speak speed and gear only when they tell you something you would not
         // already assume. Calling the target speed of a corner you are already
         // slower than is exactly the noise that makes a co-driver ignorable.
-        val needsSlowing = chain.any { it.vTargetMps < speed * params.speakSpeedBelowRatio }
-        val severe = chain.any { it.band == com.rallycopilot.core.model.SeverityBand.HAIRPIN ||
-            it.band == com.rallycopilot.core.model.SeverityBand.ONE ||
-            it.band == com.rallycopilot.core.model.SeverityBand.TWO }
+        // PER CORNER, not per chain: one corner needing "sixty" must not drag a
+        // "ninety-five" onto the open bend next to it.
+        fun speedWorthSaying(c: HorizonCorner): Boolean =
+            c.vTargetMps < speed * params.speakSpeedBelowRatio ||
+                c.band == com.rallycopilot.core.model.SeverityBand.HAIRPIN ||
+                c.band == com.rallycopilot.core.model.SeverityBand.ONE ||
+                c.band == com.rallycopilot.core.model.SeverityBand.TWO
+        val speedCorners = chain.filter { speedWorthSaying(it) }.map { it.corner.id }.toSet()
         val currentGear = vehicle.currentGear()
         val needsDownshift = currentGear != null &&
             chain.any { c -> c.gear != null && c.gear < currentGear }
         val detail = NoteComposer.Detail(
-            speed = params.speakSpeed && (needsSlowing || severe),
+            speed = params.speakSpeed && speedCorners.isNotEmpty(),
+            speedCornerIds = speedCorners,
             gear = params.includeGear && vehicle.rpm() != null && needsDownshift,
         )
 
@@ -735,7 +740,13 @@ class DriveEngine(
 
     /** Metres consumed while the utterance plays, incl. BT latency — end-anchored timing. */
     private fun speechLeadM(speed: Double, c: HorizonCorner): Double {
-        val clipMs = NoteComposer.cornerKeys(c, includeGear = false).sumOf { audio.clipDurationMs(it) }
+        // Estimate with the details a real call is likely to carry. The old
+        // estimate ignored the speed clip, so a call that gained "sixty" at
+        // compose time travelled ~15-20 m further than the trigger had budgeted —
+        // two of eleven calls in the first traced drive finished PAST their
+        // braking point.
+        val detail = NoteComposer.Detail(speed = params.speakSpeed, gear = false)
+        val clipMs = NoteComposer.cornerKeys(c, detail).sumOf { audio.clipDurationMs(it) }
         return speed * (clipMs + audioLatencyMs) / 1000.0
     }
 

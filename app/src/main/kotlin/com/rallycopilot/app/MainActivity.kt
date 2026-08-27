@@ -981,6 +981,26 @@ fun SettingsScreen(activity: MainActivity) {
         var vol by remember { mutableStateOf(db.kvGet("voice_volume")?.toFloatOrNull() ?: 1.0f) }
         var bal by remember { mutableStateOf(db.kvGet("voice_balance")?.toFloatOrNull() ?: 0.0f) }
 
+        var boost by remember { mutableStateOf(db.kvGet("voice_boost")?.toIntOrNull() ?: 6) }
+        Text(
+            "Voice boost: ${if (boost == 0) "off" else "+$boost dB"}",
+            color = Color(0xFFB8C4D0),
+        )
+        Slider(
+            value = boost.toFloat(), onValueChange = {
+                boost = it.toInt()
+                db.kvPut("voice_boost", boost.toString())
+                activity.driveService?.setVoiceBoost(boost)
+            },
+            valueRange = 0f..12f, steps = 11,
+        )
+        Text(
+            "Extra gain past 100%, for being heard over music at motorway volume. " +
+                "The clips are also mastered louder than before — if the co-driver " +
+                "is now shouting, turn this down first.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+        Spacer(Modifier.height(10.dp))
         Text("Voice volume: ${(vol * 100).toInt()}%", color = Color(0xFFB8C4D0))
         Slider(
             value = vol,

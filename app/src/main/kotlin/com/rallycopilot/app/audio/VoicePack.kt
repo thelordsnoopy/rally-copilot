@@ -53,6 +53,17 @@ class VoicePack(private val context: Context) : AudioSink {
     @Volatile var volume: Float = 1.0f
         private set
 
+    /**
+     * Extra gain ON TOP of full volume, dB, via Android's LoudnessEnhancer.
+     *
+     * The volume slider tops out at digital full scale, and against a car stereo
+     * at road-trip volume that was not enough — Chad had 100% set and still could
+     * not hear the calls over music. The clips are now mastered ~7 dB hotter at
+     * build time, and this adds up to 12 dB more at playback for the driver who
+     * wants the co-driver to simply be the loudest thing in the car.
+     */
+    @Volatile var boostDb: Int = 6
+
     /** Hands-free "quiet": everything is swallowed until "talk". The keep-alive
      *  stream keeps running so unmuting doesn't cost a swallowed first syllable. */
     @Volatile var muted: Boolean = false
@@ -163,11 +174,24 @@ class VoicePack(private val context: Context) : AudioSink {
             mp.setAudioAttributes(audioAttrs)
             mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
             afd.close()
-            mp.setOnCompletionListener { it.release(); if (player === it) player = null; playNext() }
-            mp.setOnErrorListener { p, _, _ -> p.release(); if (player === p) player = null; playNext(); true }
+            var boost: android.media.audiofx.LoudnessEnhancer? = null
+            fun cleanup(m: MediaPlayer) {
+                runCatching { boost?.release() }
+                m.release()
+                if (player === m) player = null
+            }
+            mp.setOnCompletionListener { cleanup(it); playNext() }
+            mp.setOnErrorListener { p, _, _ -> cleanup(p); playNext(); true }
             mp.prepare()
             val (l, r) = channelGains()
             mp.setVolume(l, r)
+            // Best effort: some devices refuse the effect; the call still plays.
+            if (boostDb > 0) boost = runCatching {
+                android.media.audiofx.LoudnessEnhancer(mp.audioSessionId).apply {
+                    setTargetGain(boostDb * 100) // millibels
+                    enabled = true
+                }
+            }.getOrNull()
             mp.start()
         } catch (_: Exception) {
             playNext()
@@ -303,17 +327,37 @@ class VoicePack(private val context: Context) : AudioSink {
     /**
      * Hold the music off for a measurement — the latency chirp has to be heard by
      * the microphone over the cabin, and a song playing across it is the one thing
-     * guaranteed to make the measurement fail or lie. Same rule as everywhere else:
-     * if nothing is playing, nothing is touched.
+     * guaranteed to make the measurement fail or lie.
+     *
+     * This IGNORES [focusMode], deliberately. "Leave my music alone" is about the
+     * co-driver's ordinary talking; the chirp is a ten-second instrument reading at
+     * drive start whose failure mistimes every corner call of the drive. Pause is
+     * requested whatever the setting says — but still only when something is
+     * actually playing, so a paused player is never woken by the focus handback.
      */
     fun beginMeasurement() {
         handler.removeCallbacks(releaseFocusRunnable)
-        acquireFocus()
+        if (measurementFocus != null || !someoneElseIsPlaying()) return
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val req = android.media.AudioFocusRequest
+            .Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            .setAudioAttributes(audioAttrs)
+            .build()
+        measurementFocus = req
+        am.requestAudioFocus(req)
     }
 
     fun endMeasurement() {
-        scheduleFocusRelease(400)
+        handler.postDelayed({
+            measurementFocus?.let {
+                val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                am.abandonAudioFocusRequest(it)
+            }
+            measurementFocus = null
+        }, 400)
     }
+
+    private var measurementFocus: android.media.AudioFocusRequest? = null
 
     /** Hand the music back once this utterance is done — unless another call has
      *  started by then, in which case that one owns the focus and its own release. */

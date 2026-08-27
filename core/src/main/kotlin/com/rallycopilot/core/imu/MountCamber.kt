@@ -66,6 +66,24 @@ class MountAlignment(
     val coherence: Double get() = if (n == 0) 0.0 else sum.norm() / n
     val isAligned: Boolean get() = n >= params.minEvents && coherence >= params.minCoherence
 
+    /**
+     * How much the phone is MOVING IN ITS MOUNT, degrees: a fast EMA of the angle
+     * between instantaneous gravity and the slow body-down baseline.
+     *
+     * A rigid mount reads 2-5° (road pitch and camber). Chad's first traced drive
+     * read 8-13° sustained with excursions past 34° — "a bit of play, an inch or
+     * so" in the holder, which on a six-inch phone is tens of degrees of rotation.
+     * No algorithm can align a frame that will not hold still, and coherence 0.087
+     * over 344 events was that fact, not a software bug. This number exists so the
+     * app can SAY "tighten the mount" instead of failing silently.
+     */
+    val wobbleDeg: Double get() = wobbleEmaDeg
+
+    private var wobbleEmaDeg = 0.0
+
+    /** Wobbling this hard, events are motion of the phone, not of the car. */
+    val isStable: Boolean get() = wobbleEmaDeg < 8.0
+
     /** Car-forward unit vector in phone frame, or null until aligned. */
     val forward: Vec3? get() = if (isAligned) sum.unit() else null
 
@@ -84,8 +102,15 @@ class MountAlignment(
         // so brief leans through corners barely move it.
         gravityEma = if (!haveGravityEma) gravity.also { haveGravityEma = true }
         else gravityEma + (gravity - gravityEma) * 0.002
+        // Track mount wobble: instantaneous gravity vs the slow baseline, degrees.
+        val cosA = (gravity.unit().dot(gravityEma.unit())).coerceIn(-1.0, 1.0)
+        val angDeg = Math.toDegrees(kotlin.math.acos(cosA))
+        wobbleEmaDeg += (angDeg - wobbleEmaDeg) * 0.01
         if (abs(dvdtMps2) < params.minEventDvDt) return
         if (abs(dvdtMps2) > params.maxEventDvDt) return
+        // A wobbling phone contributes phone motion, not car motion. Do not learn
+        // from it — and do not slowly poison the accumulated direction either.
+        if (!isStable) return
         val up = gravity.unit() * -1.0 // gravity points down; up is the negative
         val horiz = linearAccel - up * linearAccel.dot(up)
         if (horiz.norm() < params.minHorizAccel) return

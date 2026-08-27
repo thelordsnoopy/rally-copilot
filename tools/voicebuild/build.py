@@ -145,6 +145,37 @@ def trim_silence(path, head_ms=20, tail_ms=60):
         return total
 
 
+def master(path):
+    """
+    Bring a clip up to co-driver loudness: +12 dB into a limiter.
+
+    edge-tts renders speech at a mean of about -20 dB — a polite assistant level
+    that a car stereo at road-trip volume simply buries. Chad drove with music on
+    and could not hear the calls at 100% app volume. Digital gain past full scale
+    is impossible at playback time, so the loudness has to be IN the clips: this
+    lifts the mean to about -13 dB with peaks limited at -0.6, which reads as
+    roughly twice as loud. Idempotent enough in practice: a re-mastered clip has
+    no headroom left for the gain stage to use, and the limiter holds the ceiling.
+    """
+    tmp = path + ".loud.mp3"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", path,
+             "-af", "volume=12dB,alimiter=limit=0.93:level=false",
+             "-c:a", "libmp3lame", "-b:a", "48k", "-ar", "24000", "-ac", "1", tmp],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode == 0 and os.path.exists(tmp):
+            os.replace(tmp, path)
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(tmp):
+            try: os.remove(tmp)
+            except OSError: pass
+    return _ffprobe_duration_ms(path)
+
+
 def mp3_duration_ms(path):
     """Rough MP3 duration: parse frame headers (CBR assumption is fine for TTS output)."""
     # edge-tts emits 24kHz mono mp3; estimate from bitrate in first frame header.
@@ -171,11 +202,13 @@ async def synth(key, text, cfg, outdir):
     tts = edge_tts.Communicate(text, VOICE, rate=cfg["rate"], pitch=cfg["pitch"])
     await tts.save(path)
     ms = trim_silence(path)
-    return key, (ms if ms else mp3_duration_ms(path))
+    ms2 = master(path)
+    return key, (ms2 or ms or mp3_duration_ms(path))
 
 
 async def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else "app/src/main/assets/voice"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    out = args[0] if args else "app/src/main/assets/voice"
     force = "--force" in sys.argv
     # Incremental by default: only synthesise clips that are missing, and merge into
     # the existing manifest. Re-rendering the whole vocabulary to add a few words
@@ -201,6 +234,17 @@ async def main():
                     if ms:
                         durations[k] = ms
             print(f"  {set_name}: re-trimmed {len(durations)} clips")
+            continue
+
+        if "--remaster" in sys.argv:
+            # Loudness pass over clips already on disk (no re-synthesis, no network).
+            for k in VOCAB:
+                p = os.path.join(outdir, f"{k}.mp3")
+                if os.path.exists(p):
+                    ms = master(p)
+                    if ms:
+                        durations[k] = ms
+            print(f"  {set_name}: remastered {len(durations)} clips")
             continue
 
         todo = [

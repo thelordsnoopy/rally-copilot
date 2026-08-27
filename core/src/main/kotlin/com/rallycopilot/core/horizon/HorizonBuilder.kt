@@ -25,6 +25,8 @@ class HorizonBuilder(
         val horizonM: Double = 1200.0,
         /** Below this path probability a branch is not followed at all. */
         val branchPrune: Double = 0.30,
+        /** No junction is ever a certainty, however dominant the through road. */
+        val maxJunctionProb: Double = 0.95,
         /** Class rank for continuation scoring. */
         val classRank: Map<String, Int> = mapOf(
             "motorway" to 6, "trunk" to 5, "primary" to 4, "secondary" to 3,
@@ -100,9 +102,20 @@ class HorizonBuilder(
             }
             if (choices.isEmpty()) break
 
-            val totalScore = choices.sumOf { it.second }
+            // Sharpened, because the raw score ratio is badly under-confident.
+            // Raw scores make a through road vs one side lane roughly 0.9 vs 0.35 —
+            // a 72% coin toss — so confidence decayed to 0.11 within half a dozen
+            // driveways and 22 corners went unspoken on the first traced drive,
+            // while the prediction itself was RIGHT in 11 of 15 horizons. Passing a
+            // minor turning is not a weighted coin flip; drivers overwhelmingly
+            // stay on the through road. Squaring the scores turns 0.9-vs-0.35 into
+            // ~87% — which is what the measured accuracy actually was — while a
+            // genuine fork with two equal scores stays 50/50 and still prunes to
+            // silence. Calibration, not optimism.
+            val totalScore = choices.sumOf { it.second * it.second }
             val best = choices.maxBy { it.second }
-            val prob = best.second / totalScore
+            val prob = (best.second * best.second / totalScore)
+                .coerceAtMost(params.maxJunctionProb)
             if (prob < params.branchPrune) break // ambiguous: stop the horizon here, engine goes quiet beyond
 
             confidence *= prob
