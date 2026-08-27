@@ -261,16 +261,26 @@ class DriveService : Service() {
         var lastSpeedT = 0L
         var currentDvdt = 0.0
         var lastCamberWriteT = 0L
+        var lastImuLogT = 0L
         imu = ImuMonitor(
             this,
             onRoughness = { rms ->
                 engine.hud.value.matched?.let { m ->
+                    blackBox?.log("rough", mapOf(
+                        "rms" to rms, "edge" to m.edgeId, "off" to m.offsetM,
+                        "speed" to engine.hud.value.speedMps))
                     if (engine.hud.value.speedMps > 4.0) {
                         scope.launch(engineDispatcher) { know.addRoughness(m.edgeId, m.offsetM, rms) }
                     }
                 }
             },
-            onBump = { slowMon.reportBump(System.currentTimeMillis()) },
+            onBump = {
+                slowMon.reportBump(System.currentTimeMillis())
+                blackBox?.log("bump", mapOf(
+                    "edge" to engine.hud.value.matched?.edgeId,
+                    "off" to engine.hud.value.matched?.offsetM,
+                    "speed" to engine.hud.value.speedMps))
+            },
             onSample = { accel, gravRaw ->
                 // Android's TYPE_GRAVITY points UP (reaction force); the core maths
                 // expects the physical gravity vector, pointing DOWN.
@@ -296,6 +306,25 @@ class DriveService : Service() {
                     kotlin.math.abs(accel.dot(left)).takeIf { it.isFinite() }
                 }
                 val deg = camber.tick(accel, grav, hudNow.speedMps)
+                // Black box: the raw IMU stream, thinned to ~10 Hz. Full sensor rate
+                // is 50-100 Hz and would be most of the file for little extra truth.
+                if (now - lastImuLogT > 100) {
+                    lastImuLogT = now
+                    val fwd = mount.forward
+                    blackBox?.log("imu", mapOf(
+                        "ax" to accel.x, "ay" to accel.y, "az" to accel.z,
+                        "gx" to grav.x, "gy" to grav.y, "gz" to grav.z,
+                        "dvdt" to currentDvdt,
+                        "aligned" to mount.isAligned,
+                        "alignEvents" to mount.eventCount,
+                        "coherence" to mount.coherence,
+                        "fx" to fwd?.x, "fy" to fwd?.y, "fz" to fwd?.z,
+                        "camberDeg" to deg,
+                        "aLat" to engine.imuLateralMps2,
+                        "speed" to hudNow.speedMps,
+                        "edge" to hudNow.matched?.edgeId, "off" to hudNow.matched?.offsetM,
+                    ))
+                }
                 // Persist camber at ~1 Hz against the current bucket, normalised to the
                 // edge's FORWARD frame — the same crown leans the other way when the
                 // edge is driven against its node order, and mixing frames cancels the

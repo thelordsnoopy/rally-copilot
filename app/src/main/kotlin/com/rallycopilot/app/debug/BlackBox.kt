@@ -77,15 +77,28 @@ class BlackBox(context: Context, runId: Long) : Telemetry {
 
     companion object {
         private const val MAX_QUEUED = 20_000
-        /** Keep the last few drives; a long drive is a few MB and phones fill up. */
-        private const val KEEP_FILES = 12
+        /** Keep the last few drives... */
+        private const val KEEP_FILES = 8
+        /**
+         * ...but bounded by total size first, because this records everything at
+         * full tick rate: roughly 10 lines a second of engine state plus 10 of IMU
+         * plus every GPS fix, which is a few MB for every ten minutes driven. The
+         * phone's storage matters more than the eighth-oldest drive.
+         */
+        private const val MAX_TOTAL_BYTES = 300L * 1024 * 1024
 
         private fun pruneOldFiles(dir: File) {
-            val files = dir.listFiles { f -> f.name.endsWith(".jsonl") } ?: return
-            if (files.size <= KEEP_FILES) return
-            files.sortedBy { it.lastModified() }
-                .dropLast(KEEP_FILES)
-                .forEach { runCatching { it.delete() } }
+            var files = (dir.listFiles { f -> f.name.endsWith(".jsonl") } ?: return)
+                .sortedByDescending { it.lastModified() }
+            if (files.size > KEEP_FILES) {
+                files.drop(KEEP_FILES).forEach { runCatching { it.delete() } }
+                files = files.take(KEEP_FILES)
+            }
+            var total = 0L
+            for (f in files) {
+                total += f.length()
+                if (total > MAX_TOTAL_BYTES) runCatching { f.delete() }
+            }
         }
 
         /** Where the traces live, for the settings screen to show. */

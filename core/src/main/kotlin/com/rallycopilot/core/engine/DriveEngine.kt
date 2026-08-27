@@ -226,6 +226,10 @@ class DriveEngine(
             }
         }
         lastFix = fix
+        telemetry.log("fix", mapOf(
+            "lat" to fix.lat, "lon" to fix.lon, "speed" to fix.speedMps,
+            "bearing" to fix.bearingDeg, "acc" to fix.accuracyM, "tMs" to fix.tMs,
+        ))
 
         // ---- match ----
         val m = matcher.match(fix)
@@ -438,27 +442,51 @@ class DriveEngine(
             }
         }
 
-        // ---- black box: a state line, ~1 Hz, plus the whole horizon each rebuild ----
-        if (now - lastTelemetryMs >= 1000) {
-            lastTelemetryMs = now
+        // ---- black box: EVERYTHING, every tick (10 Hz) ----
+        run {
             val m2 = lastMatch
-            telemetry.log("state", mapOf(
+            val nextC = h.corners.firstOrNull { aheadOf(it) > 0 }
+            telemetry.log("s", mapOf(
+                // where
                 "lat" to fix?.lat, "lon" to fix?.lon, "acc" to fix?.accuracyM,
+                "gpsSpeed" to fix?.speedMps, "gpsBearing" to fix?.bearingDeg,
+                "fixAgeMs" to fix?.let { now - it.tMs },
+                // map match
                 "edge" to m2?.edgeId, "off" to m2?.offsetM, "fwd" to m2?.forward,
-                "matchConf" to m2?.confidence,
-                "speed" to speed, "obdSpeed" to vehicle.obdSpeedMps(), "usingObd" to usingObdSpeed,
-                "gear" to gear, "rpm" to vehicle.rpm(), "throttle" to vehicle.throttle01(),
-                "aLatImu" to imuLateralMps2,
+                "matchConf" to m2?.confidence, "matchBearing" to m2?.bearingDeg,
                 "progress" to progressM, "odo" to odometerM,
+                // the car
+                "speed" to speed, "obdSpeed" to vehicle.obdSpeedMps(), "usingObd" to usingObdSpeed,
+                "rpm" to vehicle.rpm(), "gear" to gear, "throttle" to vehicle.throttle01(),
+                "coolantC" to vehicle.coolantC(), "batteryV" to vehicle.batteryV(),
+                "ambientC" to vehicle.ambientC(), "mapKpa" to vehicle.mapKpa(),
+                "fuel" to vehicle.fuelLevel01(), "obdSilent" to vehicle.linkSilent(),
+                // motion
+                "aLatImu" to imuLateralMps2,
+                "aLatGeom" to insideCorner?.let { (speed * speed) / it.corner.minRadiusM },
+                "insideCorner" to insideCorner?.corner?.id,
+                // what the co-driver thinks
                 "horizonCorners" to h.corners.size, "horizonM" to h.totalLengthM,
-                "confEnd" to h.confidenceAtEnd,
+                "confEnd" to h.confidenceAtEnd, "pathEdges" to h.pathEdgeIds.size,
                 "spirited" to spiritedNow, "spiritedFrac" to (styleDetector?.spiritedFraction ?: 0.0),
+                "styleScore" to (styleDetector?.score ?: 0.0),
+                "styleFast" to (styleDetector?.fastScore ?: 0.0),
                 "pressingOn" to (styleDetector?.isPressingOn ?: true),
                 "quiet" to quietNow, "speaking" to audio.isSpeaking(),
+                "speakingMs" to audio.remainingMs(),
                 "activeObs" to (collector?.activeCount ?: 0),
-                "nextCorner" to h.corners.firstOrNull { aheadOf(it) > 0 }?.let {
-                    "${it.corner.direction}${it.band}@${aheadOf(it).toInt()}m r=${it.corner.minRadiusM.toInt()}"
-                },
+                "obsSoFar" to (collector?.observations?.size ?: 0),
+                // the next corner, in full
+                "nextId" to nextC?.corner?.id,
+                "nextDir" to nextC?.corner?.direction?.name,
+                "nextBand" to nextC?.band?.name,
+                "nextAheadM" to nextC?.let { aheadOf(it) },
+                "nextRadiusM" to nextC?.corner?.minRadiusM,
+                "nextConf" to nextC?.corner?.confidence,
+                "nextPathConf" to nextC?.pathConfidence,
+                "nextVTarget" to nextC?.vTargetMps,
+                "nextGrade" to nextC?.corner?.approachGrade,
+                "nextSpoken" to (nextC?.corner?.id?.let { it in spokenCorners } ?: false),
             ))
         }
 
@@ -690,7 +718,6 @@ class DriveEngine(
     }
 
     private var lastCall: String? = null
-    private var lastTelemetryMs = 0L
     private var lastPendingLogMs = 0L
 
     /**
