@@ -57,6 +57,17 @@ class DriveEngine(
         val maxJumpMps: Double = 90.0,
         /** At or above this path confidence a corner is called plainly. */
         val speakConfidence: Double = 0.50,
+        /**
+         * A corner about to pass under the wheels is not held to the same standard
+         * of proof as one a kilometre of junction guesses away. Within
+         * [speakNearM] the gate relaxes to this; it climbs linearly back to
+         * [speakConfidence] at [speakFarM]. Drive 42: a ONE — second-tightest
+         * band in the vocabulary — sat 1.5 m ahead at pathConf 0.367 against the
+         * flat 0.50 gate, and the app said nothing while the car was in it.
+         */
+        val speakConfidenceNear: Double = 0.35,
+        val speakNearM: Double = 150.0,
+        val speakFarM: Double = 600.0,
         val gpsLostAfterMs: Long = 3000,
         /** Rebuild horizon on edge change or heading change beyond this. */
         val rebuildHeadingDeg: Double = 25.0,
@@ -617,11 +628,11 @@ class DriveEngine(
         val speakable = h.corners.filter { c ->
             val ok = c.corner.id !in spokenCorners && aheadOf(c) > 0 &&
                 c.band.ordinal <= maxSpokenBandOrdinal
-            if (ok && c.pathConfidence < params.speakConfidence) {
+            if (ok && c.pathConfidence < speakConfidenceAt(aheadOf(c))) {
                 if (suppressionLogged.add(c.corner.id)) {
                     telemetry.log("note_suppressed", mapOf(
                         "corner" to c.corner.id, "band" to c.band.name,
-                        "pathConf" to c.pathConfidence, "need" to params.speakConfidence,
+                        "pathConf" to c.pathConfidence, "need" to speakConfidenceAt(aheadOf(c)),
                         "aheadM" to aheadOf(c)))
                     runLog.logEvent(RunEvent(now, RunEventType.NOTE_SUPPRESSED_LOW_CONFIDENCE, c.corner.id.toString()))
                 }
@@ -747,6 +758,20 @@ class DriveEngine(
         val m = lastMatch
         runLog.logEvent(RunEvent(clock.nowMs(), RunEventType.NOTE_FLAGGED,
             info + " at=" + (m?.let { "${it.edgeId}:${it.offsetM.toInt()}" } ?: "?")))
+    }
+
+    /**
+     * The path confidence a corner needs before it is spoken, by distance ahead:
+     * [Params.speakConfidenceNear] under the wheels, [Params.speakConfidence] a
+     * junction-guessing horizon away, linear between. A suppressed distant corner
+     * is re-tested every tick, so it can still be called once it comes close.
+     */
+    private fun speakConfidenceAt(aheadM: Double): Double {
+        val p = params
+        if (aheadM <= p.speakNearM) return p.speakConfidenceNear
+        if (aheadM >= p.speakFarM) return p.speakConfidence
+        val f = (aheadM - p.speakNearM) / (p.speakFarM - p.speakNearM)
+        return p.speakConfidenceNear + f * (p.speakConfidence - p.speakConfidenceNear)
     }
 
     /** Metres consumed while the utterance plays, incl. BT latency — end-anchored timing. */

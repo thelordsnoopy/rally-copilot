@@ -78,11 +78,6 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             locationGranted.value = hasLocationPermission()
-        // One-time: everything learned before the corner-geometry fix is suspect, so
-        // start the model afresh. Keeps every recorded drive; only learning restarts.
-        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching { AppDb.get(this@MainActivity).migrateLearningCutoff() }
-        }
         }
 
     fun hasLocationPermission(): Boolean =
@@ -264,6 +259,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         locationGranted.value = hasLocationPermission()
+        // One-time: everything learned before the corner-geometry fix is suspect, so
+        // start the model afresh. Keeps every recorded drive; only learning restarts.
+        // (Runs on every launch and no-ops after the first; it used to live inside
+        // the permission-result callback, where it only ran if a dialog came back.)
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { AppDb.get(this@MainActivity).migrateLearningCutoff() }
+        }
         // Ask only when something is actually missing — re-firing dialogs on every
         // recreation burns through the system's "don't ask again" budget.
         val missing = arrayOf(

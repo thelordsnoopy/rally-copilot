@@ -217,7 +217,7 @@ class DriveService : Service() {
             "keepAlive" to (db.kvGet("bt_keepalive") != "off"),
             "voiceCommands" to (db.kvGet("voice_commands") == "on"),
             "coaching" to (db.kvGet("coaching") != "off"),
-            "audioLatencyMs" to (db.kvGet("audio_latency_ms") ?: "unmeasured"),
+            "audioLatencyMs" to (db.kvGet("audio_latency2_ms") ?: "unmeasured"),
         ))
         // Separate learned profiles per conditions: wet drives use and train the wet model.
         val profile = db.loadProfile(conditions)
@@ -324,7 +324,7 @@ class DriveService : Service() {
                     currentDvdt = if (kotlin.math.abs(d) <= 8.0) d else 0.0
                     lastSpeed = hudNow.speedMps; lastSpeedT = now
                 }
-                mount.tick(accel, grav, currentDvdt)
+                mount.tick(now, accel, grav, currentDvdt, hudNow.speedMps)
                 // Car-frame lateral acceleration for the radius audit: the component
                 // of accel along car-LEFT (up × forward). Null until the mount is
                 // aligned — an unaligned axis would feed the audit garbage radii.
@@ -349,6 +349,7 @@ class DriveService : Service() {
                         "stable" to mount.isStable,
                         "alignEvents" to mount.eventCount,
                         "coherence" to mount.coherence,
+                        "polVotes" to mount.polarityVotes,
                         "fx" to fwd?.x, "fy" to fwd?.y, "fz" to fwd?.z,
                         "camberDeg" to deg,
                         "yawRate" to slip.state.yawRateRadS,
@@ -390,8 +391,11 @@ class DriveService : Service() {
         // the first real trace, because a failed re-measurement silently falls back
         // to whatever was remembered. Timing is the one number worth being fussy
         // about: it is subtracted from every braking point.
-        val storedRoute = db.kvGet("audio_latency_route")
-        val stored = db.kvGet("audio_latency_ms")?.toLongOrNull()
+        // The "2" keys deliberately orphan every number measured before v0.18.0:
+        // 416 ms came from the old broadband detector and 77 ms from a chirp that
+        // fell back to the phone speaker — neither deserves to survive an update.
+        val storedRoute = db.kvGet("audio_latency2_route")
+        val stored = db.kvGet("audio_latency2_ms")?.toLongOrNull()
         if (stored != null && storedRoute == audioRoute()) engine.audioLatencyMs = stored
         scope.launch(Dispatchers.IO) {
             // Give Bluetooth a moment to take the stream: the drive often starts
@@ -552,15 +556,16 @@ class DriveService : Service() {
         // playing across the chirp is the one thing that reliably breaks it.
         voice.beginMeasurement()
         val r = try {
-            com.rallycopilot.app.audio.LatencyCalibrator.measureBest(this, voice.attributes)
+            com.rallycopilot.app.audio.LatencyCalibrator.measureBest(
+                this, voice.attributes, expectBluetooth = route == "bluetooth")
         } finally {
             voice.endMeasurement()
         }
         val ms = r.latencyMs
         if (ms != null) {
             engine.audioLatencyMs = ms
-            db.kvPut("audio_latency_ms", ms.toString())
-            db.kvPut("audio_latency_route", route)
+            db.kvPut("audio_latency2_ms", ms.toString())
+            db.kvPut("audio_latency2_route", route)
             audioCalibration = "audio delay ${ms} ms (measured)"
             blackBox?.log("audio_cal", mapOf("ms" to ms, "noise" to r.noiseLevel))
         } else {

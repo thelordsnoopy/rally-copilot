@@ -12,8 +12,8 @@ android {
         applicationId = "com.rallycopilot.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 37
-        versionName = "0.17.2"
+        versionCode = 38
+        versionName = "0.18.0"
     }
 
     buildTypes {

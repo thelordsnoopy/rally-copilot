@@ -1,6 +1,7 @@
 package com.rallycopilot.core.imu
 
 import kotlin.math.abs
+import kotlin.math.max
 
 /**
  * Is the car going where it is pointing?
@@ -30,6 +31,15 @@ import kotlin.math.abs
  * car-forward in phone coordinates, this needs no alignment, no calibration, and no
  * particular mounting angle.
  *
+ * TIMING. The course rate is a trailing measurement: d(bearing)/dt over the last
+ * GNSS second describes the path HALF A SECOND AGO on average, plus fix latency.
+ * The gyro is instantaneous. Compared raw, yaw leads course through every corner
+ * entry and the estimator reads phantom oversteer, then phantom understeer on
+ * exit — drive 42 spent 344 samples "sliding" on a dry, gentle drive that way.
+ * So the verdict compares the course rate against the yaw rate from
+ * [Params.yawDelayMs] ago. Replayed against that trace, the delay plus the
+ * both-rates gate cut the false slides from 344 samples to 3.
+ *
  * Pure maths, no Android: the app supplies the two rates.
  */
 class SlipEstimator(private val params: Params = Params()) {
@@ -38,13 +48,30 @@ class SlipEstimator(private val params: Params = Params()) {
         /** Below this there is no meaningful cornering to compare, m/s. */
         val minSpeedMps: Double = 6.0,
         /**
-         * Both rates must exceed this before a comparison means anything, rad/s.
+         * BOTH rates must exceed this before a comparison means anything, rad/s.
          * A GNSS bearing is only good to a handful of degrees, so on a near-straight
          * road the ratio of two small noisy numbers is meaningless.
          */
         val minTurnRateRadS: Double = 0.09, // ~5 deg/s
+        /**
+         * A body rotation this strong with NO course rotation is a spin in
+         * progress, not a number to be shy about, rad/s.
+         */
+        val spinYawRadS: Double = 0.35, // ~20 deg/s
+        /**
+         * The disagreement must involve real cornering load: speed × turn rate is
+         * the lateral acceleration the faster of the two rates implies, m/s².
+         * Below this the "slide" would be one a shopping trolley could hold.
+         */
+        val minLatAccelMps2: Double = 1.2,
         /** Smoothing on both rates, per sample at ~10 Hz. */
         val emaAlpha: Double = 0.25,
+        /**
+         * Compare course rate against the yaw from this long ago. The course rate
+         * is an average over the previous GNSS second (centred ~500 ms in the
+         * past) arriving with fix latency on top; the gyro is now.
+         */
+        val yawDelayMs: Long = 700,
         /** Body rotating this much MORE than the path is turning: oversteer. */
         val oversteerRatio: Double = 1.30,
         /** ...and this much less: understeer, running wide. */
@@ -79,6 +106,9 @@ class SlipEstimator(private val params: Params = Params()) {
     private var verdictSince = 0L
     private var currentVerdict = Verdict.UNKNOWN
 
+    /** Recent yaw EMA history so the verdict can look [Params.yawDelayMs] back. */
+    private val yawHist = ArrayDeque<Pair<Long, Double>>()
+
     var state = State(0.0, 0.0, 1.0, Verdict.UNKNOWN, false)
         private set
 
@@ -90,8 +120,10 @@ class SlipEstimator(private val params: Params = Params()) {
 
     /**
      * [yawRateRadS] signed body rotation about the vertical, [courseRateRadS] signed
-     * rotation of the velocity vector. Signs must share a convention; only their
-     * relative size and agreement are used.
+     * rotation of the velocity vector. Signs MUST share a convention (positive =
+     * anticlockwise seen from above); opposite signs while both turning hard reads
+     * as a spin. Drive 42 proved how much that matters: the app layer fed yaw with
+     * the sign inverted and every ordinary corner became "OVERSTEER".
      */
     fun tick(tMs: Long, yawRateRadS: Double, courseRateRadS: Double, speedMps: Double): State {
         if (!yawRateRadS.isFinite() || !courseRateRadS.isFinite() || !speedMps.isFinite()) {
@@ -104,16 +136,27 @@ class SlipEstimator(private val params: Params = Params()) {
             courseEma += (courseRateRadS - courseEma) * params.emaAlpha
         }
 
-        val y = abs(yawEma)
+        yawHist.addLast(tMs to yawEma)
+        // ~64 entries covers 6 s at 10 Hz — far more than the delay needs.
+        while (yawHist.size > 64) yawHist.removeFirst()
+        val targetT = tMs - params.yawDelayMs
+        var delayedYaw = yawHist.first().second
+        for ((t, v) in yawHist) {
+            if (t <= targetT) delayedYaw = v else break
+        }
+
+        val y = abs(delayedYaw)
         val c = abs(courseEma)
         val verdict = when {
             speedMps < params.minSpeedMps -> Verdict.UNKNOWN
+            // Strong body rotation the path never shows: a spin in progress.
+            y >= params.spinYawRadS && c < params.minTurnRateRadS -> Verdict.OVERSTEER
             // BOTH must be turning: one small noisy number over another is not a ratio.
-            y < params.minTurnRateRadS && c < params.minTurnRateRadS -> Verdict.UNKNOWN
+            y < params.minTurnRateRadS || c < params.minTurnRateRadS -> Verdict.UNKNOWN
             // Opposite directions mid-corner is a spin, not a ratio worth taking.
-            yawEma * courseEma < 0 && y > params.minTurnRateRadS && c > params.minTurnRateRadS ->
-                Verdict.OVERSTEER
-            c < 1e-6 -> Verdict.UNKNOWN
+            delayedYaw * courseEma < 0 -> Verdict.OVERSTEER
+            // No real cornering load: nothing slides at trolley speeds.
+            speedMps * max(y, c) < params.minLatAccelMps2 -> Verdict.UNKNOWN
             y / c >= params.oversteerRatio -> Verdict.OVERSTEER
             y / c <= params.understeerRatio -> Verdict.UNDERSTEER
             else -> Verdict.NEUTRAL

@@ -19,43 +19,116 @@ class MountAlignmentTests {
     private val gravity = Vec3(0.0, 0.0, -9.81)
     private fun carForwardInPhone(mag: Double) = Vec3(mag * cos(yaw), mag * sin(yaw), 0.0)
 
+    /**
+     * Drive a plausible sequence at 10 Hz: alternating hard-accelerate and
+     * hard-brake phases with a consistent speed trace, which is what the polarity
+     * vote needs. [dvdtSign] lets a test corrupt the per-sample dv/dt sign — the
+     * drive-42 failure mode — without corrupting the physics.
+     */
+    private fun drive(
+        m: MountAlignment,
+        phases: Int = 8,
+        dvdtSign: (sampleIndex: Int, trueDvDt: Double) -> Double = { _, d -> d },
+    ) {
+        var t = 0L
+        var speed = 5.0
+        var idx = 0
+        repeat(phases) { phase ->
+            val accelerating = phase % 2 == 0
+            val dvdt = if (accelerating) 2.5 else -2.5
+            repeat(30) { // 3 s per phase at 10 Hz
+                m.tick(t, carForwardInPhone(dvdt), gravity, dvdtSign(idx, dvdt), speed)
+                speed = (speed + dvdt * 0.1).coerceAtLeast(2.0)
+                t += 100; idx++
+            }
+        }
+    }
+
     @Test
     fun `alignment converges to the mount yaw from accel and brake events`() {
         val m = MountAlignment()
-        repeat(20) { m.tick(carForwardInPhone(2.5), gravity, dvdtMps2 = 2.5) }      // accelerating
-        repeat(20) { m.tick(carForwardInPhone(-3.0), gravity, dvdtMps2 = -3.0) }    // braking flips sign
-        assertTrue(m.isAligned)
+        drive(m)
+        assertTrue("aligned after sustained accel/brake phases", m.isAligned)
         val f = m.forward!!
         assertEquals(cos(yaw), f.x, 0.05)
         assertEquals(sin(yaw), f.y, 0.05)
     }
 
     @Test
+    fun `a coin-flipped dvdt sign still aligns with the right polarity`() {
+        // The drive-42 regression: speed lags the accelerometer, so per-sample
+        // dv/dt agreed with the true event direction only 54% of the time and the
+        // signed sum never cohered. The axis must not depend on that sign at all,
+        // and the polarity must come from the speed trace instead.
+        val m = MountAlignment()
+        drive(m, phases = 10, dvdtSign = { i, d -> if (i % 2 == 0) d else -d })
+        assertTrue("axis and polarity must survive per-sample sign garbage", m.isAligned)
+        val f = m.forward!!
+        assertEquals("polarity resolved forward, not backward", cos(yaw), f.x, 0.05)
+        assertEquals(sin(yaw), f.y, 0.05)
+    }
+
+    @Test
     fun `gentle driving never aligns`() {
         val m = MountAlignment()
-        repeat(200) { m.tick(carForwardInPhone(0.4), gravity, dvdtMps2 = 0.4) }
+        var t = 0L
+        repeat(200) {
+            m.tick(t, carForwardInPhone(0.4), gravity, 0.4, 10.0)
+            t += 100
+        }
         assertFalse(m.isAligned)
     }
 
     @Test
     fun `incoherent directions refuse to align`() {
         val m = MountAlignment()
-        // Random-ish directions: coherence must stay low.
-        repeat(40) { i ->
+        var t = 0L
+        var speed = 5.0
+        // Event directions spread round the compass with a consistent speed trace:
+        // whatever the votes say, the folded axis must stay too diffuse to trust.
+        repeat(120) { i ->
             val a = Math.toRadians(i * 137.0)
-            m.tick(Vec3(2.5 * cos(a), 2.5 * sin(a), 0.0), gravity, dvdtMps2 = 2.5)
+            val dvdt = if ((i / 30) % 2 == 0) 2.5 else -2.5
+            m.tick(t, Vec3(2.5 * cos(a), 2.5 * sin(a), 0.0), gravity, dvdt, speed)
+            speed = (speed + dvdt * 0.1).coerceAtLeast(2.0)
+            t += 100
         }
         assertFalse(m.isAligned)
+    }
+
+    @Test
+    fun `no polarity votes, no alignment`() {
+        // Perfect line of events but a speed trace that never clearly changes
+        // across a window: the axis is known, which END is forward is not.
+        val m = MountAlignment()
+        var t = 0L
+        repeat(100) { i ->
+            val dvdt = if (i % 2 == 0) 2.0 else -2.0 // dv/dt flaps, speed goes nowhere
+            m.tick(t, carForwardInPhone(dvdt), gravity, dvdt, 10.0)
+            t += 100
+        }
+        assertFalse("an axis without a direction must not claim alignment", m.isAligned)
+        assertTrue("but the line itself should be coherent", m.coherence >= 0.72)
     }
 }
 
 class CamberEstimatorTests {
-    private val yaw = 0.0 // phone aligned with car for simplicity
     private val flatGravity = Vec3(0.0, 0.0, -9.81)
 
+    /** Phone aligned with the car: aligned mount via accel/brake phases + speed trace. */
     private fun aligned(): MountAlignment {
         val m = MountAlignment()
-        repeat(30) { m.tick(Vec3(2.5, 0.0, 0.0), flatGravity, 2.5) }
+        var t = 0L
+        var speed = 5.0
+        repeat(8) { phase ->
+            val dvdt = if (phase % 2 == 0) 2.5 else -2.5
+            repeat(30) {
+                m.tick(t, Vec3(dvdt, 0.0, 0.0), flatGravity, dvdt, speed)
+                speed = (speed + dvdt * 0.1).coerceAtLeast(2.0)
+                t += 100
+            }
+        }
+        check(m.isAligned) { "test rig failed to align the mount" }
         return m
     }
 

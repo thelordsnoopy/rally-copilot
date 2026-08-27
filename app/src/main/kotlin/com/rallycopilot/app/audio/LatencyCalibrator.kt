@@ -35,6 +35,16 @@ object LatencyCalibrator {
     /** Sanity bounds. Anything outside these is a bad measurement, not a fast car. */
     private const val MIN_PLAUSIBLE_MS = 30L
     private const val MAX_PLAUSIBLE_MS = 900L
+    /**
+     * Bluetooth cannot physically be this quick: A2DP encode + buffer + head unit
+     * decode is 100 ms at the very best, 150-250 ms typically. Drive 42 "measured"
+     * 77 ms on a bluetooth route — which is the phone's OWN speaker's number, and
+     * the tell for what actually happens: starting the microphone makes many
+     * devices SUSPEND A2DP (echo avoidance), so the chirp quietly falls back to
+     * the phone speaker while the route check, taken before recording began,
+     * still says bluetooth. That 77 then timed every call of the drive.
+     */
+    private const val MIN_PLAUSIBLE_BLUETOOTH_MS = 110L
 
     data class Result(
         val latencyMs: Long?,
@@ -57,11 +67,14 @@ object LatencyCalibrator {
      * shutting. Three cheap looks and a median is far harder to fool than a single
      * reading, and this number is subtracted from every braking point of the drive.
      */
-    fun measureBest(context: Context, attrs: AudioAttributes, attempts: Int = 3): Result {
+    fun measureBest(
+        context: Context, attrs: AudioAttributes,
+        attempts: Int = 3, expectBluetooth: Boolean = false,
+    ): Result {
         val good = ArrayList<Long>(attempts)
         var last: Result? = null
         repeat(attempts) {
-            val r = measure(context, attrs)
+            val r = measure(context, attrs, expectBluetooth)
             last = r
             r.latencyMs?.let { good += it }
             // A clear win early is enough; do not keep chirping at the driver.
@@ -77,7 +90,7 @@ object LatencyCalibrator {
      * Blocking measurement — call off the main thread. Returns null latency (with a
      * reason) rather than a wrong number whenever the measurement is not trustworthy.
      */
-    fun measure(context: Context, attrs: AudioAttributes): Result {
+    fun measure(context: Context, attrs: AudioAttributes, expectBluetooth: Boolean = false): Result {
         if (!hasMic(context)) return Result(null, "microphone permission not granted")
 
         val minBuf = AudioRecord.getMinBufferSize(
@@ -140,15 +153,30 @@ object LatencyCalibrator {
 
             val playAtSample = filled
             track.play()
+            // Where is the chirp ACTUALLY going? The route was checked before the
+            // recorder started, and starting the recorder is exactly what makes
+            // some devices suspend A2DP and fall back to the phone speaker.
+            var routed: android.media.AudioDeviceInfo? = track.routedDevice
 
             while (filled < total) {
                 val n = recorder.read(captured, filled, total - filled)
                 if (n <= 0) break
                 filled += n
+                track.routedDevice?.let { routed = it }
             }
             recorder.stop()
 
-            analyse(captured, filled, playAtSample)
+            val routedType = routed?.type
+            val onBluetooth = routedType == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                routedType == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            if (expectBluetooth && routedType != null && !onBluetooth) {
+                return Result(
+                    null,
+                    "chirp fell back to the phone (route type $routedType) while the mic " +
+                        "recorded — not the car's latency",
+                )
+            }
+            analyse(captured, filled, playAtSample, expectBluetooth)
         } catch (e: Exception) {
             Result(null, e.message?.take(50) ?: "measurement failed")
         } finally {
@@ -158,7 +186,7 @@ object LatencyCalibrator {
         }
     }
 
-    private fun analyse(buf: ShortArray, valid: Int, playAtSample: Int): Result {
+    private fun analyse(buf: ShortArray, valid: Int, playAtSample: Int, expectBluetooth: Boolean): Result {
         // Detection lives in :core so it can be tested against real cabin noise —
         // see ChirpTests. The old broadband version worked parked and failed twice
         // on the move, which meant corner timing ran on a remembered number.
@@ -166,8 +194,13 @@ object LatencyCalibrator {
         val onset = d.onsetSamples
             ?: return Result(null, d.reason, d.noiseLevel)
         val ms = (onset.toDouble() / SAMPLE_RATE * 1000).roundToInt().toLong()
-        if (ms < MIN_PLAUSIBLE_MS || ms > MAX_PLAUSIBLE_MS) {
-            return Result(null, "measured ${ms} ms, which is out of range — ignoring", d.noiseLevel)
+        val minPlausible = if (expectBluetooth) MIN_PLAUSIBLE_BLUETOOTH_MS else MIN_PLAUSIBLE_MS
+        if (ms < minPlausible || ms > MAX_PLAUSIBLE_MS) {
+            return Result(
+                null,
+                "measured ${ms} ms, implausible for this route — ignoring",
+                d.noiseLevel,
+            )
         }
         return Result(ms, "measured ${ms} ms", d.noiseLevel)
     }

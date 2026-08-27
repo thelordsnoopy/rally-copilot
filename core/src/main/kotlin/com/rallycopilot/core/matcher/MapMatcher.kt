@@ -78,10 +78,20 @@ class MapMatcher(private val map: MapStore) {
                 scored += Scored(edge, proj.distanceAlongM, forward, s)
             }
         }
-        val total = scored.sumOf { it.score }
+        // Sharpened: the winner's share of RAW scores is badly under-confident,
+        // for the same reason junction probabilities were (HorizonBuilder). Every
+        // lane, driveway and reverse direction inside the 35 m circle keeps a
+        // slice of the denominator however wrong its heading is, so on drive 42
+        // the matcher sat at 0.44-0.81 while placing the car on the right edge
+        // essentially always — and 29 of 36 corners were silenced by a confidence
+        // gate fed from here. Squaring the scores before normalising prices a
+        // rival at half the winner's likelihood at a fifth of it, which is what
+        // the measured hit rate says it deserves. A genuine parallel-road
+        // ambiguity (two near-equal scores) still reads ~0.5 and still gates.
+        val total = scored.sumOf { it.score * it.score }
         if (total <= 0.0) { prev = null; return null }
         val best = scored.maxBy { it.score }
-        val confidence = (best.score / total).coerceIn(0.0, 1.0)
+        val confidence = (best.score * best.score / total).coerceIn(0.0, 1.0)
         if (confidence < params.minConfidence) { prev = null; return null }
 
         val m = MatchedPosition(

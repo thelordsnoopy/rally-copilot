@@ -20,14 +20,31 @@ data class Vec3(val x: Double, val y: Double, val z: Double) {
  * Silent mount self-alignment: finds the CAR-FORWARD direction in phone coordinates.
  *
  * The phone knows "down" (gravity) but not "forward" — the mount could sit at any
- * angle. The trick: when the car firmly accelerates or brakes, the true acceleration
- * direction is known from speed change (GPS/OBD), and the accelerometer shows where
- * that swing points in phone-space. Accumulate a handful of those events and the
- * forward axis falls out — no calibration screen, nothing for the driver to do.
+ * angle. The trick: when the car firmly accelerates or brakes, the accelerometer
+ * shows where that swing points in phone-space. Accumulate those events and the
+ * forward AXIS falls out — no calibration screen, nothing for the driver to do.
  *
- * Alignment is trusted only while the accumulated directions agree with each other
- * (coherence); a knocked or re-clamped phone degrades coherence and drops alignment
- * until fresh events rebuild it.
+ * THE AXIS AND ITS SIGN ARE LEARNED SEPARATELY, and that split is the whole design.
+ * The original version flipped each event by the sign of dv/dt so accelerating and
+ * braking events could share one signed sum. Replaying drive 42 showed why that
+ * never aligned: the per-sample dv/dt sign — derived from OBD/GPS speed that lags
+ * the accelerometer by most of a second — agreed with the event's true direction
+ * only 54% of the time. A coin flip. The event DIRECTIONS lay on one beautiful
+ * line (median 0.91 projection onto the principal axis); the signed sum of
+ * coin-flipped vectors was rubble (coherence 0.17 against the 0.75 gate).
+ *
+ * So now:
+ *  - THE AXIS ignores sign entirely: each event is folded into the hemisphere of
+ *    the running sum before adding. Same trace, same events: coherence 0.76.
+ *  - THE SIGN comes from physics that lag cannot flip: over a whole 2 s window,
+ *    the speed change and the mean accelerometer projection along the axis must
+ *    agree in sign. Each window with clear signal casts one vote; the majority
+ *    fixes which end of the axis is forward (79% per-window agreement on the
+ *    same trace, and votes accumulate).
+ *
+ * Alignment is trusted only while folded events agree (coherence) AND the
+ * polarity vote is decisive; a knocked or re-clamped phone degrades coherence and
+ * drops alignment until fresh events rebuild it.
  */
 class MountAlignment(
     private val params: Params = Params(),
@@ -38,24 +55,42 @@ class MountAlignment(
         /**
          * ...and no stronger than this. A road car does not accelerate or brake at
          * 1.5 g; a reading that says it did is a speed-source artefact, not a car.
-         *
-         * Found in the first black box trace: 344 alignment events accumulated with
-         * a coherence of 0.087 — pure noise, so the mount never aligned all drive
-         * and the IMU lateral figure was never available to anything. The peak
-         * "acceleration" recorded was 14.48 m/s², which is the fingerprint of the
-         * speed jumping between sources rather than the car doing anything.
          */
         val maxEventDvDt: Double = 8.0,
         /** ...and show at least this much horizontal accel in phone space. */
         val minHorizAccel: Double = 1.0,
-        val minEvents: Int = 25,
-        /** Mean-resultant-length threshold: 1.0 = all events agree perfectly. */
-        val minCoherence: Double = 0.75,
+        val minEvents: Int = 30,
+        /**
+         * Mean-resultant-length of the hemisphere-FOLDED events: 1.0 = a perfect
+         * line. Calibrated on drive 42: real events measured 0.76; synthetic
+         * garbage (uniform directions 0.64, two mixed axes 0.69) stays below.
+         */
+        val minCoherence: Double = 0.72,
+        /** Folded coherence this low with real evidence means the axis is simply
+         *  wrong (re-clamped mount): start again rather than fight history. */
+        val resetCoherence: Double = 0.40,
         val maxEvents: Int = 400,
+        /** Polarity vote window: speed change vs mean accel projection. */
+        val polarityWindowMs: Long = 2_000,
+        /** A window votes only when the speed clearly changed, m/s... */
+        val polarityMinDvMps: Double = 1.5,
+        /** ...and the mean projection clearly pointed somewhere, m/s². */
+        val polarityMinProjMps2: Double = 0.4,
+        /** Net votes needed before the sign is trusted. */
+        val minPolarityVotes: Int = 5,
+        /** Votes are clamped so an old majority can still be overturned. */
+        val maxPolarityVotes: Int = 40,
     )
 
     private var sum = Vec3(0.0, 0.0, 0.0)
     private var n = 0
+    /** Net polarity vote: positive = car-forward is along [sum], negative = against. */
+    private var polarity = 0
+    // Current polarity-vote window.
+    private var windowStartT = 0L
+    private var windowStartSpeed = 0.0
+    private var windowProjSum = 0.0
+    private var windowProjN = 0
     /** Long-EMA of the gravity direction: the car BODY's down axis in phone frame.
      *  Camber is a lean relative to this baseline — measuring against instantaneous
      *  gravity would read zero by construction. */
@@ -64,7 +99,10 @@ class MountAlignment(
 
     val eventCount: Int get() = n
     val coherence: Double get() = if (n == 0) 0.0 else sum.norm() / n
-    val isAligned: Boolean get() = n >= params.minEvents && coherence >= params.minCoherence
+    /** Net polarity votes, signed. Exposed for telemetry. */
+    val polarityVotes: Int get() = polarity
+    val isAligned: Boolean get() = n >= params.minEvents && coherence >= params.minCoherence &&
+        kotlin.math.abs(polarity) >= params.minPolarityVotes
 
     /**
      * How much the phone is MOVING IN ITS MOUNT, degrees: a fast EMA of the angle
@@ -85,19 +123,22 @@ class MountAlignment(
     val isStable: Boolean get() = wobbleEmaDeg < 8.0
 
     /** Car-forward unit vector in phone frame, or null until aligned. */
-    val forward: Vec3? get() = if (isAligned) sum.unit() else null
+    val forward: Vec3? get() = if (isAligned) sum.unit() * (if (polarity >= 0) 1.0 else -1.0) else null
 
     /**
      * Feed every IMU sample. [linearAccel] and [gravity] in phone frame,
-     * [dvdtMps2] = signed speed derivative from GPS/OBD.
+     * [dvdtMps2] = signed speed derivative from GPS/OBD, [speedMps] the fused
+     * speed itself (polarity votes compare its change across a window), [tMs]
+     * wall time for the vote windows.
      *
      * CONVENTION: [gravity] is the PHYSICAL gravity vector — it points DOWN
      * (flat phone on a table: (0, 0, −9.81)). Android's TYPE_GRAVITY reports the
      * opposite sign; the app layer negates it before calling here.
      */
-    fun tick(linearAccel: Vec3, gravity: Vec3, dvdtMps2: Double) {
+    fun tick(tMs: Long, linearAccel: Vec3, gravity: Vec3, dvdtMps2: Double, speedMps: Double) {
         // One NaN would poison the EMAs forever — reject non-finite samples outright.
-        if (!linearAccel.isFinite() || !gravity.isFinite() || !dvdtMps2.isFinite()) return
+        if (!linearAccel.isFinite() || !gravity.isFinite() ||
+            !dvdtMps2.isFinite() || !speedMps.isFinite()) return
         // Body-down baseline updates on EVERY sample (slow EMA ~ tens of seconds),
         // so brief leans through corners barely move it.
         gravityEma = if (!haveGravityEma) gravity.also { haveGravityEma = true }
@@ -106,20 +147,53 @@ class MountAlignment(
         val cosA = (gravity.unit().dot(gravityEma.unit())).coerceIn(-1.0, 1.0)
         val angDeg = Math.toDegrees(kotlin.math.acos(cosA))
         wobbleEmaDeg += (angDeg - wobbleEmaDeg) * 0.01
+
+        val up = gravity.unit() * -1.0 // gravity points down; up is the negative
+        val horiz = linearAccel - up * linearAccel.dot(up)
+
+        // ---- Polarity vote window: every sample contributes its raw projection ----
+        if (n > 0) {
+            if (windowStartT == 0L) {
+                windowStartT = tMs; windowStartSpeed = speedMps
+                windowProjSum = 0.0; windowProjN = 0
+            }
+            windowProjSum += horiz.dot(sum.unit())
+            windowProjN++
+            if (tMs - windowStartT >= params.polarityWindowMs) {
+                val dv = speedMps - windowStartSpeed
+                val meanProj = if (windowProjN > 0) windowProjSum / windowProjN else 0.0
+                if (abs(dv) >= params.polarityMinDvMps &&
+                    abs(meanProj) >= params.polarityMinProjMps2
+                ) {
+                    val vote = if ((dv > 0) == (meanProj > 0)) 1 else -1
+                    polarity = (polarity + vote)
+                        .coerceIn(-params.maxPolarityVotes, params.maxPolarityVotes)
+                }
+                windowStartT = tMs; windowStartSpeed = speedMps
+                windowProjSum = 0.0; windowProjN = 0
+            }
+        }
+
+        // ---- Axis accumulation: sign-agnostic, hemisphere-folded ----
         if (abs(dvdtMps2) < params.minEventDvDt) return
         if (abs(dvdtMps2) > params.maxEventDvDt) return
         // A wobbling phone contributes phone motion, not car motion. Do not learn
         // from it — and do not slowly poison the accumulated direction either.
         if (!isStable) return
-        val up = gravity.unit() * -1.0 // gravity points down; up is the negative
-        val horiz = linearAccel - up * linearAccel.dot(up)
         if (horiz.norm() < params.minHorizAccel) return
-        // Accelerating: accel vector points forward. Braking: backward — flip it.
-        val dir = horiz.unit() * (if (dvdtMps2 > 0) 1.0 else -1.0)
+        var dir = horiz.unit()
+        // Fold into the hemisphere of the running sum: braking and accelerating
+        // both sharpen the LINE, and no lagging speed sign can scatter it.
+        if (n > 0 && dir.dot(sum) < 0) dir *= -1.0
         sum += dir
         n++
         // Forget slowly so a re-clamped mount re-learns rather than fighting history.
         if (n > params.maxEvents) { sum *= 0.5; n /= 2 }
+        // Coherence this low with real evidence is not noise, it is a contradicted
+        // axis — the mount moved. Start over.
+        if (n >= params.minEvents && coherence < params.resetCoherence) {
+            sum = Vec3(0.0, 0.0, 0.0); n = 0; polarity = 0; windowStartT = 0L
+        }
     }
 
     /** Car-left unit vector in phone frame (bodyUp x forward), or null until aligned. */

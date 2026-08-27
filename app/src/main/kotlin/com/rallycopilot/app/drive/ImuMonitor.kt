@@ -66,9 +66,15 @@ class ImuMonitor(
                     (gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]).toDouble()
                 )
                 if (gMag < 1e-3) return
-                // Gravity points DOWN, so the component along it is negated to give
-                // rotation about UP: positive = turning left.
-                val yaw = -(e.values[0] * gravity[0] + e.values[1] * gravity[1] +
+                // Android's TYPE_GRAVITY points UP (flat phone, screen up, reads
+                // +9.81 on z), so projecting the gyro onto it directly gives
+                // rotation about UP: positive = turning left (anticlockwise from
+                // above), matching the negated course rate in DriveService.
+                // Drive 42 regression: a negation here — written for a DOWN-pointing
+                // gravity that Android does not report — inverted the yaw sign, so
+                // yaw and course rate disagreed in sign through 91% of cornering
+                // samples and every ordinary corner read as a spin (OVERSTEER).
+                val yaw = (e.values[0] * gravity[0] + e.values[1] * gravity[1] +
                     e.values[2] * gravity[2]) / gMag
                 onYawRate(yaw)
             }
