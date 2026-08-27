@@ -35,6 +35,17 @@ class MountAlignment(
     data class Params(
         /** Longitudinal events must be at least this strong, m/s2. */
         val minEventDvDt: Double = 1.5,
+        /**
+         * ...and no stronger than this. A road car does not accelerate or brake at
+         * 1.5 g; a reading that says it did is a speed-source artefact, not a car.
+         *
+         * Found in the first black box trace: 344 alignment events accumulated with
+         * a coherence of 0.087 — pure noise, so the mount never aligned all drive
+         * and the IMU lateral figure was never available to anything. The peak
+         * "acceleration" recorded was 14.48 m/s², which is the fingerprint of the
+         * speed jumping between sources rather than the car doing anything.
+         */
+        val maxEventDvDt: Double = 8.0,
         /** ...and show at least this much horizontal accel in phone space. */
         val minHorizAccel: Double = 1.0,
         val minEvents: Int = 25,
@@ -74,6 +85,7 @@ class MountAlignment(
         gravityEma = if (!haveGravityEma) gravity.also { haveGravityEma = true }
         else gravityEma + (gravity - gravityEma) * 0.002
         if (abs(dvdtMps2) < params.minEventDvDt) return
+        if (abs(dvdtMps2) > params.maxEventDvDt) return
         val up = gravity.unit() * -1.0 // gravity points down; up is the negative
         val horiz = linearAccel - up * linearAccel.dot(up)
         if (horiz.norm() < params.minHorizAccel) return

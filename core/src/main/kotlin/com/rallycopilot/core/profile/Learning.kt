@@ -41,7 +41,11 @@ object Learning {
         !it.wasConstrained &&
             it.spirited &&
             it.mapConfidence >= params.minMapConfidence &&
-            it.pathConfidence >= params.minPathConfidence &&
+            // CONFIRMED, not predicted: see CornerObservation.confirmed. Path
+            // confidence still decides what gets SPOKEN, where guessing wrong means
+            // calling a corner on a road you are not on. It has no business deciding
+            // what a corner you demonstrably drove is allowed to teach.
+            it.confirmed &&
             it.aLatObserved.isFinite() && it.aLatObserved > 0.5 // discard parked/crawling noise
     }
 

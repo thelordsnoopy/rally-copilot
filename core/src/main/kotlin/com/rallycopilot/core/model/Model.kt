@@ -217,6 +217,19 @@ data class CornerObservation(
     /** Was the style detector reading SPIRITED when this corner was driven? Only
      *  spirited corners train the model — normal driving must never drag it down. */
     val spirited: Boolean = true,
+    /**
+     * Did the map matcher actually place the car on this corner's edge while it was
+     * being driven?
+     *
+     * [pathConfidence] is a PREDICTION — how sure the app was, beforehand, that you
+     * would go this way — and it is the right question for deciding whether to speak
+     * a call. It is the wrong question for learning, which happens afterwards, when
+     * whether you drove the corner is no longer a matter of opinion. Gating learning
+     * on the prediction threw away the best samples of the first real drive: a 0.90 g
+     * three, a 0.78 g five and a 0.69 g two, all driven, all confirmed by the
+     * matcher, all discarded because the app had not been sure in advance.
+     */
+    val confirmed: Boolean = true,
 )
 
 enum class FeedbackAnswer { EASY, GOOD, HARD }

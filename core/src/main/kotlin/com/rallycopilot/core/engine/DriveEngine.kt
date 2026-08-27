@@ -402,7 +402,8 @@ class DriveEngine(
         )
 
         // ---- feed the observation collector (runs behind the car) ----
-        collector?.tick(now, speed, vehicle.throttle01(), h.corners, spiritedNow) { aheadOf(it) }
+        collector?.tick(now, speed, vehicle.throttle01(), h.corners, spiritedNow,
+            matchedEdgeId = lastMatch?.edgeId) { aheadOf(it) }
 
         // ---- personal knowledge: unexplained slowdowns become hazard evidence ----
         recentSpeeds += now to speed

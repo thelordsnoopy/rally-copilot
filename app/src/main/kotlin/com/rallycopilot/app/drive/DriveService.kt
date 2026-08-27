@@ -259,6 +259,7 @@ class DriveService : Service() {
         val camber = com.rallycopilot.core.imu.CamberEstimator(mount)
         var lastSpeed = 0.0
         var lastSpeedT = 0L
+        var lastSpeedSrc = false
         var currentDvdt = 0.0
         var lastCamberWriteT = 0L
         var lastImuLogT = 0L
@@ -290,10 +291,22 @@ class DriveService : Service() {
                 // dv/dt over a >=300 ms window of HUD speed — NOT per-IMU-sample deltas.
                 // Integer-km/h OBD speed over a 20 ms gap reads ~14 m/s² of pure
                 // quantisation noise and would flood the alignment event gate.
-                if (lastSpeedT == 0L) {
+                // dv/dt must be differentiated from ONE speed source. OBD answered on
+                // 88% of ticks in the first real trace, and every drop back to GPS —
+                // and every return — put a step change into the fused speed that is
+                // not the car accelerating. Differentiating across that boundary
+                // manufactured events with the wrong SIGN as often as the right one,
+                // which is why 344 alignment events averaged out to a coherence of
+                // 0.087 and the mount never aligned.
+                val src = hudNow.speedFromObd
+                if (lastSpeedT == 0L || src != lastSpeedSrc) {
                     lastSpeed = hudNow.speedMps; lastSpeedT = now
+                    lastSpeedSrc = src; currentDvdt = 0.0
                 } else if (now - lastSpeedT >= 300) {
-                    currentDvdt = (hudNow.speedMps - lastSpeed) / ((now - lastSpeedT) / 1000.0)
+                    val d = (hudNow.speedMps - lastSpeed) / ((now - lastSpeedT) / 1000.0)
+                    // Belt to the core's brace: anything beyond road-car physics is
+                    // an artefact and must not become an alignment event.
+                    currentDvdt = if (kotlin.math.abs(d) <= 8.0) d else 0.0
                     lastSpeed = hudNow.speedMps; lastSpeedT = now
                 }
                 mount.tick(accel, grav, currentDvdt)
@@ -348,8 +361,21 @@ class DriveService : Service() {
 
         // Audio latency: use the remembered measurement immediately, then re-measure
         // in the background (head unit, codec and phone can all change between drives).
-        db.kvGet("audio_latency_ms")?.toLongOrNull()?.let { engine.audioLatencyMs = it }
+        // Reuse a stored measurement only if it was taken on the SAME audio route.
+        // A 488 ms figure measured against who-knows-what was timing every call in
+        // the first real trace, because a failed re-measurement silently falls back
+        // to whatever was remembered. Timing is the one number worth being fussy
+        // about: it is subtracted from every braking point.
+        val storedRoute = db.kvGet("audio_latency_route")
+        val stored = db.kvGet("audio_latency_ms")?.toLongOrNull()
+        if (stored != null && storedRoute == audioRoute()) engine.audioLatencyMs = stored
         scope.launch(Dispatchers.IO) {
+            // Give Bluetooth a moment to take the stream: the drive often starts
+            // before the head unit has finished connecting.
+            var waited = 0
+            while (driveActive && waited < 20_000 && audioRoute() != "bluetooth") {
+                delay(1000); waited += 1000
+            }
             calibrateAudio()
             // Hands-free voice starts AFTER the chirp measurement: two owners of the
             // microphone at once and the calibrator hears the recogniser's silence.
@@ -483,6 +509,18 @@ class DriveService : Service() {
             audioCalibration = "microphone permission not granted - using ${engine.audioLatencyMs} ms"
             return
         }
+        // Only worth measuring once audio is actually going to the car. The first
+        // real trace measured 9 ms — the microphone hearing the phone's own speaker,
+        // because the chirp ran before Bluetooth had the stream. A number that small
+        // is not a fast car, it is proof the sound never left the phone, so the
+        // result was binned and a stale 488 ms carried the whole drive's timing.
+        val route = audioRoute()
+        blackBox?.log("audio_route", mapOf("route" to route))
+        if (route != "bluetooth") {
+            audioCalibration = "not measured — audio is going to the $route, not the car"
+            blackBox?.log("audio_cal", mapOf("ms" to null, "why" to "route=$route"))
+            return
+        }
         audioCalibration = "measuring..."
         // Hold the music off for the measurement, then hand it straight back. A song
         // playing across the chirp is the one thing that reliably breaks it.
@@ -496,6 +534,7 @@ class DriveService : Service() {
         if (ms != null) {
             engine.audioLatencyMs = ms
             db.kvPut("audio_latency_ms", ms.toString())
+            db.kvPut("audio_latency_route", route)
             audioCalibration = "audio delay ${ms} ms (measured)"
             blackBox?.log("audio_cal", mapOf("ms" to ms, "noise" to r.noiseLevel))
         } else {
@@ -503,6 +542,21 @@ class DriveService : Service() {
             blackBox?.log("audio_cal", mapOf("ms" to null, "why" to r.message, "noise" to r.noiseLevel))
         }
     }
+
+    /** Where the co-driver's voice is actually coming out right now. */
+    private fun audioRoute(): String = runCatching {
+        val am = getSystemService(android.media.AudioManager::class.java)
+        val outs = am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)
+        when {
+            outs.any {
+                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            } -> "bluetooth"
+            outs.any { it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET } -> "headphones"
+            else -> "phone speaker"
+        }
+    }.getOrDefault("unknown")
 
     /** Map view telemetry: what the HUD actually had to draw, and from where. */
     fun logMapFetch(lat: Double, lon: Double, edgeId: Long, offsetM: Double, edges: Int, ms: Long) {
@@ -659,12 +713,13 @@ class DriveService : Service() {
                     "aLat" to o.aLatObserved, "g" to o.aLatObserved / 9.81,
                     "mapConf" to o.mapConfidence, "pathConf" to o.pathConfidence,
                     "constrained" to o.wasConstrained, "spirited" to o.spirited,
+                    "confirmed" to o.confirmed,
                     "throttle" to o.throttleMean,
                     "rejectedBecause" to when {
                         o.wasConstrained -> "constrained"
                         !o.spirited -> "not spirited"
                         o.mapConfidence < 0.6 -> "map confidence %.2f < 0.60".format(o.mapConfidence)
-                        o.pathConfidence < 0.6 -> "path confidence %.2f < 0.60".format(o.pathConfidence)
+                        !o.confirmed -> "never matched onto the corner's own edge"
                         o.aLatObserved <= 0.5 -> "lateral g too low"
                         else -> null
                     },

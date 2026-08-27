@@ -16,6 +16,25 @@ class ObservationCollector(
         /** Slack past the mapped arc before a detached corner is closed out — the
          *  driven line runs slightly long, and closing early clips the exit speed. */
         const val DETACHED_MARGIN_M = 15.0
+
+        /**
+         * Lateral acceleration at which a corner is self-evidently committed, and
+         * counts as spirited whatever the sustained detector thinks. In m/s².
+         *
+         * The sustained detector exists so a brief squirt of throttle never trains
+         * the model, and that intent is right. But its proxy for "spirited" needs
+         * about two minutes of moving before the pace vote even activates, and the
+         * first real trace was a 2.6 minute drive: the first spirited tick landed at
+         * +132 s, so twelve of seventeen corners were rejected as "not spirited" —
+         * including ones taken at 0.90 g, 0.78 g and 0.69 g. A corner held at 0.6 g
+         * is not a short pull or an accident of traffic; it is the driver at work,
+         * and it is exactly the sample the profile is starved of.
+         *
+         * Note this cannot be gamed by a gentle drive: it is a floor on measured
+         * cornering load, and the per-session ratchet still bounds how far one
+         * session may move any band.
+         */
+        const val DECISIVE_A_LAT = 0.60 * 9.81
     }
 
     private data class Tracking(
@@ -41,6 +60,8 @@ class ObservationCollector(
         var travelledM: Double = 0.0,
         /** The corner is no longer in the horizon; distance alone closes it now. */
         var detached: Boolean = false,
+        /** The matcher put us on this corner's own edge while we were driving it. */
+        var confirmed: Boolean = false,
     )
 
     private var spiritedNow: Boolean = false
@@ -94,6 +115,8 @@ class ObservationCollector(
         horizonCorners: List<HorizonCorner>,
         // Fail CLOSED: with no style verdict, corners must not train the profile.
         spiritedNow: Boolean = false,
+        /** The edge the matcher currently has the car on, for confirmation. */
+        matchedEdgeId: Long? = null,
         distanceAheadOf: (HorizonCorner) -> Double,
     ) {
         this.spiritedNow = spiritedNow
@@ -122,6 +145,8 @@ class ObservationCollector(
                 distanceAheadOf(t.hc) + t.hc.corner.arcLengthM > 0.0
             }
             if (stillInside) {
+                // Proof we are on this corner's road, not one the horizon guessed.
+                if (matchedEdgeId != null && matchedEdgeId == t.hc.corner.edgeId) t.confirmed = true
                 if (speedMps < t.vMin) t.vMin = speedMps
                 if (throttle01 != null) { t.throttleSum += throttle01; t.throttleN++ }
             } else {
@@ -157,7 +182,9 @@ class ObservationCollector(
             wasConstrained = constrained(t, throttleMean),
             conditions = conditions,
             throttleMean = throttleMean,
-            spirited = t.wasSpirited || spiritedNow, // spirited at entry or exit counts
+            // Spirited at entry, at exit, or self-evidently from the cornering load.
+            spirited = t.wasSpirited || spiritedNow || aLat >= DECISIVE_A_LAT,
+            confirmed = t.confirmed,
         )
     }
 

@@ -23,7 +23,7 @@ import org.json.JSONObject
  * service's write transactions.
  */
 class AppDb private constructor(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "rallycopilot.db", null, 4) {
+    SQLiteOpenHelper(context.applicationContext, "rallycopilot.db", null, 5) {
 
     companion object {
         @Volatile private var instance: AppDb? = null
@@ -46,7 +46,8 @@ class AppDb private constructor(context: Context) :
         db.execSQL("""CREATE TABLE observations(run_id INTEGER, corner_id INTEGER, t_ms INTEGER,
             band TEXT, min_r REAL, v_entry REAL, v_min REAL, v_exit REAL, a_lat REAL,
             map_conf REAL, path_conf REAL, constrained INTEGER, conditions TEXT, throttle REAL,
-            spirited INTEGER DEFAULT 1, car TEXT DEFAULT 'default')""")
+            spirited INTEGER DEFAULT 1, car TEXT DEFAULT 'default',
+            confirmed INTEGER DEFAULT 1)""")
         db.execSQL("CREATE INDEX idx_obs_run ON observations(run_id)")
         db.execSQL("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
         db.execSQL("""CREATE TABLE corner_audit(corner_id INTEGER PRIMARY KEY,
@@ -59,10 +60,18 @@ class AppDb private constructor(context: Context) :
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_rf_run_t ON run_fixes(run_id, t_ms)")
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_obs_run ON observations(run_id)")
         }
+        // IN VERSION ORDER. These ALTERs append columns, and the reader finds them
+        // by name, but running v5 before v4 would still leave two installs with the
+        // same schema version and different column orders.
         if (old < 4) {
             db.execSQL("ALTER TABLE observations ADD COLUMN car TEXT DEFAULT 'default'")
             db.execSQL("""CREATE TABLE IF NOT EXISTS corner_audit(corner_id INTEGER PRIMARY KEY,
                 passes INTEGER DEFAULT 0, ratio_ema REAL DEFAULT 1.0)""")
+        }
+        if (old < 5) {
+            // Rows recorded before confirmation existed were gated on path
+            // confidence instead, so they were already at least that trustworthy.
+            db.execSQL("ALTER TABLE observations ADD COLUMN confirmed INTEGER DEFAULT 1")
         }
     }
 
@@ -214,6 +223,7 @@ class AppDb private constructor(context: Context) :
                     put("conditions", o.conditions.name)
                     o.throttleMean?.let { put("throttle", it) }
                     put("spirited", if (o.spirited) 1 else 0)
+                    put("confirmed", if (o.confirmed) 1 else 0)
                 }
                 db.insert("observations", null, v)
             }
@@ -235,6 +245,7 @@ class AppDb private constructor(context: Context) :
                 conditions = Conditions.valueOf(c.getString(12)),
                 throttleMean = if (c.isNull(13)) null else c.getDouble(13),
                 spirited = c.getInt(14) == 1,
+                confirmed = c.getColumnIndex("confirmed").let { i -> i < 0 || c.getInt(i) == 1 },
             )
         }
         return out
