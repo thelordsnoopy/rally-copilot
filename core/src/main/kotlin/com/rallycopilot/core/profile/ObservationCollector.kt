@@ -35,7 +35,22 @@ class ObservationCollector(
          * session may move any band.
          */
         const val DECISIVE_A_LAT = 0.60 * 9.81
+
+        /**
+         * The same floor for a WET drive. 0.60 g is a dry number: drive 44 was a
+         * wet drive whose hardest corners ran 0.39-0.50 g — genuinely committed
+         * for the grip available — and fifteen of its twenty-nine observations
+         * were rejected "not spirited" because the sustained detector's pace vote
+         * had not warmed up and the dry floor was unreachable. The same corners
+         * driven a second time, 3 mph faster, were kept; the profile was starved
+         * by a threshold that assumed dry grip in the rain.
+         */
+        const val DECISIVE_A_LAT_WET = 0.42 * 9.81
     }
+
+    /** Cornering load that is self-evidently spirited under THESE conditions. */
+    private val decisiveALat =
+        if (conditions == Conditions.WET) DECISIVE_A_LAT_WET else DECISIVE_A_LAT
 
     private data class Tracking(
         var hc: HorizonCorner,
@@ -77,6 +92,17 @@ class ObservationCollector(
         val v = lastClosed
         lastClosed = null
         return v
+    }
+
+    /** Observations closed since the last drain — for logging each one AT the
+     *  moment and place it closed. A batch stamped at drive_end answers "what",
+     *  never "where": drive 44's twenty-nine obs records all carried +392.8 s. */
+    private val closedUnlogged = ArrayList<CornerObservation>()
+    fun drainClosed(): List<CornerObservation> {
+        if (closedUnlogged.isEmpty()) return emptyList()
+        val out = closedUnlogged.toList()
+        closedUnlogged.clear()
+        return out
     }
 
     val observations: List<CornerObservation> get() = done
@@ -159,6 +185,7 @@ class ObservationCollector(
                 if (speedMps < 1.0) t.sawStopAfter = true
                 val closed = finish(t, tMs)
                 done += closed
+                closedUnlogged += closed
                 lastClosed = closed to t.hc
                 it.remove()
             }
@@ -188,7 +215,7 @@ class ObservationCollector(
             conditions = conditions,
             throttleMean = throttleMean,
             // Spirited at entry, at exit, or self-evidently from the cornering load.
-            spirited = t.wasSpirited || spiritedNow || aLat >= DECISIVE_A_LAT,
+            spirited = t.wasSpirited || spiritedNow || aLat >= decisiveALat,
             confirmed = t.confirmed,
             slid = t.slid,
         )

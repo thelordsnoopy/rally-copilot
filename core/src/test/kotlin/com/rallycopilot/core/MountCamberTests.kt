@@ -97,6 +97,30 @@ class MountAlignmentTests {
     }
 
     @Test
+    fun `alignment latches - a hair under the engage threshold does not release`() {
+        // Drive 44 sat at coherence 0.719-0.722 against the 0.72 gate and the
+        // flag toggled five times in 100 s. Once earned, alignment must survive
+        // small dips: engage at minCoherence, release only at releaseCoherence.
+        val m = MountAlignment()
+        drive(m)
+        assertTrue(m.isAligned)
+        val coherenceWhenAligned = m.coherence
+        // Pollute with a modest run of off-axis events: coherence sags a little
+        // but stays above the release threshold.
+        var t = 1_000_000L
+        var speed = 10.0
+        val side = Vec3(-sin(yaw) * 2.5, cos(yaw) * 2.5, 0.0) // perpendicular axis
+        repeat(25) {
+            m.tick(t, side, gravity, 2.5, speed)
+            speed += 0.25; t += 100
+        }
+        assertTrue("coherence should have sagged", m.coherence < coherenceWhenAligned)
+        if (m.coherence >= MountAlignment.Params().releaseCoherence) {
+            assertTrue("must stay aligned above the release threshold", m.isAligned)
+        }
+    }
+
+    @Test
     fun `no polarity votes, no alignment`() {
         // Perfect line of events but a speed trace that never clearly changes
         // across a window: the axis is known, which END is forward is not.

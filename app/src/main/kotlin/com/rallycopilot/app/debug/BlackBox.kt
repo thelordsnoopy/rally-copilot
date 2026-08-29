@@ -57,6 +57,12 @@ class BlackBox(context: Context, runId: Long) : Telemetry {
         o.put("t", System.currentTimeMillis())
         o.put("k", kind)
         for ((k, v) in fields) {
+            // Coordinates keep full useful precision: 3 dp is ~110 m, which turned
+            // 392 fixes of drive 44 into 35 distinct points and made the raw trace
+            // unmappable. 6 dp is ~11 cm — below GPS noise, cheap in bytes.
+            if ((k == "lat" || k == "lon") && v is Double && v.isFinite()) {
+                o.put(k, Math.round(v * 1e6) / 1e6); continue
+            }
             o.put(k, when (v) {
                 null -> JSONObject.NULL
                 is Double -> if (v.isFinite()) Math.round(v * 1000.0) / 1000.0 else JSONObject.NULL

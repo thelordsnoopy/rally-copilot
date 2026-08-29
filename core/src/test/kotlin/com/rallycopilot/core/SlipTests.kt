@@ -8,24 +8,30 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Is the car going where it is pointing? Gyro yaw rate vs GNSS course rate.
+ * Is the car going where it is pointing? Two detectors:
  *
- * Built because Chad drives a car with a welded diff on part-worn rear tyres, where
- * "0.9 g through that corner" may be a slide rather than grip — and the learning
- * loop, which has no absolute ceiling, would happily treat it as grip.
+ *  - the impossible radius: speed / yaw below the car's physical turning circle
+ *    (found drive 44's donut, which the old estimator never saw — 81°/s at 7 mph
+ *    was UNDER its speed gate);
+ *  - the angle comparison: gyro yaw integrated between GNSS fixes against the
+ *    bearing change over the same window (replaced the guessed 700 ms rate lag
+ *    that manufactured five phantom slides on that same drive).
  */
 class SlipTests {
 
-    /** Drive [secs] seconds at 10 Hz with the given rates. */
-    private fun run(
-        e: SlipEstimator, secs: Double, yaw: Double, course: Double,
-        speed: Double = 20.0, startMs: Long = 0,
+    /** Feed [secs] seconds of gyro at 10 Hz plus a fix each second whose bearing
+     *  advances by [bearingStepDeg] — i.e. a course turning at that rate. */
+    private fun drive(
+        e: SlipEstimator, secs: Int, yawRadS: Double, bearingStepDeg: Double,
+        speed: Double = 20.0, startMs: Long = 0, startBearing: Double = 0.0,
     ): SlipEstimator.State {
         var st = e.state
         var t = startMs
-        repeat((secs * 10).toInt()) {
-            st = e.tick(t, yaw, course, speed)
-            t += 100
+        var bearing = startBearing
+        repeat(secs) {
+            repeat(10) { st = e.onYaw(t, yawRadS, speed); t += 100 }
+            bearing = (bearing + bearingStepDeg + 360.0) % 360.0
+            st = e.onFix(t, bearing, speed)
         }
         return st
     }
@@ -33,122 +39,124 @@ class SlipTests {
     @Test
     fun `a gripping car reads neutral`() {
         val e = SlipEstimator()
-        // 20 m/s round a 100 m radius: 0.2 rad/s, and the body follows the path.
-        val st = run(e, 3.0, yaw = 0.20, course = 0.20)
+        // 0.20 rad/s body yaw (anticlockwise = bearing FALLING) matched by the
+        // course: ~11.5° of bearing change per second, same direction.
+        val st = drive(e, 4, yawRadS = 0.20, bearingStepDeg = -Math.toDegrees(0.20))
         assertEquals(SlipEstimator.Verdict.NEUTRAL, st.verdict)
         assertFalse(st.sliding)
-        assertEquals(1.0, st.ratio, 0.05)
     }
 
     @Test
-    fun `the body rotating faster than the path is oversteer`() {
+    fun `body turning far more than the path is oversteer`() {
         val e = SlipEstimator()
-        // Path still bending at 0.20, but the car has stepped out and is rotating
-        // at 0.32 — the welded-diff-on-worn-rears signature.
-        val st = run(e, 3.0, yaw = 0.32, course = 0.20)
+        // Gyro says 0.40 rad/s (~23°/s); the path only bends 11°/s. The 12°/s
+        // difference is far over the 9° window threshold.
+        val st = drive(e, 3, yawRadS = 0.40, bearingStepDeg = -11.0)
         assertEquals(SlipEstimator.Verdict.OVERSTEER, st.verdict)
         assertTrue("must be flagged as sliding", st.sliding)
+        assertTrue(e.slidSinceReset)
     }
 
     @Test
-    fun `turning less than the road demands is understeer`() {
+    fun `turning far less than the road demands is understeer`() {
         val e = SlipEstimator()
-        val st = run(e, 3.0, yaw = 0.12, course = 0.22)
+        // Path bends 20°/s; the body only rotates ~6°/s: pushing wide.
+        val st = drive(e, 3, yawRadS = 0.10, bearingStepDeg = -20.0)
         assertEquals(SlipEstimator.Verdict.UNDERSTEER, st.verdict)
         assertTrue(st.sliding)
     }
 
     @Test
-    fun `a brief disagreement is not a slide`() {
+    fun `small disagreement inside the noise floor stays neutral`() {
         val e = SlipEstimator()
-        run(e, 2.0, yaw = 0.20, course = 0.20)
-        // 300 ms of divergence — inside the sustain window, so not yet a verdict.
-        val st = run(e, 0.3, yaw = 0.34, course = 0.20, startMs = 2_000)
-        assertFalse("must persist before it counts", st.sliding)
-    }
-
-    @Test
-    fun `a straight road says nothing at all`() {
-        val e = SlipEstimator()
-        // Both rates near zero: the ratio of two small noisy numbers is meaningless.
-        val st = run(e, 3.0, yaw = 0.02, course = 0.01)
-        assertEquals(SlipEstimator.Verdict.UNKNOWN, st.verdict)
-        assertFalse(st.sliding)
-    }
-
-    @Test
-    fun `crawling says nothing either`() {
-        val e = SlipEstimator()
-        val st = run(e, 3.0, yaw = 0.30, course = 0.15, speed = 2.0)
-        assertEquals(SlipEstimator.Verdict.UNKNOWN, st.verdict)
-    }
-
-    @Test
-    fun `the driven radius comes from speed and course rate, with no map`() {
-        val e = SlipEstimator()
-        run(e, 3.0, yaw = 0.20, course = 0.20, speed = 20.0)
-        val r = e.drivenRadiusM(20.0)!!
-        assertEquals("v / courseRate = 20 / 0.2", 100.0, r, 5.0)
-    }
-
-    @Test
-    fun `the driven radius is unavailable on a straight`() {
-        val e = SlipEstimator()
-        run(e, 3.0, yaw = 0.01, course = 0.01, speed = 20.0)
-        assertNull(e.drivenRadiusM(20.0))
-    }
-
-    @Test
-    fun `one rate turning alone says nothing`() {
-        // The drive-42 regression class: the old gate said UNKNOWN only when BOTH
-        // rates were small, so one noisy small number under a modest real one
-        // produced verdicts. 8 of 16 observations were flagged slides at up to
-        // 0.05 g that way. Yaw clearly turning, course not: no verdict.
-        val e = SlipEstimator()
-        val st = run(e, 3.0, yaw = 0.15, course = 0.03)
-        assertEquals(SlipEstimator.Verdict.UNKNOWN, st.verdict)
-        assertFalse(st.sliding)
-    }
-
-    @Test
-    fun `a strong rotation the path never shows is a spin`() {
-        val e = SlipEstimator()
-        val st = run(e, 3.0, yaw = 0.50, course = 0.02)
-        assertEquals(SlipEstimator.Verdict.OVERSTEER, st.verdict)
-        assertTrue(st.sliding)
-    }
-
-    @Test
-    fun `no cornering load, no slide`() {
-        // Ratio 1.5 would read oversteer, but at 6.5 m/s x 0.15 rad/s the implied
-        // lateral acceleration is 0.1 g — nothing slides there.
-        val e = SlipEstimator()
-        val st = run(e, 3.0, yaw = 0.15, course = 0.10, speed = 6.5)
-        assertEquals(SlipEstimator.Verdict.UNKNOWN, st.verdict)
-        assertFalse(st.sliding)
-    }
-
-    @Test
-    fun `corner entry lag is not oversteer`() {
-        // GNSS course rate trails the gyro by most of a second: on entry the body
-        // is already turning while the reported path is not. The delayed-yaw
-        // comparison must ride that out without declaring a slide.
-        val e = SlipEstimator()
-        var st = run(e, 0.7, yaw = 0.25, course = 0.02)
-        assertFalse("entry transient must not slide", st.sliding)
-        st = run(e, 3.0, yaw = 0.25, course = 0.25, startMs = 700)
+        // 3°/s of mismatch: under the 9° per-window threshold, which sits above
+        // the measured p99 noise of a real drive.
+        val st = drive(e, 4, yawRadS = 0.25, bearingStepDeg = -Math.toDegrees(0.20))
         assertEquals(SlipEstimator.Verdict.NEUTRAL, st.verdict)
         assertFalse(st.sliding)
     }
 
     @Test
-    fun `the slide flag latches until the corner is closed out`() {
+    fun `the donut - an impossible radius needs no GPS at all`() {
         val e = SlipEstimator()
-        run(e, 3.0, yaw = 0.34, course = 0.20)
+        // Drive 44, +102.4 s: 81°/s of yaw at 7 mph (3.1 m/s) = 2.2 m implied
+        // radius against a 5 m floor. No fixes are fed at all — a 1 Hz bearing
+        // aliases on a spin and can never see one.
+        var st = e.state
+        var t = 0L
+        repeat(10) { st = e.onYaw(t, 1.41, 3.1); t += 100 }
+        assertEquals(SlipEstimator.Verdict.OVERSTEER, st.verdict)
+        assertTrue("a donut is a slide", st.sliding)
         assertTrue(e.slidSinceReset)
-        run(e, 3.0, yaw = 0.20, course = 0.20, startMs = 5_000)
-        assertTrue("still latched for this corner", e.slidSinceReset)
+        assertTrue(st.impliedRadiusM != null && st.impliedRadiusM!! < 5.0)
+    }
+
+    @Test
+    fun `a parked phone twisted in the hand is not a donut`() {
+        val e = SlipEstimator()
+        var st = e.state
+        var t = 0L
+        // Same rotation, but the car is not moving: radius zero of speed zero.
+        repeat(10) { st = e.onYaw(t, 1.41, 0.4); t += 100 }
+        assertFalse(st.sliding)
+        assertEquals(SlipEstimator.Verdict.UNKNOWN, st.verdict)
+    }
+
+    @Test
+    fun `a flick of the wheel shorter than the sustain is not a slide`() {
+        val e = SlipEstimator()
+        var st = e.state
+        var t = 0L
+        repeat(2) { st = e.onYaw(t, 1.41, 3.1); t += 100 }   // 200 ms only
+        assertFalse("must persist before it counts", st.sliding)
+    }
+
+    @Test
+    fun `low-speed GPS bearing glitches are ignored by the window`() {
+        val e = SlipEstimator()
+        // Drive 47 logged a ±36° equal-and-opposite bearing pair at 9 mph
+        // (4 m/s). Below windowMinSpeedMps the window must not judge at all.
+        var t = 0L
+        repeat(10) { e.onYaw(t, 0.02, 4.0); t += 100 }
+        e.onFix(t, 10.0, 4.0)
+        repeat(10) { e.onYaw(t, 0.02, 4.0); t += 100 }
+        val st = e.onFix(t, 46.0, 4.0) // bearing leapt 36° with no body rotation
+        assertFalse(st.sliding)
+        assertEquals(SlipEstimator.Verdict.UNKNOWN, st.verdict)
+    }
+
+    @Test
+    fun `driven radius comes from the course and needs real turning`() {
+        val e = SlipEstimator()
+        drive(e, 3, yawRadS = 0.20, bearingStepDeg = -Math.toDegrees(0.20))
+        // 20 m/s at 0.2 rad/s of course = 100 m radius.
+        val r = e.drivenRadiusM(20.0)
+        assertTrue(r != null && r!! > 80 && r < 120)
+        // Straight road: nothing to measure.
+        val e2 = SlipEstimator()
+        drive(e2, 3, yawRadS = 0.0, bearingStepDeg = 0.0)
+        assertNull(e2.drivenRadiusM(20.0))
+    }
+
+    @Test
+    fun `slidSinceReset holds until the collector clears it`() {
+        val e = SlipEstimator()
+        drive(e, 3, yawRadS = 0.40, bearingStepDeg = -11.0)
+        assertTrue(e.slidSinceReset)
+        // Long after the hold expires the flag must still be up...
+        drive(e, 5, yawRadS = 0.0, bearingStepDeg = 0.0, startMs = 60_000)
+        assertTrue(e.slidSinceReset)
         e.resetSlide()
         assertFalse(e.slidSinceReset)
+    }
+
+    @Test
+    fun `the window verdict expires rather than lingering`() {
+        val e = SlipEstimator()
+        var st = drive(e, 3, yawRadS = 0.40, bearingStepDeg = -11.0)
+        assertTrue(st.sliding)
+        // Two seconds of straight driving later, the hold has lapsed.
+        st = drive(e, 3, yawRadS = 0.0, bearingStepDeg = 0.0, startMs = 30_000)
+        assertFalse(st.sliding)
     }
 }

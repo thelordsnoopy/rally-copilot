@@ -66,6 +66,11 @@ class MountAlignment(
          * garbage (uniform directions 0.64, two mixed axes 0.69) stays below.
          */
         val minCoherence: Double = 0.72,
+        /** Once aligned, stay aligned until coherence falls below THIS — not the
+         *  engage threshold. Real drives sit right on the engage number (0.719 vs
+         *  0.72 for minutes at a time); without hysteresis the flag flaps and
+         *  aLat/camber/audit all blink with it. */
+        val releaseCoherence: Double = 0.66,
         /** Folded coherence this low with real evidence means the axis is simply
          *  wrong (re-clamped mount): start again rather than fight history. */
         val resetCoherence: Double = 0.40,
@@ -101,8 +106,27 @@ class MountAlignment(
     val coherence: Double get() = if (n == 0) 0.0 else sum.norm() / n
     /** Net polarity votes, signed. Exposed for telemetry. */
     val polarityVotes: Int get() = polarity
-    val isAligned: Boolean get() = n >= params.minEvents && coherence >= params.minCoherence &&
-        kotlin.math.abs(polarity) >= params.minPolarityVotes
+
+    /**
+     * LATCHED, with hysteresis: engage at [Params.minCoherence], release only
+     * below [Params.releaseCoherence]. Drive 44 sat within three thousandths of
+     * the bare threshold for its whole length — coherence 0.719 / 0.721 / 0.722 —
+     * and a naked comparison toggled alignment five times in 100 s, so every
+     * consumer of [forward] saw a stream with holes in it. An estimate does not
+     * get slightly wrong the moment it dips a hair under the number that
+     * qualified it.
+     */
+    val isAligned: Boolean get() = alignedLatch
+    private var alignedLatch = false
+
+    private fun updateAlignedLatch() {
+        val votesOk = kotlin.math.abs(polarity) >= params.minPolarityVotes
+        alignedLatch = if (!alignedLatch) {
+            n >= params.minEvents && coherence >= params.minCoherence && votesOk
+        } else {
+            n >= params.minEvents && coherence >= params.releaseCoherence && votesOk
+        }
+    }
 
     /**
      * How much the phone is MOVING IN ITS MOUNT, degrees: a fast EMA of the angle
@@ -173,6 +197,9 @@ class MountAlignment(
                 windowProjSum = 0.0; windowProjN = 0
             }
         }
+        // The latch must track every path through this method — votes can change
+        // even on samples the axis gates below reject.
+        updateAlignedLatch()
 
         // ---- Axis accumulation: sign-agnostic, hemisphere-folded ----
         if (abs(dvdtMps2) < params.minEventDvDt) return
@@ -194,6 +221,7 @@ class MountAlignment(
         if (n >= params.minEvents && coherence < params.resetCoherence) {
             sum = Vec3(0.0, 0.0, 0.0); n = 0; polarity = 0; windowStartT = 0L
         }
+        updateAlignedLatch()
     }
 
     /** Car-left unit vector in phone frame (bodyUp x forward), or null until aligned. */

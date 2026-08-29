@@ -98,7 +98,18 @@ class DriveService : Service() {
     /** Is the car going where it is pointing? Gyro vs GNSS course. */
     val slip = com.rallycopilot.core.imu.SlipEstimator()
     @Volatile private var yawRateRadS = 0.0
-    @Volatile private var courseRateRadS = 0.0
+
+    /**
+     * Auto-stop: when non-zero, the drive screen is showing "Stopped driving?"
+     * counting down to this wall-clock time; if nobody answers by then, the drive
+     * stops itself. Set by [autoStopTick], cleared by movement or by the driver.
+     */
+    @Volatile var autoStopDeadlineMs: Long = 0L
+        private set
+    private var lastMovingT = 0L
+    /** The dongle answered at some point this drive — so its silence means the
+     *  ignition went off, not that there is no dongle. */
+    private var obdWasLive = false
 
     /** Phone-in-mount wobble, degrees — the DriveScreen warns above 8. */
     @Volatile var mountWobbleDeg: Double = 0.0
@@ -152,6 +163,9 @@ class DriveService : Service() {
         // run's distance or a stale lastFix (one giant haversine jump).
         distanceM = 0.0
         lastFix = null
+        autoStopDeadlineMs = 0L
+        lastMovingT = 0L
+        obdWasLive = false
 
         wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rallycopilot:drive")
@@ -286,7 +300,7 @@ class DriveService : Service() {
             onYawRate = { rad ->
                 yawRateRadS = rad
                 val hud = engine.hud.value
-                val st = slip.tick(System.currentTimeMillis(), rad, courseRateRadS, hud.speedMps)
+                val st = slip.onYaw(System.currentTimeMillis(), rad, hud.speedMps)
                 engine.slipping = st.sliding
                 engine.drivenRadiusM = slip.drivenRadiusM(hud.speedMps)
             },
@@ -354,7 +368,8 @@ class DriveService : Service() {
                         "camberDeg" to deg,
                         "yawRate" to slip.state.yawRateRadS,
                         "courseRate" to slip.state.courseRateRadS,
-                        "slipRatio" to slip.state.ratio,
+                        "dbeta" to slip.state.dbetaDeg,
+                        "impliedR" to slip.state.impliedRadiusM,
                         "slipVerdict" to slip.state.verdict.name,
                         "sliding" to slip.state.sliding,
                         "drivenR" to slip.drivenRadiusM(hudNow.speedMps),
@@ -469,6 +484,99 @@ class DriveService : Service() {
                 delay(100)
             }
         }
+
+        // Housekeeping at 1 Hz: log each observation AT the moment and place it
+        // closed, and watch for the drive that ended without anyone pressing stop.
+        scope.launch(engineDispatcher) {
+            while (isActive && driveActive) {
+                drainObsLog()
+                autoStopTick()
+                delay(1000)
+            }
+        }
+    }
+
+    /**
+     * The drive that nobody stops. Drive 46 was 31 minutes long, 27 of them a
+     * parked car at the pub with the app still recording. The signal that a stop
+     * is a real stop rather than a junction: the car is stationary AND the dongle
+     * has gone quiet — an ELM327 answers as long as the ignition is on, so its
+     * silence after it had been answering means the key came out. Ask on screen;
+     * if nobody answers inside the window, believe the evidence and stop.
+     */
+    private fun autoStopTick() {
+        if (isDemo || isCalibration || !::engine.isInitialized) return
+        val now = System.currentTimeMillis()
+        val hud = engine.hud.value
+        val obdLive = hud.obdConnected && !hud.obdSilent
+        if (obdLive) obdWasLive = true
+        if (lastMovingT == 0L) lastMovingT = now
+        if (hud.speedMps > 1.0) {
+            lastMovingT = now
+            if (autoStopDeadlineMs != 0L) {
+                autoStopDeadlineMs = 0L
+                blackBox?.log("autostop", mapOf("event" to "cancelled: moving again"))
+            }
+            return
+        }
+        val stillMs = now - lastMovingT
+        val trigger = if (obdWasLive) {
+            // Ignition-off is decisive: prompt after a short stationary grace.
+            !obdLive && stillMs >= AUTO_STOP_STILL_MS
+        } else {
+            // No dongle this drive: stationary time is the only evidence, so
+            // demand much more of it (a long wait at a level crossing is real).
+            stillMs >= AUTO_STOP_STILL_NO_OBD_MS
+        }
+        if (autoStopDeadlineMs == 0L) {
+            if (trigger) {
+                autoStopDeadlineMs = now + AUTO_STOP_ANSWER_MS
+                blackBox?.log("autostop", mapOf(
+                    "event" to "prompt", "stillS" to stillMs / 1000, "obdWasLive" to obdWasLive))
+            }
+        } else if (now >= autoStopDeadlineMs) {
+            blackBox?.log("autostop", mapOf("event" to "no answer - stopping the drive"))
+            stopDrive()
+        }
+    }
+
+    /** The driver tapped "still driving": push the evidence back and carry on. */
+    fun autoStopStillDriving() {
+        lastMovingT = System.currentTimeMillis()
+        autoStopDeadlineMs = 0L
+        blackBox?.log("autostop", mapOf("event" to "driver said still driving"))
+    }
+
+    /** Log every observation the collector closed since the last look — with the
+     *  time and position of the close, not a batch stamped at drive_end. */
+    private fun drainObsLog() {
+        val col = collector ?: return
+        val bb = blackBox ?: return
+        val fixNow = lastFix
+        for (o in col.drainClosed()) {
+            bb.log("obs", mapOf(
+                "corner" to o.cornerId, "band" to o.band.name,
+                "rM" to o.minRadiusM,
+                "vEntry" to o.vEntryMps, "vMin" to o.vMinMps, "vExit" to o.vExitMps,
+                "aLat" to o.aLatObserved, "g" to o.aLatObserved / 9.81,
+                "mapConf" to o.mapConfidence, "pathConf" to o.pathConfidence,
+                "constrained" to o.wasConstrained, "spirited" to o.spirited,
+                "confirmed" to o.confirmed, "slid" to o.slid,
+                "throttle" to o.throttleMean,
+                "lat" to fixNow?.lat, "lon" to fixNow?.lon,
+                "rejectedBecause" to rejectReason(o),
+            ))
+        }
+    }
+
+    private fun rejectReason(o: com.rallycopilot.core.model.CornerObservation): String? = when {
+        o.wasConstrained -> "constrained"
+        !o.spirited -> "not spirited"
+        o.mapConfidence < 0.6 -> "map confidence %.2f < 0.60".format(o.mapConfidence)
+        o.slid -> "the car was sliding — not evidence of grip"
+        !o.confirmed -> "never matched onto the corner's own edge"
+        o.aLatObserved <= 0.5 -> "lateral g too low"
+        else -> null
     }
 
     /** Live change of the quiet-mode setting; takes effect on the next tick. */
@@ -709,22 +817,12 @@ class DriveService : Service() {
                             com.rallycopilot.core.model.LatLon(prev.lat, prev.lon),
                             com.rallycopilot.core.model.LatLon(fix.lat, fix.lon),
                         )
-                        // How fast the VELOCITY VECTOR is turning, from successive
-                        // GNSS bearings. Paired against the gyro's body yaw rate,
-                        // the difference is sideslip — the car not going where it
-                        // is pointing. Bearing is only meaningful while moving, and
-                        // is NaN when the fix has none.
-                        val dt = (fix.tMs - prev.tMs) / 1000.0
-                        if (dt in 0.05..2.0 && fix.speedMps > 3.0 &&
-                            !fix.bearingDeg.isNaN() && !prev.bearingDeg.isNaN()
-                        ) {
-                            var d = fix.bearingDeg - prev.bearingDeg
-                            while (d > 180) d -= 360
-                            while (d < -180) d += 360
-                            // Bearing grows clockwise; yaw is positive anticlockwise.
-                            courseRateRadS = -Math.toRadians(d) / dt
-                        }
                     }
+                    // Close the slip estimator's integration window: the yaw the
+                    // gyro accumulated since the previous fix, against the bearing
+                    // change over exactly that interval. Two angles, one window —
+                    // this is what replaced the guessed 700 ms rate delay.
+                    slip.onFix(fix.tMs, fix.bearingDeg, fix.speedMps)
                     lastFix = fix
                     scope.launch(engineDispatcher) { if (driveActive) engine.onFix(fix) }
                 }
@@ -741,6 +839,7 @@ class DriveService : Service() {
     fun stopDrive() {
         if (!driveActive) return
         driveActive = false
+        autoStopDeadlineMs = 0L
         val rid = runId
         runId = -1
         // Cheap teardown immediately, on whichever thread called us.
@@ -758,36 +857,15 @@ class DriveService : Service() {
         scope.launch(engineDispatcher) {
             // A corner in progress when the drive ends still counts as a pass.
             radiusAuditor?.closePass(); radiusAuditor = null
-            val bbEnd = blackBox
-            bbEnd?.log("drive_end", mapOf(
+            // Observations are logged live as each closes (kind "obs", with time
+            // and position); this final drain catches any that closed since the
+            // last 1 Hz sweep so the trace never loses the drive's last corner.
+            drainObsLog()
+            blackBox?.log("drive_end", mapOf(
                 "distanceM" to distanceM,
                 "observations" to (obs?.size ?: 0),
                 "usable" to (obs?.let { com.rallycopilot.core.profile.Learning.usable(it).size } ?: 0),
             ))
-            // Every corner the collector closed, with the exact reason it was or was
-            // not allowed to teach the profile. This is the record that answers
-            // "why did a drive with ten corners learn one?".
-            obs?.forEach { o ->
-                bbEnd?.log("obs", mapOf(
-                    "corner" to o.cornerId, "band" to o.band.name,
-                    "rM" to o.minRadiusM,
-                    "vEntry" to o.vEntryMps, "vMin" to o.vMinMps, "vExit" to o.vExitMps,
-                    "aLat" to o.aLatObserved, "g" to o.aLatObserved / 9.81,
-                    "mapConf" to o.mapConfidence, "pathConf" to o.pathConfidence,
-                    "constrained" to o.wasConstrained, "spirited" to o.spirited,
-                    "confirmed" to o.confirmed, "slid" to o.slid,
-                    "throttle" to o.throttleMean,
-                    "rejectedBecause" to when {
-                        o.wasConstrained -> "constrained"
-                        !o.spirited -> "not spirited"
-                        o.mapConfidence < 0.6 -> "map confidence %.2f < 0.60".format(o.mapConfidence)
-                        o.slid -> "the car was sliding — not evidence of grip"
-                        !o.confirmed -> "never matched onto the corner's own edge"
-                        o.aLatObserved <= 0.5 -> "lateral g too low"
-                        else -> null
-                    },
-                ))
-            }
             if (rid >= 0 && distanceM < MIN_SAVED_DRIVE_M && obs.isNullOrEmpty()) {
                 // Went nowhere: a mis-tap, or the app opened to check a setting.
                 // Not a drive, so do not keep one.
@@ -868,6 +946,16 @@ class DriveService : Service() {
         /** Under this distance with nothing learned, a run is discarded rather than
          *  saved — see the note on AppDb.deleteRun. */
         const val MIN_SAVED_DRIVE_M = 100.0
+
+        /** Stationary this long with the dongle gone quiet: ask "stopped driving?".
+         *  90 s clears any traffic light — at a light the engine idles and the
+         *  dongle keeps answering, so the prompt never fires in traffic. */
+        const val AUTO_STOP_STILL_MS = 90_000L
+        /** Without a dongle this drive, stillness is the only evidence — demand a
+         *  lot of it before interrupting (level crossings are long). */
+        const val AUTO_STOP_STILL_NO_OBD_MS = 420_000L
+        /** How long the prompt waits for an answer before stopping the drive. */
+        const val AUTO_STOP_ANSWER_MS = 120_000L
 
         const val CHANNEL = "drive"
         const val NOTIF_ID = 1

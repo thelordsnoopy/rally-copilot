@@ -114,6 +114,37 @@ fun DriveScreen(activity: MainActivity, onExit: () -> Unit) {
         }
     }
 
+    // Auto-stop prompt: the service saw the car stop and the dongle go quiet.
+    // Ticks the remaining seconds; -1 means no prompt is active.
+    val autoStopLeftS by produceState(-1L) {
+        while (true) {
+            val dl = activity.driveService?.autoStopDeadlineMs ?: 0L
+            value = if (dl == 0L) -1L
+            else ((dl - System.currentTimeMillis()) / 1000).coerceAtLeast(0)
+            delay(250)
+        }
+    }
+    if (autoStopLeftS >= 0 && !showFeedback) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { activity.driveService?.autoStopStillDriving() },
+            title = { Text("Stopped driving?") },
+            text = {
+                Text(
+                    "The car has been still for a while and the OBD link has gone quiet. " +
+                        "The drive stops itself in ${autoStopLeftS}s."
+                )
+            },
+            confirmButton = {
+                Button(onClick = { showFeedback = true }) { Text("STOP THE DRIVE") }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { activity.driveService?.autoStopStillDriving() }
+                ) { Text("STILL DRIVING") }
+            },
+        )
+    }
+
     if (showFeedback) {
         FeedbackSheet(activity) { onExit() }
         return

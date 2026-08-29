@@ -219,6 +219,36 @@ class ObservationSurvivalTests {
         assertTrue("lateral g computed", obs[0].aLatObserved > 0)
     }
 
+    /** Drive one corner through the collector with no style verdict at all. */
+    private fun oneCornerAt(speed: Double, rM: Double,
+                            cond: com.rallycopilot.core.model.Conditions): 
+        com.rallycopilot.core.model.CornerObservation {
+        val col = com.rallycopilot.core.profile.ObservationCollector(runId = 1, conditions = cond)
+        val c = corner(9, rM, arc = 60.0)
+        var ahead = 10.0
+        var t = 0L
+        repeat(3) {
+            col.tick(t, speed, null, listOf(horizonCorner(c, ahead)), spiritedNow = false) { ahead }
+            ahead -= 5.0; t += 333
+        }
+        col.onHorizonRebuilt(emptyList())
+        repeat(30) { col.tick(t, speed, null, emptyList(), spiritedNow = false) { -999.0 }; t += 333 }
+        return col.observations.single()
+    }
+
+    @Test
+    fun `wet drives use the wet decisive threshold`() {
+        // 0.45 g: v² = 0.45*9.81*100 → v = 21.0 m/s on a 100 m corner. Drive 44
+        // rejected exactly this shape of corner fifteen times in the rain.
+        val wet = oneCornerAt(21.0, 100.0, com.rallycopilot.core.model.Conditions.WET)
+        assertTrue("0.45 g in the wet is the driver at work", wet.spirited)
+        val dry = oneCornerAt(21.0, 100.0, com.rallycopilot.core.model.Conditions.DRY)
+        assertFalse("0.45 g in the dry is below the dry floor", dry.spirited)
+        // And the dry floor still works where it always did.
+        val hard = oneCornerAt(25.0, 100.0, com.rallycopilot.core.model.Conditions.DRY) // 0.64 g
+        assertTrue(hard.spirited)
+    }
+
     @Test
     fun `an approaching corner that vanishes for real is still closed, not leaked`() {
         val col = com.rallycopilot.core.profile.ObservationCollector(
