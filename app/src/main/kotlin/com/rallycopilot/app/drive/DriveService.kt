@@ -97,6 +97,8 @@ class DriveService : Service() {
     private var voiceCommands: com.rallycopilot.app.audio.VoiceCommands? = null
     /** Is the car going where it is pointing? Gyro vs GNSS course. */
     val slip = com.rallycopilot.core.imu.SlipEstimator()
+    /** Are the driven wheels outrunning the ground? rpm vs the learned gearing. */
+    val wheelspin = com.rallycopilot.core.obd.WheelspinDetector()
     @Volatile private var yawRateRadS = 0.0
 
     /**
@@ -370,6 +372,11 @@ class DriveService : Service() {
                         "courseRate" to slip.state.courseRateRadS,
                         "dbeta" to slip.state.dbetaDeg,
                         "impliedR" to slip.state.impliedRadiusM,
+                        "spinRatio" to wheelspin.state.ratio,
+                        "spinFirstGear" to wheelspin.state.firstGearRatio,
+                        "spinExcess" to wheelspin.state.excess,
+                        "spinVerdict" to wheelspin.state.verdict.name,
+                        "spinning" to wheelspin.state.spinning,
                         "slipVerdict" to slip.state.verdict.name,
                         "sliding" to slip.state.sliding,
                         "drivenR" to slip.drivenRadiusM(hudNow.speedMps),
@@ -823,6 +830,19 @@ class DriveService : Service() {
                     // change over exactly that interval. Two angles, one window —
                     // this is what replaced the guessed 700 ms rate delay.
                     slip.onFix(fix.tMs, fix.bearingDeg, fix.speedMps)
+                    // Wheelspin: engine rpm against GROUND speed. GPS deliberately,
+                    // not the car's own speedometer — that number comes from the
+                    // very wheels in question, so it cannot report them spinning.
+                    lastFix?.let { prev ->
+                        val dt = (fix.tMs - prev.tMs) / 1000.0
+                        if (dt in 0.2..2.0) {
+                            val accel = (fix.speedMps - prev.speedMps) / dt
+                            wheelspin.tick(
+                                fix.tMs, obd.rpm(), fix.speedMps, accel,
+                                obd.gearInference.learnedRatios,
+                            )
+                        }
+                    }
                     lastFix = fix
                     scope.launch(engineDispatcher) { if (driveActive) engine.onFix(fix) }
                 }

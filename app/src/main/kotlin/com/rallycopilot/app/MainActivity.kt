@@ -180,6 +180,26 @@ class MainActivity : ComponentActivity() {
     val testObd by lazy { com.rallycopilot.app.obd.ObdClient(lifecycleScope) }
     val testingObd = androidx.compose.runtime.mutableStateOf(false)
 
+    /**
+     * The CAN probe: asks the car's DSC and steering modules what they know.
+     * Owns the dongle exactly as the test link does, so the same one-connection
+     * rule applies — a drive, the test link and the probe can never overlap.
+     */
+    val canProbe by lazy { com.rallycopilot.app.obd.CanProbe(lifecycleScope, this) }
+
+    fun startCanProbe(rolling: Boolean) {
+        if (canProbe.running) { canProbe.stop(); return }
+        if (DriveService.instance?.driveActive == true) return
+        if (testingObd.value) { testObd.disconnect(); testingObd.value = false }
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
+        val db = com.rallycopilot.app.data.AppDb.get(this)
+        val mac = db.kvGet("obd_mac") ?: runCatching { testObd.findBonded() }.getOrNull() ?: return
+        canProbe.start(mac, rolling)
+    }
+
     fun toggleObdTest() {
         val db = com.rallycopilot.app.data.AppDb.get(this)
         if (testingObd.value) {
@@ -1239,6 +1259,79 @@ fun SettingsScreen(activity: MainActivity) {
                 fontSize = 12.sp, color = Color(0xFF8899AA),
             )
         }
+
+        // ---- CAN probe: what the car's other modules will tell us ----
+        val probe = activity.canProbe
+        val probeState by androidx.compose.runtime.produceState(
+            initialValue = Triple("", "", listOf<String>())
+        ) {
+            while (true) {
+                value = Triple(
+                    probe.phase.name, probe.progress,
+                    listOfNotNull(
+                        probe.alive.takeIf { it.isNotEmpty() }?.let { "answering: " + it.joinToString(", ") },
+                        probe.answering.size.takeIf { it > 0 }?.let { "$it identifiers returned data" },
+                        probe.wheelSpeedHit?.let { "WHEEL SPEEDS? $it" },
+                    )
+                )
+                kotlinx.coroutines.delay(500)
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "EXPERIMENT — ask the DSC and steering modules directly",
+            color = Color(0xFF8899AA), fontSize = 11.sp, fontWeight = FontWeight.Bold,
+        )
+        Text(
+            "Standard OBD has no per-wheel speeds and no steering angle. This asks the " +
+                "other modules, read-only, and writes down every answer. Run it PARKED " +
+                "first to find what answers, then DRIVING so the numbers can be matched " +
+                "against road speed.",
+            color = Color(0xFF667788), fontSize = 11.sp,
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { activity.startCanProbe(rolling = false) },
+                enabled = activity.driveService == null,
+                modifier = Modifier.weight(1f).height(44.dp),
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (probe.running) Color(0xFF5A2530) else Color(0xFF232D38),
+                    disabledContainerColor = Color(0xFF1A222B),
+                ),
+            ) {
+                Text(
+                    if (probe.running) "STOP PROBE" else "PROBE (PARKED)",
+                    fontSize = 12.sp, color = Color(0xFFB8C4D0), fontWeight = FontWeight.Bold,
+                )
+            }
+            Button(
+                onClick = { activity.startCanProbe(rolling = true) },
+                enabled = activity.driveService == null && !probe.running,
+                modifier = Modifier.weight(1f).height(44.dp),
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF232D38),
+                    disabledContainerColor = Color(0xFF1A222B),
+                ),
+            ) {
+                Text("PROBE (DRIVING)", fontSize = 12.sp, color = Color(0xFFB8C4D0),
+                    fontWeight = FontWeight.Bold)
+            }
+        }
+        if (probeState.first != "IDLE") {
+            Text(
+                "${probeState.first.lowercase()} — ${probeState.second}",
+                color = Color(0xFF8899AA), fontSize = 11.sp,
+            )
+            for (line in probeState.third) {
+                Text(
+                    line, fontSize = 11.sp,
+                    color = if (line.startsWith("WHEEL")) Color(0xFF2EE06B) else Color(0xFF8899AA),
+                )
+            }
+        }
+        Spacer(Modifier.height(6.dp))
         if (showLog) {
             Column(
                 Modifier.fillMaxWidth().background(Color(0xFF0A0E13), RoundedCornerShape(8.dp))
