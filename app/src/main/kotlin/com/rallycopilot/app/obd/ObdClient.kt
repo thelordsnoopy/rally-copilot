@@ -210,7 +210,29 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                  * PREVIOUS command's answer. The drain is BOUNDED: a chatty clone can
                  * hold available() above zero forever.
                  */
+                var owedPrompt = false
                 fun cmd(c: String, timeoutMs: Long = 900): String {
+                    // A command that hit its deadline did NOT consume its answer: the
+                    // ELM is still going to send it, plus the '>' that ends it. The
+                    // drain below only removes what has ALREADY landed, so when the
+                    // reply is merely late — the common case, since the deadline is
+                    // what we ran out of — available() reads zero, the drain falls
+                    // straight through, and the previous command's answer is returned
+                    // as this one's. Measured over drives 56-58 that mis-attributed
+                    // one sweep reply in five: 0x0F and 0x21 both "answered" 410B.
+                    // The only way back into step is to wait for the prompt we are
+                    // owed and throw away everything up to it.
+                    if (owedPrompt) {
+                        val until = System.currentTimeMillis() + 400
+                        while (System.currentTimeMillis() < until) {
+                            if (inp.available() > 0) {
+                                val ch = inp.read()
+                                if (ch < 0) break
+                                if (ch.toChar() == '>') break
+                            } else Thread.sleep(2)
+                        }
+                        owedPrompt = false
+                    }
                     val drainUntil = System.currentTimeMillis() + 250
                     var drained = 0
                     while (inp.available() > 0 && drained < 4096 &&
@@ -221,6 +243,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                     }
                     out.write((c + "\r").toByteArray())
                     out.flush()
+                    owedPrompt = true
                     val sb = StringBuilder()
                     val deadline = System.currentTimeMillis() + timeoutMs
                     while (System.currentTimeMillis() < deadline) {
@@ -228,6 +251,7 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                             val ch = inp.read()
                             if (ch < 0) break
                             if (ch.toChar() == '>') {
+                                owedPrompt = false
                                 log("$c -> ${sb.toString().trim().replace('\r', ' ')}")
                                 return sb.toString()
                             }
@@ -336,6 +360,18 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                     supported = supported!! + more
                 }
                 runCatching { saveCache(cacheKey, supported!!) }
+                // Which protocol did the ELM actually settle on? "auto-detect" is
+                // what we asked for, not what it found, and the difference decides
+                // whether a car can be talked to any other way. ATDPN answers with
+                // the number ("6", or "A6" when auto-detect chose it).
+                runCatching {
+                    val n = cmd("ATDPN", 900).trim().replace("\r", "").removePrefix("A")
+                    if (n.isNotEmpty()) {
+                        Elm327.PROTOCOL_SWEEP.firstOrNull { it.cmd == "ATSP$n" }?.let {
+                            protocolLabel = it.label
+                        } ?: run { protocolLabel = "protocol $n" }
+                    }
+                }
                 // Publish the car's own sensor list: this is the answer to "what does
                 // this car actually know", and it is worth recording once per drive.
                 sensorReport = buildSensorReport(supported!!)

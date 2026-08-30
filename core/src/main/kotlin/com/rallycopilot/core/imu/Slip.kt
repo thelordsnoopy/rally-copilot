@@ -65,12 +65,24 @@ class SlipEstimator(private val params: Params = Params()) {
         /** Impossible radius must persist this long, ms. Half of a wheel-jerk. */
         val spinSustainMs: Long = 300,
         /**
-         * The angle comparison needs a usable bearing. Below ~10 mph a GNSS
-         * bearing is rubble: drive 47 logged a ±36° equal-and-opposite pair at
-         * 9 mph that was a bearing glitch, not motion. The impossible-radius
-         * clause owns the low-speed regime. m/s.
+         * The angle comparison needs a usable bearing, and a GNSS bearing does not
+         * become usable at 10 mph — it becomes usable at about 18. Binned by speed
+         * across drives 56-58, |dbeta| behaves like two different instruments:
+         *
+         *   4.5-6 m/s   279 samples   p95 14.5°   40 windows over 7°
+         *   6-8         669           p95  6.7°   27 over 7°
+         *   8-12       3730           p95  2.4°    0 over 7°
+         *   18-40      3857           p95  2.2°    0 over 7°
+         *
+         * Every false slide those three drives produced sat in the bottom two bins,
+         * one of them 68° of "sideslip" while the gyro read 0.04 rad/s — i.e. the
+         * car was going straight and the bearing jumped. Above 8 m/s the noise
+         * floor collapses to ~2° and stays there.
+         *
+         * Nothing is lost by refusing to judge below it: the impossible-radius
+         * clause owns the low-speed regime, needs 2.5 m/s, and is gyro-only. m/s.
          */
-        val windowMinSpeedMps: Double = 4.5,
+        val windowMinSpeedMps: Double = 8.0,
         /**
          * Sideslip over one fix window that counts as a slide, degrees — for a
          * RIGID mount. Measured across six drives, the noise floor tracks how much

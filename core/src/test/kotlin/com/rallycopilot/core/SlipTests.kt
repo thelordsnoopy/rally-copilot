@@ -147,6 +147,22 @@ class SlipTests {
     }
 
     @Test
+    fun `the bearing is still rubble at 6 m per second`() {
+        // Every false slide in drives 56-58 sat between 4.4 and 6.1 m/s, where the
+        // p95 sideslip is 6.7-14.5° against 2.4° above 8 m/s. The worst of them was
+        // 68° of "sideslip" logged while the gyro read 0.04 rad/s — a car going
+        // dead straight. The window must stay silent through all of it.
+        val e = SlipEstimator()
+        var t = 0L
+        repeat(10) { e.onYaw(t, 0.04, 6.0); t += 100 }
+        e.onFix(t, 10.0, 6.0)
+        repeat(10) { e.onYaw(t, 0.04, 6.0); t += 100 }
+        val st = e.onFix(t, 78.0, 6.0) // 68° bearing leap, no body rotation
+        assertFalse(st.sliding)
+        assertEquals(SlipEstimator.Verdict.UNKNOWN, st.verdict)
+    }
+
+    @Test
     fun `driven radius comes from the course and needs real turning`() {
         val e = SlipEstimator()
         drive(e, 3, yawRadS = 0.20, bearingStepDeg = -Math.toDegrees(0.20))
