@@ -91,6 +91,51 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
     @Volatile private var fuelV: Double? = null
     @Volatile var connected = false
         private set
+
+    /**
+     * Everything this car said it supports, decoded into names — written to the
+     * black box once per drive so there is a record of what the car offers rather
+     * than only what the app happened to ask for.
+     */
+    @Volatile var sensorReport: List<Map<String, Any?>> = emptyList()
+        private set
+    /** Most recent value of each swept sensor, by PID. */
+    private val latestSweep = java.util.concurrent.ConcurrentHashMap<Int, Double>()
+    fun sweptValues(): Map<Int, Double> = latestSweep.toMap()
+    /**
+     * Called for every swept reading: the PID, the RAW response, and the decoded
+     * value when the catalogue knows how. Raw is always passed even when the app
+     * cannot make sense of it — an unknown PID's bytes are still the car telling
+     * us something, and a trace can be read later by someone who can work it out.
+     */
+    @Volatile var onSensor: ((pid: Int, raw: String, value: Double?) -> Unit)? = null
+
+    private var sweepList: List<Int> = emptyList()
+    private var sweepIdx = 0
+    /** The bitmap queries themselves are not sensors; never sweep them. */
+    private val SUPPORT_BITMAPS = setOf(0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0)
+
+    /** Name every supported PID, note whether we can read it, and build the sweep. */
+    private fun buildSensorReport(pids: Set<Int>): List<Map<String, Any?>> {
+        val cat = com.rallycopilot.core.obd.SensorCatalog
+        // Already polled by the drive proper — no point asking twice a second.
+        val alreadyPolled = setOf(0x0C, 0x0D, 0x05, 0x0B, 0x2F, 0x46, 0x11, 0x49, 0x04)
+        // Sweep EVERYTHING the car claims, decodable or not. A PID the catalogue
+        // has never heard of is exactly the one worth capturing raw.
+        sweepList = pids.sorted().filter { it !in alreadyPolled && it !in SUPPORT_BITMAPS }
+        sweepIdx = 0
+        return pids.sorted().map { pid ->
+            val s = cat.BY_PID[pid]
+            mapOf(
+                "pid" to "0x%02X".format(pid),
+                "name" to (s?.name ?: "unknown to the catalogue"),
+                "unit" to s?.unit,
+                "readable" to (s?.decodable ?: false),
+                "swept" to (pid in sweepList),
+                "useful" to s?.useful,
+            )
+        }
+    }
     /** VIN read over mode 09 at connect, when the ECU offers it. */
     @Volatile var vin: String? = null
         private set
@@ -279,8 +324,21 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                 loadCache(cacheKey)?.takeIf { it.isNotEmpty() }?.let { cached ->
                     supported = supported!! + cached
                 }
-                supported = supported!! + Elm327.supportedPids(0x40, cmd(Elm327.Pid.SUPPORTED_41_60, 3000))
+                // Ask for the WHOLE supported-PID space. The app used to query two
+                // of the seven bitmaps, so everything from 0x21-0x40 and past 0x60
+                // was invisible — engine oil temperature and the torque pair among
+                // them. Each bitmap also advertises whether the next one exists, so
+                // a car that stops at 0x40 costs one extra request, not six.
+                for ((base, req) in com.rallycopilot.core.obd.SensorCatalog.SUPPORT_QUERIES) {
+                    if (base == 0x00) continue // already asked, that is how we got here
+                    val more = Elm327.supportedPids(base, cmd(req, 3000))
+                    if (more.isEmpty()) break
+                    supported = supported!! + more
+                }
                 runCatching { saveCache(cacheKey, supported!!) }
+                // Publish the car's own sensor list: this is the answer to "what does
+                // this car actually know", and it is worth recording once per drive.
+                sensorReport = buildSensorReport(supported!!)
 
                 val pids = supported!!
                 // On the E90 320d PID 0x11 is meaningless; 0x49 (accel pedal D) is the
@@ -337,6 +395,21 @@ class ObdClient(private val scope: CoroutineScope) : VehicleData {
                             log("car back")
                         }
                         continue
+                    }
+                    // ---- background sensor sweep ----
+                    // One extra PID per cycle, round-robin over everything the car
+                    // says it supports that the drive does not already poll. At ~8
+                    // cycles a second this walks a 40-PID list in five seconds and
+                    // costs one request in nine, so speed and rpm keep their pace.
+                    if (sweepList.isNotEmpty()) {
+                        val pid = sweepList[sweepIdx % sweepList.size]
+                        sweepIdx++
+                        val raw = cmd("01%02X".format(pid), 400)
+                        val v = com.rallycopilot.core.obd.SensorCatalog.decode(pid, raw)
+                        if (v != null) latestSweep[pid] = v
+                        // Log it either way: a PID the catalogue cannot decode is
+                        // still worth its bytes.
+                        onSensor?.invoke(pid, raw.trim(), v)
                     }
                     if (slowTick++ % 20 == 0) { // slow-changing values every ~20 cycles
                         coolantV = Elm327.coolantC(cmd(Elm327.Pid.COOLANT))

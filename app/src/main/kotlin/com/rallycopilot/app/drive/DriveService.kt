@@ -168,6 +168,7 @@ class DriveService : Service() {
         autoStopDeadlineMs = 0L
         lastMovingT = 0L
         obdWasLive = false
+        sensorInventoryLogged = false
 
         wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rallycopilot:drive")
@@ -433,6 +434,21 @@ class DriveService : Service() {
                 val mac = resolveObdMac()
                 if (mac != null) {
                     // PID cache keyed by VIN when readable (follows the car), else MAC.
+                    // Every swept reading straight into the black box, raw bytes
+                    // included. If the catalogue cannot decode a PID, the trace
+                    // still carries what the car said and it can be worked out
+                    // later — that is the whole point of a black box.
+                    obd.onSensor = { pid, raw, value ->
+                        blackBox?.log("sensor", mapOf(
+                            "pid" to "0x%02X".format(pid),
+                            "name" to com.rallycopilot.core.obd.SensorCatalog.nameOf(pid),
+                            "raw" to raw,
+                            "value" to value,
+                            "unit" to com.rallycopilot.core.obd.SensorCatalog.BY_PID[pid]?.unit,
+                            "speed" to engine.hud.value.speedMps,
+                            "rpm" to engine.hud.value.gear,
+                        ))
+                    }
                     obd.connect(
                         mac,
                         loadCache = { key ->
@@ -469,6 +485,7 @@ class DriveService : Service() {
             while (isActive && driveActive) {
                 drainObsLog()
                 autoStopTick()
+                logSensorInventoryOnce()
                 delay(1000)
             }
         }
@@ -515,6 +532,43 @@ class DriveService : Service() {
         } else if (now >= autoStopDeadlineMs) {
             blackBox?.log("autostop", mapOf("event" to "no answer - stopping the drive"))
             stopDrive()
+        }
+    }
+
+    private var sensorInventoryLogged = false
+
+    /**
+     * Write down, once per drive, exactly what this car and this phone can be
+     * asked about. The OBD half only becomes available after the dongle finishes
+     * its protocol handshake, which is why it is polled for rather than logged at
+     * start-up — and why it is silently skipped on a drive with no dongle.
+     */
+    private fun logSensorInventoryOnce() {
+        if (sensorInventoryLogged) return
+        val report = obd.sensorReport
+        if (report.isEmpty()) return
+        sensorInventoryLogged = true
+        val cat = com.rallycopilot.core.obd.SensorCatalog
+        blackBox?.log("car_sensors", mapOf(
+            "count" to report.size,
+            "readable" to report.count { it["readable"] == true },
+            "swept" to report.count { it["swept"] == true },
+            "vin" to obd.vin,
+            "protocol" to obd.protocolLabel,
+        ))
+        for (r in report) blackBox?.log("car_sensor", r)
+        // And what the handset itself carries, so a trace never has to assume.
+        runCatching {
+            val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+            for (ps in cat.PHONE) {
+                val dev = sm.getDefaultSensor(ps.type)
+                blackBox?.log("phone_sensor", mapOf(
+                    "type" to ps.type, "name" to ps.name, "present" to (dev != null),
+                    "vendor" to dev?.vendor, "resolution" to dev?.resolution?.toDouble(),
+                    "maxRange" to dev?.maximumRange?.toDouble(),
+                    "minDelayUs" to dev?.minDelay, "useful" to ps.useful,
+                ))
+            }
         }
     }
 
