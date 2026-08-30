@@ -377,6 +377,9 @@ class DriveService : Service() {
                         "spinExcess" to wheelspin.state.excess,
                         "spinVerdict" to wheelspin.state.verdict.name,
                         "spinning" to wheelspin.state.spinning,
+                        // How much of the gearbox is fitted: without most of it,
+                        // "taller than first gear" means nothing at all.
+                        "gearsLearned" to obd.gearInference.gearCount,
                         "slipVerdict" to slip.state.verdict.name,
                         "sliding" to slip.state.sliding,
                         "drivenR" to slip.drivenRadiusM(hudNow.speedMps),

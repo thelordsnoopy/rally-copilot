@@ -36,8 +36,31 @@ class WheelspinDetector(private val params: Params = Params()) {
          * or more over.
          */
         val overRatio: Double = 1.15,
-        /** Below this there is no meaningful road speed to divide by, m/s. */
-        val minSpeedMps: Double = 2.5,
+        /**
+         * Below this, no verdict — m/s. Not because the arithmetic breaks, but
+         * because of the clutch: pulling away in first, the disc is still slipping
+         * and rpm/speed legitimately reads far over the gear ratio. Drives 52-55
+         * showed ratios of 508, 512 and 482 above 2.5 m/s against a real first
+         * gear near 440, and every one of them was a normal pull-away. Above
+         * 4 m/s the clutch is home and the ratio tells the truth.
+         */
+        val minSpeedMps: Double = 4.0,
+        /**
+         * Gears that must be fitted before the tallest ratio may be called "first".
+         * This is the one that matters. [GearInference] clusters rpm/speed samples,
+         * and on a short town drive it finds three or four of a six-speed box — so
+         * `max(ratios)` is second or third gear, and every legitimate pull-away in
+         * first reads as impossible. Drive 52 believed first gear was 233 when the
+         * car was really turning 434, and produced 87 samples of phantom wheelspin
+         * in the first minute because of it.
+         */
+        val minGearsLearned: Int = 5,
+        /**
+         * First gear stands well clear of second — typically 1.5-1.8x on a manual.
+         * A tallest ratio sitting right next to its neighbour is not the bottom of
+         * the box, it is the bottom of what has been SEEN so far.
+         */
+        val firstGearStep: Double = 1.20,
         /** Below this rpm the engine is not driving anything. */
         val minRpm: Int = 1200,
         /** Must persist this long: a downshift blip is shorter, ms. */
@@ -50,7 +73,8 @@ class WheelspinDetector(private val params: Params = Params()) {
     )
 
     enum class Verdict {
-        /** No usable evidence: too slow, no rpm, gearing not learned yet. */
+        /** No usable evidence: too slow, no rpm, or the gearbox is not yet
+         *  learned well enough for "faster than first gear" to mean anything. */
         UNKNOWN,
         /** rpm and speed agree with a gear the car actually has. */
         HOOKED_UP,
@@ -95,9 +119,16 @@ class WheelspinDetector(private val params: Params = Params()) {
         accelMps2: Double,
         ratios: List<Double>,
     ): State {
-        val first = ratios.maxOrNull() ?: 0.0
+        val sorted = ratios.sortedDescending()
+        val first = sorted.firstOrNull() ?: 0.0
+        val second = sorted.getOrNull(1) ?: 0.0
+        // Is the tallest ratio actually FIRST GEAR, or just the lowest gear this
+        // drive happened to use? Without that distinction the whole test inverts:
+        // an honest pull-away becomes "a ratio no gear can explain".
+        val firstIsTrustworthy = ratios.size >= params.minGearsLearned &&
+            second > 0.0 && first / second >= params.firstGearStep
         if (rpm == null || rpm < params.minRpm || speedMps < params.minSpeedMps ||
-            ratios.size < 3 || first <= 0.0
+            !firstIsTrustworthy
         ) {
             overSince = 0L
             state = State(Verdict.UNKNOWN, 0.0, first, null, tMs < holdUntil)

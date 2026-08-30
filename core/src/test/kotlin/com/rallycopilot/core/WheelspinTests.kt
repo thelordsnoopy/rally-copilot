@@ -52,9 +52,9 @@ class WheelspinTests {
     @Test
     fun `rpm no gear can explain is wheelspin`() {
         val d = WheelspinDetector()
-        // 4 m/s with 2600 rpm implies a ratio of 650 — half again over first gear.
+        // 6 m/s with 3900 rpm implies a ratio of 650 — half again over first gear.
         // The wheels are turning far faster than the car is moving.
-        val st = hold(d, 2.0, rpm = 2600, speed = 4.0, accel = 1.0)
+        val st = hold(d, 2.0, rpm = 3900, speed = 6.0, accel = 1.0)
         assertEquals(WheelspinDetector.Verdict.SUSPECTED, st.verdict)
         assertTrue(st.spinning)
         assertTrue(d.spunSinceReset)
@@ -75,8 +75,49 @@ class WheelspinTests {
         val d = WheelspinDetector()
         // Same impossible ratio, but the car is shedding speed hard: this is the
         // clutch, not the tyres.
-        val st = hold(d, 2.0, rpm = 2600, speed = 4.0, accel = -4.0)
+        val st = hold(d, 2.0, rpm = 3900, speed = 6.0, accel = -4.0)
         assertFalse(st.spinning)
+    }
+
+    @Test
+    fun `a partly-learned gearbox says nothing at all`() {
+        // Drives 52-55: on short town drives GearInference fitted three or four of
+        // six gears, so max(ratios) was second or third - and every pull-away in
+        // first read as "a ratio no gear can explain". 87 samples of phantom spin.
+        val d = WheelspinDetector()
+        var st = d.state
+        var t = 0L
+        // Real first gear is 430; the fit has only found 165/122/97 (gears 3-5).
+        val partial = listOf(165.0, 122.0, 97.0)
+        repeat(30) { st = d.tick(t, 2600, 6.0, 1.0, partial); t += 100 }
+        assertEquals(WheelspinDetector.Verdict.UNKNOWN, st.verdict)
+        assertFalse("a half-known gearbox must never accuse the driver", d.spunSinceReset)
+    }
+
+    @Test
+    fun `a tallest ratio too close to its neighbour is not first gear`() {
+        // Five ratios, but the top two are 8% apart - that is two middle gears,
+        // not the bottom of the box.
+        val d = WheelspinDetector()
+        var st = d.state
+        var t = 0L
+        val suspicious = listOf(165.0, 152.0, 122.0, 97.0, 80.0)
+        repeat(30) { st = d.tick(t, 3000, 6.0, 1.0, suspicious); t += 100 }
+        assertEquals(WheelspinDetector.Verdict.UNKNOWN, st.verdict)
+        assertFalse(d.spunSinceReset)
+    }
+
+    @Test
+    fun `pulling away with the clutch slipping is not wheelspin`() {
+        // Below 4 m/s the disc is still slipping and rpm/speed legitimately runs
+        // way over the gear ratio. Drives 52-55 measured 482-512 there against a
+        // real first gear near 440, every one of them an ordinary pull-away.
+        val d = WheelspinDetector()
+        var st = d.state
+        var t = 0L
+        repeat(30) { st = d.tick(t, 1800, 3.0, 1.5, ratios); t += 100 }
+        assertEquals(WheelspinDetector.Verdict.UNKNOWN, st.verdict)
+        assertFalse(d.spunSinceReset)
     }
 
     @Test
@@ -109,12 +150,12 @@ class WheelspinTests {
     @Test
     fun `the flag holds briefly after the wheels hook back up`() {
         val d = WheelspinDetector()
-        var st = hold(d, 2.0, rpm = 2600, speed = 4.0, accel = 1.0)
+        var st = hold(d, 2.0, rpm = 3900, speed = 6.0, accel = 1.0)
         assertTrue(st.spinning)
         // Traction returns; the flag should linger for the hold, then clear.
-        st = hold(d, 0.5, rpm = 1720, speed = 4.0, startMs = 2_000)
+        st = hold(d, 0.5, rpm = 2580, speed = 6.0, startMs = 2_000)
         assertTrue("still held", st.spinning)
-        st = hold(d, 1.0, rpm = 1720, speed = 4.0, startMs = 10_000)
+        st = hold(d, 1.0, rpm = 2580, speed = 6.0, startMs = 10_000)
         assertFalse("hold expired", st.spinning)
         assertTrue("but the drive-long flag stays until reset", d.spunSinceReset)
         d.resetSpin()
