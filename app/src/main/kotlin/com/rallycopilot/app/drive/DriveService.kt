@@ -854,7 +854,7 @@ class DriveService : Service() {
                     // gyro accumulated since the previous fix, against the bearing
                     // change over exactly that interval. Two angles, one window —
                     // this is what replaced the guessed 700 ms rate delay.
-                    slip.onFix(fix.tMs, fix.bearingDeg, fix.speedMps)
+                    slip.onFix(fix.tMs, fix.bearingDeg, fix.speedMps, mountWobbleDeg)
                     // Wheelspin: engine rpm against GROUND speed. GPS deliberately,
                     // not the car's own speedometer — that number comes from the
                     // very wheels in question, so it cannot report them spinning.

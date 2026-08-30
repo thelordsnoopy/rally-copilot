@@ -71,11 +71,28 @@ class SlipEstimator(private val params: Params = Params()) {
          * clause owns the low-speed regime. m/s.
          */
         val windowMinSpeedMps: Double = 4.5,
-        /** Sideslip change over one fix window that counts as a slide, degrees.
-         *  Real slides measured 6.6-13.2°; two dry drives' worst noise was 10.6°
-         *  under a wobbling mount — this sits above the p99 (~7-9°) and accepts
-         *  missing a mild scrub over poisoning the learning loop. */
-        val windowSlipDeg: Double = 9.0,
+        /**
+         * Sideslip over one fix window that counts as a slide, degrees — for a
+         * RIGID mount. Measured across six drives, the noise floor tracks how much
+         * the phone is moving in its holder: wedged (wobble p90 under 7°) the p99
+         * is 4.9-5.0° and the worst window 5.6°; loose (wobble p90 9.6-15.5°) the
+         * p99 runs to 9.0° and the worst to 13.6°. So the floor is not a constant,
+         * and neither is this.
+         */
+        val windowSlipDeg: Double = 7.0,
+        /**
+         * ...raised by this much per degree of wobble past [wobbleFreeDeg], because
+         * a phone shifting in its cradle adds rotation the car never made. Capped
+         * by [maxWindowSlipDeg].
+         *
+         * Deliberately NOT a hard stability gate: hard cornering tilts the fused
+         * gravity vector, so wobble RISES during exactly the moments worth
+         * catching, and a gate would mute the evidence. Widening the bar instead
+         * keeps a wobbling mount honest without going deaf.
+         */
+        val slipPerWobbleDeg: Double = 0.5,
+        val wobbleFreeDeg: Double = 5.0,
+        val maxWindowSlipDeg: Double = 12.0,
         /** A usable fix window, seconds. */
         val windowMinDtS: Double = 0.5,
         val windowMaxDtS: Double = 2.0,
@@ -186,7 +203,14 @@ class SlipEstimator(private val params: Params = Params()) {
      * the yaw angle the gyro accumulated since the previous fix is compared with
      * the bearing change over exactly that interval.
      */
-    fun onFix(tMs: Long, bearingDeg: Double, speedMps: Double): State {
+    fun onFix(
+        tMs: Long,
+        bearingDeg: Double,
+        speedMps: Double,
+        /** How much the phone is moving in its holder right now, degrees. The
+         *  slide threshold widens with it; 0 means a perfectly rigid mount. */
+        mountWobbleDeg: Double = 0.0,
+    ): State {
         val dtS = if (lastFixT == 0L) Double.NaN else (tMs - lastFixT) / 1000.0
         val prevBearing = lastBearingDeg
         val gyroAngle = yawIntegralRad
@@ -215,7 +239,10 @@ class SlipEstimator(private val params: Params = Params()) {
         if (speedMps >= params.windowMinSpeedMps) {
             val dbeta = Math.toDegrees(gyroAngle - courseAngle)
             lastDbetaDeg = dbeta
-            if (abs(dbeta) >= params.windowSlipDeg) {
+            val bar = (params.windowSlipDeg +
+                params.slipPerWobbleDeg * (mountWobbleDeg - params.wobbleFreeDeg)
+                    .coerceAtLeast(0.0)).coerceAtMost(params.maxWindowSlipDeg)
+            if (abs(dbeta) >= bar) {
                 // The body turned more than the path (same sign as the turn, or a
                 // rotation the path never showed): oversteer. Turned less: understeer.
                 val turnRef = if (abs(courseAngle) > 1e-3) courseAngle else gyroAngle

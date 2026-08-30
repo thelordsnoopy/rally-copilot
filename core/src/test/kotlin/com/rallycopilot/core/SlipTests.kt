@@ -50,7 +50,7 @@ class SlipTests {
     fun `body turning far more than the path is oversteer`() {
         val e = SlipEstimator()
         // Gyro says 0.40 rad/s (~23°/s); the path only bends 11°/s. The 12°/s
-        // difference is far over the 9° window threshold.
+        // difference is far over the 7° rigid-mount threshold.
         val st = drive(e, 3, yawRadS = 0.40, bearingStepDeg = -11.0)
         assertEquals(SlipEstimator.Verdict.OVERSTEER, st.verdict)
         assertTrue("must be flagged as sliding", st.sliding)
@@ -69,11 +69,32 @@ class SlipTests {
     @Test
     fun `small disagreement inside the noise floor stays neutral`() {
         val e = SlipEstimator()
-        // 3°/s of mismatch: under the 9° per-window threshold, which sits above
-        // the measured p99 noise of a real drive.
+        // 3°/s of mismatch: under the 7° per-window threshold, which sits above
+        // the measured p99 noise (~5°) of a real drive on a wedged mount.
         val st = drive(e, 4, yawRadS = 0.25, bearingStepDeg = -Math.toDegrees(0.20))
         assertEquals(SlipEstimator.Verdict.NEUTRAL, st.verdict)
         assertFalse(st.sliding)
+    }
+
+    @Test
+    fun `the slide bar widens when the phone is moving in its holder`() {
+        // 8 degrees of sideslip. On a wedged mount that is a slide; with the phone
+        // shifting 12 degrees in its cradle it is inside the noise and must not be
+        // called. Measured floors: rigid p99 ~5, loose p99 ~9.
+        fun run(wobble: Double): Boolean {
+            val e = SlipEstimator()
+            var t = 0L
+            var bearing = 0.0
+            var sliding = false
+            repeat(4) {
+                repeat(10) { e.onYaw(t, Math.toRadians(19.0), 20.0); t += 100 }
+                bearing = (bearing - 11.0 + 360.0) % 360.0   // path turns 11 deg/s
+                sliding = e.onFix(t, bearing, 20.0, wobble).sliding
+            }
+            return sliding
+        }
+        assertTrue("a rigid mount must call it", run(0.0))
+        assertFalse("a wobbling mount must not", run(12.0))
     }
 
     @Test
