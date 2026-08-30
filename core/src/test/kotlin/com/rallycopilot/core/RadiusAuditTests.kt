@@ -28,22 +28,22 @@ private class MemAuditStore : AuditStore {
 
 class RadiusAuditorTests {
 
-    /** Drive one pass through corner [id]: mapped radius [rMap], at [v] m/s with the
-     *  IMU reading [aLat] m/s² mid-corner. */
+    /** Drive one pass through corner [id]: mapped radius [rMap], at [v] m/s,
+     *  describing a radius of [drivenR] m through it. */
     private fun pass(
-        a: RadiusAuditor, id: Long, rMap: Double, v: Double, aLat: Double,
+        a: RadiusAuditor, id: Long, rMap: Double, v: Double, drivenR: Double?,
         accuracy: Double = 5.0,
     ) {
-        repeat(5) { a.tick(id, rMap, v, aLat, accuracy) }
-        a.tick(null, null, v, 0.0, accuracy) // leave the corner
+        repeat(5) { a.tick(id, rMap, v, accuracy, drivenR) }
+        a.tick(null, null, v, accuracy, null) // leave the corner
     }
 
     @Test
     fun `an agreeing pass produces no advice`() {
         val store = MemAuditStore()
         val a = RadiusAuditor(store)
-        // R = v²/aLat = 20²/8 = 50 m, map says 50 m: the map is right.
-        pass(a, 1, rMap = 50.0, v = 20.0, aLat = 8.0)
+        // The car described 50 m and the map says 50 m: the map is right.
+        pass(a, 1, rMap = 50.0, v = 20.0, drivenR = 50.0)
         assertEquals(1, store.map[1L]!!.passes)
         assertNull(a.adviceFor(1))
     }
@@ -51,17 +51,17 @@ class RadiusAuditorTests {
     @Test
     fun `one pass is never enough to move a corner`() {
         val a = RadiusAuditor(MemAuditStore())
-        // Implied R = 15²/9 = 25 m; map claims 50 m — the road looks much tighter,
-        // but a single measurement does not get to rewrite the map.
-        pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0)
+        // Driven R = 25 m; map claims 50 m — the road looks much tighter, but a
+        // single measurement does not get to rewrite the map.
+        pass(a, 1, rMap = 50.0, v = 15.0, drivenR = 25.0)
         assertNull("no correction from one pass", a.adviceFor(1))
     }
 
     @Test
     fun `two consistent passes correct the radius, and only downward`() {
         val a = RadiusAuditor(MemAuditStore())
-        pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0)
-        pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0)
+        pass(a, 1, rMap = 50.0, v = 15.0, drivenR = 25.0)
+        pass(a, 1, rMap = 50.0, v = 15.0, drivenR = 25.0)
         val advice = a.adviceFor(1)!!
         assertEquals(0.5, advice.radiusFactor, 0.02) // 25/50, floored at 0.5
         assertTrue("corrections only tighten", advice.radiusFactor < 1.0)
@@ -70,22 +70,23 @@ class RadiusAuditorTests {
     @Test
     fun `a road gentler than mapped is left alone, never sped up`() {
         val a = RadiusAuditor(MemAuditStore())
-        // Implied R = 30²/4.5 = 200 m; map claims 60 m — over-called, not dangerous.
-        pass(a, 1, rMap = 60.0, v = 30.0, aLat = 4.5)
-        pass(a, 1, rMap = 60.0, v = 30.0, aLat = 4.5)
+        // Driven R = 200 m; map claims 60 m — over-called, not dangerous.
+        pass(a, 1, rMap = 60.0, v = 30.0, drivenR = 200.0)
+        pass(a, 1, rMap = 60.0, v = 30.0, drivenR = 200.0)
         // A driven line is always wider than the centreline, so this is the normal
         // reading, not news — and raising a suggested speed from it is never done.
         assertNull("gentler-than-mapped changes nothing", a.adviceFor(1))
     }
 
     @Test
-    fun `bad GPS, low speed and gentle cornering never produce a pass`() {
+    fun `bad GPS, crawling, and no measurement never produce a pass`() {
         val store = MemAuditStore()
         val a = RadiusAuditor(store)
-        pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0, accuracy = 25.0) // GPS poor
-        pass(a, 2, rMap = 50.0, v = 4.0, aLat = 9.0)                   // crawling
-        pass(a, 3, rMap = 50.0, v = 15.0, aLat = 1.0)                  // not cornering
-        repeat(5) { a.tick(4, 50.0, 15.0, null, 5.0) }                 // mount not aligned
+        pass(a, 1, rMap = 50.0, v = 15.0, drivenR = 25.0, accuracy = 25.0) // GPS poor
+        pass(a, 2, rMap = 50.0, v = 4.0, drivenR = 25.0)                   // crawling
+        // No driven radius at all: on a straight the estimator returns null, which
+        // is where "not cornering" is now filtered — it never reaches the auditor.
+        repeat(5) { a.tick(3, 50.0, 15.0, 5.0, null) }
         a.closePass()
         assertTrue("nothing qualified", store.map.isEmpty())
     }
@@ -94,8 +95,8 @@ class RadiusAuditorTests {
     fun `evidence accumulates by EMA so one later good pass softens the verdict`() {
         val store = MemAuditStore()
         val a = RadiusAuditor(store)
-        pass(a, 1, rMap = 50.0, v = 15.0, aLat = 9.0) // ratio 0.5
-        pass(a, 1, rMap = 50.0, v = 20.0, aLat = 8.0) // ratio 1.0 — map right this time
+        pass(a, 1, rMap = 50.0, v = 15.0, drivenR = 25.0) // ratio 0.5
+        pass(a, 1, rMap = 50.0, v = 20.0, drivenR = 50.0) // ratio 1.0 — map right this time
         val ema = store.map[1L]!!.ratioEma
         assertEquals(0.75, ema, 0.01)
     }

@@ -12,14 +12,14 @@ import kotlin.math.sqrt
  * vector, so "vertical" needs no mount calibration whatsoever. Emits a 1 s RMS
  * (surface roughness) and discrete spikes (pothole hits, sunk grids).
  *
- * Raw samples are also handed to the mount-alignment + camber estimators via
+ * Raw samples are also handed to the mount-wobble monitor via
  * [onSample]; this class stays a dumb sensor pump.
  */
 class ImuMonitor(
     context: Context,
     private val onRoughness: (rms: Double) -> Unit,
     private val onBump: () -> Unit,
-    /** Raw phone-frame vectors for mount alignment and camber, ~50 Hz. */
+    /** Raw phone-frame vectors for the mount-wobble monitor, ~50 Hz. */
     private val onSample: (accel: com.rallycopilot.core.imu.Vec3, gravity: com.rallycopilot.core.imu.Vec3) -> Unit = { _, _ -> },
     /**
      * Yaw rate about the VERTICAL axis, rad/s, positive anticlockwise seen from

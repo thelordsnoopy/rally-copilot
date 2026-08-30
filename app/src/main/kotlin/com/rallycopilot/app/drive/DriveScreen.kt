@@ -418,8 +418,10 @@ private fun InstrumentBar(hud: DriveEngine.HudState?, modifier: Modifier) {
             if (hud?.pressingOn == false) Chip("QUIET", InkDim)
             else if (hud?.spirited == true) Chip("SPIRITED", Amber)
             else Chip("CALLING", Green)
-            // The phone moving in its holder, not the car moving: alignment, camber
-            // and the radius audit are all blind until the mount is wedged tight.
+            // The phone moving in its holder rather than the car moving. Nothing
+            // depends on the mount being aligned any more, but a flapping phone
+            // still pollutes the road-roughness reading — and a driver who can see
+            // this chip goes and wedges the holder, which is what happened.
             if ((DriveService.instance?.mountWobbleDeg ?: 0.0) >= 8.0) Chip("LOOSE MOUNT", Amber)
         }
         // path confidence

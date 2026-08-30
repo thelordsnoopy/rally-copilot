@@ -43,9 +43,7 @@ class RadiusAuditor(
         val maxGpsAccuracyM: Double = 12.0,
         /** ...and the car is genuinely moving (walking-pace v²/a is noise). */
         val minSpeedMps: Double = 8.0,
-        /** ...and cornering hard enough that aLat is signal, not sensor noise. */
-        val minALatMps2: Double = 2.5,
-        /** Implausible single-pass ratios are clamped before entering the EMA. */
+                /** Implausible single-pass ratios are clamped before entering the EMA. */
         val minRatio: Double = 0.4,
         val maxRatio: Double = 2.5,
         /** New passes move the EMA by this much — recent evidence dominates. */
@@ -68,14 +66,11 @@ class RadiusAuditor(
 
     private var currentCornerId: Long = -1
     private var currentMapRadiusM: Double = 0.0
-    private var bestALat: Double = 0.0
-    private var speedAtBest: Double = 0.0
     private var tightestDrivenM: Double = Double.MAX_VALUE
 
     /**
      * Feed every engine tick. [cornerId]/[mapRadiusM] describe the corner the car is
-     * currently INSIDE (null when on a straight). [aLatImuMps2] is the IMU's measured
-     * lateral acceleration magnitude in the car frame, null until the mount is aligned.
+     * currently INSIDE (null when on a straight).
      *
      * A pass closes when the car leaves the corner; a pass that never met the gates
      * simply records nothing.
@@ -84,15 +79,15 @@ class RadiusAuditor(
         cornerId: Long?,
         mapRadiusM: Double?,
         speedMps: Double,
-        aLatImuMps2: Double?,
         gpsAccuracyM: Double?,
         /**
          * The radius the car actually drove, from speed and GNSS course rate.
          *
-         * Preferred over the lateral-g route when available, because it needs no
-         * mount alignment — and mount alignment has never once completed on this
-         * phone. It measures the PATH rather than the road, so a driver straightening
-         * a bend reads wider than the map; that only ever produces ratios above 1,
+         * This is the auditor's only input now. It needs no mount alignment — which
+         * matters, because alignment never once completed in nineteen traced drives
+         * and was removed in v0.21.0 along with the lateral-g route that depended on
+         * it. It measures the PATH rather than the road, so a driver straightening a
+         * bend reads wider than the map; that only ever produces ratios above 1,
          * which this auditor refuses to act on anyway. What it catches is the case
          * that matters: a map claiming 200 m where the car cannot get round above 70.
          */
@@ -106,18 +101,9 @@ class RadiusAuditor(
         if (cornerId == null) return
         if (gpsAccuracyM == null || gpsAccuracyM > params.maxGpsAccuracyM) return
         if (speedMps < params.minSpeedMps) return
-        // Route one: the path the car actually described. No mount needed.
+        // The path the car actually described. No mount, no alignment, no calibration.
         if (drivenRadiusM != null && drivenRadiusM.isFinite() && drivenRadiusM > 1.0) {
             if (drivenRadiusM < tightestDrivenM) tightestDrivenM = drivenRadiusM
-            return
-        }
-        // Route two: lateral g. Keeps only the hardest-cornering qualifying moment
-        // (peak aLat ↔ closest to the apex).
-        if (aLatImuMps2 == null || !aLatImuMps2.isFinite()) return
-        if (aLatImuMps2 < params.minALatMps2) return
-        if (aLatImuMps2 > bestALat) {
-            bestALat = aLatImuMps2
-            speedAtBest = speedMps
         }
     }
 
@@ -125,19 +111,12 @@ class RadiusAuditor(
     fun closePass() {
         val id = currentCornerId
         val rMap = currentMapRadiusM
-        val aLat = bestALat
-        val v = speedAtBest
         val driven = tightestDrivenM
         currentCornerId = -1
-        bestALat = 0.0
-        speedAtBest = 0.0
         tightestDrivenM = Double.MAX_VALUE
         if (id < 0 || rMap <= 0.0) return
-        val rImplied = when {
-            driven < Double.MAX_VALUE -> driven
-            aLat >= params.minALatMps2 -> (v * v) / aLat
-            else -> return
-        }
+        if (driven >= Double.MAX_VALUE) return
+        val rImplied = driven
         val ratio = (rImplied / rMap).coerceIn(params.minRatio, params.maxRatio)
         val prev = store.get(id)
         val ema = if (prev == null) ratio

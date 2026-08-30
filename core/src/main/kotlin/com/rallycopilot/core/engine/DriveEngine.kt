@@ -131,10 +131,6 @@ class DriveEngine(
     @Volatile
     var audioLatencyMs: Long = 220
 
-    /** IMU lateral acceleration magnitude in the CAR frame, m/s², set by the app
-     *  layer once the mount is aligned. Null = no trustworthy measurement. */
-    @Volatile
-    var imuLateralMps2: Double? = null
 
     /** The car is not going where it is pointing (see SlipEstimator). */
     @Volatile
@@ -416,7 +412,6 @@ class DriveEngine(
             cornerId = insideCorner?.corner?.id,
             mapRadiusM = insideCorner?.corner?.minRadiusM,
             speedMps = speed,
-            aLatImuMps2 = imuLateralMps2,
             gpsAccuracyM = fix?.accuracyM,
             // Only while gripping: a slide describes a path that is not the road's.
             drivenRadiusM = if (slipping) null else drivenRadiusM,
@@ -484,7 +479,6 @@ class DriveEngine(
                 "ambientC" to vehicle.ambientC(), "mapKpa" to vehicle.mapKpa(),
                 "fuel" to vehicle.fuelLevel01(), "obdSilent" to vehicle.linkSilent(),
                 // motion
-                "aLatImu" to imuLateralMps2,
                 "slipping" to slipping, "drivenR" to drivenRadiusM,
                 "aLatGeom" to insideCorner?.let { (speed * speed) / it.corner.minRadiusM },
                 "insideCorner" to insideCorner?.corner?.id,

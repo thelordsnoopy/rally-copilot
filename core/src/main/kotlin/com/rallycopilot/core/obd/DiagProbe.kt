@@ -14,7 +14,7 @@ package com.rallycopilot.core.obd
  * biases the comparison by 17%. Four wheel speeds are not an inference. Rear
  * wheels turning faster than the fronts IS wheelspin, definitionally, and a
  * welded diff on worn rears produces exactly that. The car's own yaw sensor would
- * also make [com.rallycopilot.core.imu.MountAlignment] irrelevant for slip.
+ * also settle the question the removed mount-alignment code never could.
  *
  * WHY IT IS A PROBE AND NOT A FEATURE. The addressing below is documented well
  * enough to try and not well enough to trust: the module addresses are the

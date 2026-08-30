@@ -24,7 +24,6 @@ class Advisor(
     /** Personal knowledge layer: learned speed factor for a stretch of an edge. */
     var speedFactorLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double)? = null,
     /** Learned camber, degrees, positive = road leans car-left when driven FORWARD (node order). */
-    var camberLookup: ((edgeId: Long, startM: Double, endM: Double) -> Double?)? = null,
     /** Gear suggestion for a target speed (learned from OBD). Null = no gear calls. */
     var gearLookup: ((vTargetMps: Double) -> Int?)? = null,
     /** Radius audit: what YOUR measured cornering says about this corner's mapped
@@ -147,18 +146,6 @@ class Advisor(
             // maths flatters exactly these. Positive camber helps LEFT turns. Camber is
             // stored in the edge's forward frame; driving the edge the other way, the
             // same crown leans the other way in the car frame.
-            val storedCamber = camberLookup?.invoke(corner.edgeId, corner.startOffsetM, corner.endOffsetM)
-            val camber = storedCamber?.let { if (entry.forward) it else -it }
-            if (camber != null) {
-                val adverseDeg = when (corner.direction) {
-                    Direction.LEFT -> (-camber).coerceAtLeast(0.0)
-                    Direction.RIGHT -> camber.coerceAtLeast(0.0)
-                }
-                if (adverseDeg >= com.rallycopilot.core.knowledge.KnowledgeMath.CAMBER_ADVERSE_DEG) {
-                    modifiers += Modifier.OFF_CAMBER
-                    vTarget *= (1.0 - 0.03 * adverseDeg).coerceAtLeast(0.85)
-                }
-            }
             // Braking point / trigger for the HUD, from build-time speed. The ENGINE
             // recomputes both from live speed every tick — these are display values.
             val v = currentSpeedMps

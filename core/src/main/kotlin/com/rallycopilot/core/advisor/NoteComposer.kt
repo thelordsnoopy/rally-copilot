@@ -66,7 +66,7 @@ object NoteComposer {
     }
 
     /** Modifiers that change how dangerous the corner is — the last thing to drop. */
-    private val DANGER = setOf(Modifier.TIGHTENS, Modifier.OPENS, Modifier.OFF_CAMBER)
+    private val DANGER = setOf(Modifier.TIGHTENS, Modifier.OPENS)
 
     fun cornerKeys(c: HorizonCorner, detail: Detail): List<String> {
         val dir = c.corner.direction.spoken()

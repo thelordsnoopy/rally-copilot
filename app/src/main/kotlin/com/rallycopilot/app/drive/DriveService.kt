@@ -242,7 +242,6 @@ class DriveService : Service() {
         val advisor = Advisor(profile, conditions = conditions)
         // Your road history trims suggestions where trouble was learned.
         advisor.speedFactorLookup = { e, a, b -> know.factorFor(e, a, b) }
-        advisor.camberLookup = { e, a, b -> know.camberFor(e, a, b) }
         // Gear calls from the learned ratio table, aiming at the exit revs learned
         // from how THIS driver actually shifts (see GearInference.exitRpm).
         advisor.gearLookup = { v -> if (obd.connected) obd.gearInference.gearForSpeed(v) else null }
@@ -276,16 +275,13 @@ class DriveService : Service() {
         engine.maxSpokenBandOrdinal = verbosityOrdinal(db.kvGet("verbosity"))
         engine.speedSource = speedSourceOf(db.kvGet("speed_source"))
 
-        // IMU: surface roughness, pothole spikes, mount self-alignment and camber —
-        // all tagged to the matched road bucket. No calibration step anywhere: the
-        // forward axis is learned from firm accelerate/brake events automatically.
-        val mount = com.rallycopilot.core.imu.MountAlignment()
-        val camber = com.rallycopilot.core.imu.CamberEstimator(mount)
+        // IMU: surface roughness, pothole spikes, and how much the phone is moving
+        // in its holder — all tagged to the matched road bucket.
+        val mount = com.rallycopilot.core.imu.MountWobble()
         var lastSpeed = 0.0
         var lastSpeedT = 0L
         var lastSpeedSrc = false
         var currentDvdt = 0.0
-        var lastCamberWriteT = 0L
         var lastImuLogT = 0L
         imu = ImuMonitor(
             this,
@@ -340,34 +336,18 @@ class DriveService : Service() {
                     currentDvdt = if (kotlin.math.abs(d) <= 8.0) d else 0.0
                     lastSpeed = hudNow.speedMps; lastSpeedT = now
                 }
-                mount.tick(now, accel, grav, currentDvdt, hudNow.speedMps)
-                // Car-frame lateral acceleration for the radius audit: the component
-                // of accel along car-LEFT (up × forward). Null until the mount is
-                // aligned — an unaligned axis would feed the audit garbage radii.
-                engine.imuLateralMps2 = mount.forward?.let { fwd ->
-                    val up = grav.unit() * -1.0
-                    val left = up.cross(fwd).unit()
-                    kotlin.math.abs(accel.dot(left)).takeIf { it.isFinite() }
-                }
-                val deg = camber.tick(accel, grav, hudNow.speedMps)
+                mount.tick(grav)
                 // Black box: the raw IMU stream, thinned to ~10 Hz. Full sensor rate
                 // is 50-100 Hz and would be most of the file for little extra truth.
                 mountWobbleDeg = mount.wobbleDeg
                 if (now - lastImuLogT > 100) {
                     lastImuLogT = now
-                    val fwd = mount.forward
                     blackBox?.log("imu", mapOf(
                         "ax" to accel.x, "ay" to accel.y, "az" to accel.z,
                         "gx" to grav.x, "gy" to grav.y, "gz" to grav.z,
                         "dvdt" to currentDvdt,
-                        "aligned" to mount.isAligned,
                         "wobbleDeg" to mount.wobbleDeg,
                         "stable" to mount.isStable,
-                        "alignEvents" to mount.eventCount,
-                        "coherence" to mount.coherence,
-                        "polVotes" to mount.polarityVotes,
-                        "fx" to fwd?.x, "fy" to fwd?.y, "fz" to fwd?.z,
-                        "camberDeg" to deg,
                         "yawRate" to slip.state.yawRateRadS,
                         "courseRate" to slip.state.courseRateRadS,
                         "dbeta" to slip.state.dbetaDeg,
@@ -383,21 +363,9 @@ class DriveService : Service() {
                         "slipVerdict" to slip.state.verdict.name,
                         "sliding" to slip.state.sliding,
                         "drivenR" to slip.drivenRadiusM(hudNow.speedMps),
-                        "aLat" to engine.imuLateralMps2,
                         "speed" to hudNow.speedMps,
                         "edge" to hudNow.matched?.edgeId, "off" to hudNow.matched?.offsetM,
                     ))
-                }
-                // Persist camber at ~1 Hz against the current bucket, normalised to the
-                // edge's FORWARD frame — the same crown leans the other way when the
-                // edge is driven against its node order, and mixing frames cancels the
-                // learned value on every two-way road.
-                if (deg != null && now - lastCamberWriteT > 1000) {
-                    lastCamberWriteT = now
-                    hudNow.matched?.let { m ->
-                        val forwardFrameDeg = if (m.forward) deg else -deg
-                        scope.launch(engineDispatcher) { know.addCamber(m.edgeId, m.offsetM, forwardFrameDeg) }
-                    }
                 }
             },
         ).also { it.start() }

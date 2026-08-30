@@ -136,7 +136,6 @@ enum class Modifier(val spoken: String) {
     LONG("long"),
     INTO("into"),
     /** Road leans out of the corner — the radius maths flatters this one. */
-    OFF_CAMBER("off_camber"),
     /** Low map confidence: the geometry may under-claim. Spoken before the call. */
     CAUTION("caution"),
 }
